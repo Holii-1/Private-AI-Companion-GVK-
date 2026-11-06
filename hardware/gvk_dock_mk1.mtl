@@ -1,0 +1,79 @@
+# GVK-DOCK // MK.I Materials
+
+newmtl CarbonBody
+Kd 0.100 0.110 0.120
+Ks 0.350 0.350 0.380
+Ns 35.0
+illum 2
+
+newmtl MatteBezel
+Kd 0.070 0.070 0.080
+Ks 0.200 0.200 0.220
+Ns 20.0
+illum 2
+
+newmtl DarkBolt
+Kd 0.040 0.040 0.050
+Ks 0.500 0.500 0.550
+Ns 60.0
+illum 2
+
+newmtl SilverPlate
+Kd 0.780 0.800 0.830
+Ks 0.900 0.900 0.950
+Ns 80.0
+illum 2
+
+newmtl ChromeMetal
+Kd 0.850 0.870 0.900
+Ks 0.980 0.980 0.980
+Ns 110.0
+illum 2
+
+newmtl RedMissileCover
+Kd 0.820 0.060 0.060
+Ks 0.700 0.300 0.300
+Ns 50.0
+illum 2
+
+newmtl LED_Green
+Kd 0.100 0.950 0.350
+Ks 0.900 0.900 0.900
+Ns 60.0
+illum 2
+
+newmtl LED_Red
+Kd 0.980 0.150 0.150
+Ks 0.900 0.900 0.900
+Ns 60.0
+illum 2
+
+newmtl CaseBlack
+Kd 0.130 0.140 0.160
+Ks 0.250 0.250 0.280
+Ns 25.0
+illum 2
+
+newmtl BadgeCyan
+Kd 0.050 0.780 0.920
+Ks 0.600 0.600 0.600
+Ns 40.0
+illum 2
+
+newmtl BadgeYellow
+Kd 0.950 0.780 0.100
+Ks 0.600 0.600 0.600
+Ns 40.0
+illum 2
+
+newmtl BadgeViolet
+Kd 0.680 0.280 0.880
+Ks 0.600 0.600 0.600
+Ns 40.0
+illum 2
+
+newmtl RubberFoot
+Kd 0.030 0.030 0.030
+Ks 0.050 0.050 0.050
+Ns 5.0
+illum 2
