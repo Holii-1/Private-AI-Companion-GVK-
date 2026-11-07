@@ -133,6 +133,40 @@ gvk-private-ai/
 * **Windows:** віртуальний диск / Memory-Mapped Anonymous Pipes із примусовим зануленням буфера перед закриттям.
 * **Kill-Switch демон:** окремий потік кожні 3 секунди перевіряє наявність `vault/master.key` на диску (якщо сесія запущена з диска). При вийманні носія — `SIGKILL` для `llama-server` та миттєве очищення/демонтування RAM-диска.
 
+### Інструкція з використання пакувальника (`tools/disc_packer.py`)
+
+Інструмент розробника для генерації ключів, потокового шифрування (по 64 МБ) та збірки образів Blu-ray дисків.
+
+```bash
+# 0. Самоперевірка криптографічного ядра в ОЗП (Argon2id + AES-256-GCM + HMAC)
+python3 tools/disc_packer.py self-test
+
+# 1. Генерація 32-байтного ключа master.key (секретна фраза вводиться приховано)
+python3 tools/disc_packer.py keygen -o vault/master.key
+
+# 2. Потокове шифрування базової моделі у контейнер .enc
+python3 tools/disc_packer.py encrypt \
+  -k vault/master.key \
+  -i Qwen2.5-7B-Instruct-Q4_K_M.gguf \
+  -o base/base_model.gguf.enc
+
+# 3. Пакування особистості учасника (створює adapter.gguf.enc, payload.tar.enc, manifest.json, origin.sig)
+python3 tools/disc_packer.py pack-persona \
+  -k vault/master.key \
+  --id friend_1 \
+  --adapter raw/friend_1_lora.gguf \
+  --payload-dir raw/friend_1_data/ \
+  -o personas_encrypted/friend_1/
+
+# 4. Збірка готової структури оптичного диска GVK_VAULT (з run.sh та run.bat)
+python3 tools/disc_packer.py build-disc \
+  -k vault/master.key \
+  --id friend_1 \
+  --base-enc base/base_model.gguf.enc \
+  --persona-dir personas_encrypted/friend_1/ \
+  -o dist/GVK_VAULT_DISC_1/
+```
+
 ---
 
 ## 5. Пайплайн даних, QLoRA та Оркестрація
