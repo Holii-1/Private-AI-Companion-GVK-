@@ -167,6 +167,31 @@ python3 tools/disc_packer.py build-disc \
   -o dist/GVK_VAULT_DISC_1/
 ```
 
+### Runtime Крипто-сховище та RAM-диск (`core/crypto_vault.py`)
+
+Модуль рантайму, що управляє життєвим циклом зашифрованої сесії у пам'яті:
+* **Автопошук носія (`find_gvk_disc_path`):** автоматично знаходить змонтований оптичний диск `GVK_VAULT` (на macOS у `/Volumes/`, Linux у `/media/` або `/run/media/`, Windows `D:\..Z:\`) і зчитує `vault/master.key` за `0.01 с`. За відсутності диска переходить у режим ручного вводу майстер-фрази (`Argon2id`).
+* **Кросплатформний RAM-диск (`mount_ramdisk`):**
+  * **macOS:** створює блоковий RAM-пристрій через `hdiutil attach -nomount ram://<sectors>`, форматує у HFS+ з правами `0700` (`nobrowse,noowners,nosuid`) та вимикає індексацію Spotlight (`mdutil -i off`, `.metadata_never_index`).
+  * **Linux:** монтує ізольований каталог у `/dev/shm/gvk_runtime_<pid>` (`chmod 0700`).
+  * **Windows:** використовує віртуальний RAM-диск `ImDisk` або ізольований сесійний буфер із примусовим затиранням нулями (`0x00`).
+* **Розпакування в ОЗП (`decrypt_container_to_ram`, `unpack_persona_to_ram`):** потоково розшифровує базову модель, LoRA-адаптери та архіви `payload.tar.enc` безпосередньо в RAM-диск.
+* **Фоновий демон Kill-Switch (`start_kill_switch`):** кожні 3 секунди перевіряє доступність `vault/master.key` на носії. При вийманні диска або спрацюванні тумблера `GVK-DOCK` миттєво надсилає `SIGKILL` процесам ШІ, затирає ключ та файли в RAM нулями (`0x00`) і примусово демонтує RAM-диск.
+
+```bash
+# Запуск повної перевірки Milestone 1 (шифрування -> монтування RAM-диска -> дешифрування -> Kill-Switch)
+python3 core/crypto_vault.py self-test
+```
+
+```python
+# Programmatic API (використання всередині core/main.py):
+from core.crypto_vault import CryptoVault
+
+with CryptoVault(disc_path=disc_path, ramdisk_mb=7168) as vault:
+    base_gguf = vault.decrypt_container_to_ram("base_model.gguf.enc", "base_model.gguf")
+    persona = vault.unpack_persona_to_ram("friend_1", "adapter.gguf.enc", "payload.tar.enc")
+```
+
 ---
 
 ## 5. Пайплайн даних, QLoRA та Оркестрація
@@ -276,9 +301,9 @@ python3 tools/disc_packer.py build-disc \
 #### Етап 1: Фундамент та даних/крипто-пайплайн
 - [ ] **[Трек А]** Реалізувати парсер Telegram-експорту (`tools/tg_parser.py`) зі склеюванням реплік (`< 180s`) та фільтрацією сміття.
 - [ ] **[Трек А]** Сформувати тренувальні вибірки у форматі ChatML для 3 учасників.
-- [ ] **[Трек Б]** Реалізувати генерацію ключа `Argon2id` та потокове шифрування/дешифрування `AES-256-GCM` (`tools/disc_packer.py`, `core/crypto_vault.py`).
-- [ ] **[Трек Б]** Реалізувати кросплатформне монтування RAM-диска (Linux/macOS/Windows).
-- [ ] **[Milestone 1]** Успішний тест: зашифрувати тестовий контейнер і розпакувати його напряму в RAM-диск.
+- [x] **[Трек Б]** Реалізувати генерацію ключа `Argon2id` та потокове шифрування/дешифрування `AES-256-GCM` (`tools/disc_packer.py`, `core/crypto_vault.py`).
+- [x] **[Трек Б]** Реалізувати кросплатформне монтування RAM-диска (Linux/macOS/Windows).
+- [x] **[Milestone 1]** Успішний тест: зашифрувати тестовий контейнер і розпакувати його напряму в RAM-диск.
 
 #### Етап 2: Тренування моделей та система доставки
 - [ ] **[Трек А]** Навчити 3 QLoRA-адаптери (`tools/train_lora.py`) на базі `Qwen2.5-7B-Instruct` та експортувати у `GGUF`.
