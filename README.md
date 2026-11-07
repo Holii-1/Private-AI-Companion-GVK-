@@ -201,11 +201,26 @@ with CryptoVault(disc_path=disc_path, ramdisk_mb=7168) as vault:
 2. **Склеювання (`Message Chunking`):** об'єднання послідовних повідомлень одного автора з інтервалом `< 180 с` через `\n`.
 3. **Нарізка контексту:** ковзне вікно по 6–12 реплік у форматі `ChatML` (цільовий друг = `assistant`).
 
-### Гіперпараметри навчання (`tools/train_lora.py`)
-* **База:** `Qwen2.5-7B-Instruct`
-* **Маскування лоссу:** `train_on_responses_only` (градієнти лише на відповідях цільового учасника)
+### Гіперпараметри навчання (`tools/train_lora.py` та `notebooks/train_qwen_lora.ipynb`)
+* **База:** `Qwen2.5-7B-Instruct` (`unsloth/Qwen2.5-7B-Instruct-bnb-4bit`)
+* **Маскування лоссу:** `train_on_responses_only` (градієнти лише на відповідях цільового учасника `<|im_start|>assistant\n`)
 * **Конфігурація LoRA:** `r = 32`, `alpha = 64`, цільові модулі: всі 7 лінійних шарів (`q_proj`, `k_proj`, `v_proj`, `o_proj`, `gate_proj`, `up_proj`, `down_proj`)
-* **Режим тренування:** `1.5 – 2.0` епохи, `LR = 1.5e-4` (Cosine), `warmup_ratio = 0.05`, оптимізатор `adamw_8bit`
+* **Режим тренування:** `1.8` епохи (`1.5 – 2.0`), `LR = 1.5e-4` (Cosine), `warmup_ratio = 0.05`, оптимізатор `adamw_8bit`
+* **Експорт у GGUF:** автоматична конвертація адаптера у формат `F16 .gguf` для `llama-server`
+
+```bash
+# 0. Автономна перевірка валідатора ChatML та симуляція маскування лоссу (працює без GPU на macOS/CPU)
+python3 tools/train_lora.py self-test
+
+# 1. Dry-run перевірка реального датасету перед запуском на GPU
+python3 tools/train_lora.py train --persona friend_1 --dataset datasets/friend_1_chatml.jsonl --dry-run
+
+# 2. Навчання одного адаптера на CUDA GPU з експортом у GGUF
+python3 tools/train_lora.py train --persona friend_1 --dataset datasets/friend_1_chatml.jsonl -o adapters/
+
+# 3. Пакетне навчання всіх 3-х учасників по черзі
+python3 tools/train_lora.py train-all --dataset-dir datasets/ -o adapters/
+```
 
 ### Оркестратор та гарячий свічинг (`core/orchestrator.py`)
 * Запускається єдиний інстанс `llama-server` (`--ctx-size 8192 --mmap -ngl 99`), якому передаються базова модель та всі відкриті адаптери з початковою вагою `0.0`.
