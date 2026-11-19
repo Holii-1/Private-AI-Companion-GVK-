@@ -385,12 +385,12 @@ def calc_split(total: float, people: int = 2) -> str:
 #### Етап 3: RAG, Скіли, Оркестратор та TUI
 - [x] **[Трек А]** Зібрати векторні бази `memory.faiss` (`tools/build_rag.py`) для кожного учасника.
 - [x] **[Трек А]** Створити системні промпти (`prompt.txt`), 4 ASCII-спрайти емоцій (`portraits/`), конфіги (`persona_config.json`) та індивідуальні функції (`tools.py`).
-- [ ] **[Трек Б]** Реалізувати `core/orchestrator.py` (керування `llama-server`, гарячий свічинг LoRA, парсинг `[MOOD]` тегів для міміки, Cross-Talk).
-- [ ] **[Трек Б]** Інтегрувати `core/memory_rag.py`, пісочницю `core/skill_runner.py` та двовіконний TUI `core/menu.py` (live-чат, динамічні ASCII-портрети, досьє).
+- [x] **[Трек Б]** Реалізувати `core/orchestrator.py` (керування `llama-server`, гарячий свічинг LoRA, парсинг `[MOOD]` тегів для міміки, Cross-Talk).
+- [x] **[Трек Б]** Інтегрувати `core/memory_rag.py`, пісочницю `core/skill_runner.py` та двовіконний TUI `core/menu.py` (live-чат, динамічні ASCII-портрети, досьє).
 - [ ] **[Milestone 3]** Запуск повноцінної групової сесії трьох ботів у Тріо-режимі з пам'яттю, скілами, реакціями міміки та візуальним TUI.
 
 #### Етап 4: Фінальне пакування та запис дисків
-- [ ] **[Трек А]** Запакувати фінальні `payload.tar.enc` та `adapter.gguf.enc`, провести тюнінг `temperature` та `chattiness_prob`.
+- [x] **[Трек А]** Запакувати фінальні `payload.tar.enc` та `adapter.gguf.enc`, провести тюнінг `temperature` та `chattiness_prob`.
 - [ ] **[Трек Б]** Відтестувати фоновий потік Kill-Switch (включно з апаратним тумблером) та стартові скрипти `run.sh` / `run.bat`.
 - [ ] **[Трек Б]** Зібрати фінальні ISO-образи та записати 3 фізичні Blu-ray диски `GVK_VAULT`.
 - [ ] **[Milestone 4]** Реліз `v1.0.0`.
