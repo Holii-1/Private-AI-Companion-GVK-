@@ -48,8 +48,12 @@ goto :resolve_py
 :dvd_mode
 set "REPO_DIR=%GVK_HOME%\repo"
 set "DISC_PATH=%SCRIPT_DIR%"
+set "MEDIA_MODE=DVD"
+if exist "%SCRIPT_DIR%\base\*.gguf" set "MEDIA_MODE=USB"
+if exist "%SCRIPT_DIR%\bin\*" set "MEDIA_MODE=USB"
+if exist "%SCRIPT_DIR%\vault\media_mode.json" set "MEDIA_MODE=USB"
 echo ====================================================================
-echo  [*] GVK_VAULT Disc Detected: %SCRIPT_DIR%
+echo  [*] GVK_VAULT Media Detected: %SCRIPT_DIR% [Mode: %MEDIA_MODE%]
 echo ====================================================================
 if not exist "%GVK_HOME%" mkdir "%GVK_HOME%"
 
@@ -57,7 +61,8 @@ if exist "%SCRIPT_DIR%\core_bundle\core\main.py" (
     if not exist "%REPO_DIR%" mkdir "%REPO_DIR%"
     xcopy "%SCRIPT_DIR%\core_bundle\*" "%REPO_DIR%\" /E /I /H /Y /Q >nul
     attrib -R "%REPO_DIR%\*.*" /S /D >nul 2>&1
-    echo  [OK] Seeded local GVK core from DVD ^(core_bundle^).
+    echo  [OK] Seeded local GVK core from %MEDIA_MODE% ^(core_bundle^).
+    if /I "%MEDIA_MODE%"=="USB" goto :resolve_py
 )
 
 where git >nul 2>&1
@@ -166,8 +171,6 @@ if exist "%GVK_HOME%\.venv\Scripts\python.exe" (
 
 :bootstrap_py
 if /I "%CMD_NAME%"=="status" goto :py_missing
-where curl.exe >nul 2>&1
-if errorlevel 1 goto :py_missing
 where tar.exe >nul 2>&1
 if errorlevel 1 goto :py_missing
 
@@ -178,6 +181,17 @@ if exist "%PY_TMP%" rmdir /S /Q "%PY_TMP%"
 if exist "%PY_ARCHIVE%" del /F /Q "%PY_ARCHIVE%"
 mkdir "%PY_TMP%"
 
+set "USB_PY_ARCHIVE="
+for %%F in ("%SCRIPT_DIR%\python_portable\*windows*.tar.gz") do set "USB_PY_ARCHIVE=%%~fF"
+if defined USB_PY_ARCHIVE (
+    echo  [*] [USB-MODE] Unpacking portable Python 3.12 from media: "%USB_PY_ARCHIVE%"...
+    tar.exe -xzf "%USB_PY_ARCHIVE%" -C "%PY_TMP%"
+    if not errorlevel 1 if exist "%PY_TMP%\python\python.exe" goto :py_extracted_ok
+)
+
+where curl.exe >nul 2>&1
+if errorlevel 1 goto :py_missing
+
 echo  [*] Python 3.10+ ^(with Tkinter^) not found — downloading portable Python 3.12 ^(~35 MB^)...
 curl.exe -fSL --retry 2 --connect-timeout 15 -o "%PY_ARCHIVE%" "%PORTABLE_PY_URL%"
 if errorlevel 1 goto :py_dl_failed
@@ -185,6 +199,8 @@ if errorlevel 1 goto :py_dl_failed
 tar.exe -xzf "%PY_ARCHIVE%" -C "%PY_TMP%"
 if errorlevel 1 goto :py_dl_failed
 if not exist "%PY_TMP%\python\python.exe" goto :py_dl_failed
+
+:py_extracted_ok
 
 if exist "%GVK_HOME%\python" rmdir /S /Q "%GVK_HOME%\python"
 move "%PY_TMP%\python" "%GVK_HOME%\python" >nul

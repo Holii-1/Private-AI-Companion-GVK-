@@ -611,11 +611,24 @@ bootstrap_portable_python() {
     tmp_dir="$(mktemp -d "${GVK_HOME}/py_dl_XXXXXX")"
     archive="${tmp_dir}/python.tar.gz"
 
-    echo " [*] Python 3.10+ (з Tk >= 8.6) не знайдено — завантажуємо портативний Python ${PORTABLE_PY_VER} (~35 МБ)..." >&2
-    if ! curl -fSL --retry 2 --connect-timeout 15 -o "${archive}" "${py_url}"; then
-        rm -rf "${tmp_dir}"
-        echo " [X] Не вдалося завантажити портативний Python. Перевірте інтернет або встановіть Python 3.12 вручну." >&2
-        return 1
+    local usb_py_cand=""
+    for cand_f in "${SCRIPT_DIR}/python_portable/"*"${triple}"*.tar.gz; do
+        if [ -f "${cand_f}" ]; then
+            usb_py_cand="${cand_f}"
+            break
+        fi
+    done
+
+    if [ -n "${usb_py_cand}" ]; then
+        echo " [*] [USB-РЕЖИМ] Встановлення портативного Python ${PORTABLE_PY_VER} із носія: $(basename "${usb_py_cand}")..." >&2
+        cp "${usb_py_cand}" "${archive}"
+    else
+        echo " [*] Python 3.10+ (з Tk >= 8.6) не знайдено — завантажуємо портативний Python ${PORTABLE_PY_VER} (~35 МБ)..." >&2
+        if ! curl -fSL --retry 2 --connect-timeout 15 -o "${archive}" "${py_url}"; then
+            rm -rf "${tmp_dir}"
+            echo " [X] Не вдалося завантажити портативний Python. Перевірте інтернет або встановіть Python 3.12 вручну." >&2
+            return 1
+        fi
     fi
 
     if ! tar -xzf "${archive}" -C "${tmp_dir}" || [ ! -x "${tmp_dir}/python/bin/python3" ]; then
@@ -712,14 +725,20 @@ if [ -f "${SCRIPT_DIR}/core/main.py" ] && [ -f "${SCRIPT_DIR}/updater.py" ]; the
 else
     REPO_DIR="${GVK_HOME}/repo"
     DISC_ARGS=(--disc-path "${SCRIPT_DIR}")
+    MEDIA_MODE="DVD"
+    if [ -d "${SCRIPT_DIR}/base" ] || [ -d "${SCRIPT_DIR}/bin" ] || [ -f "${SCRIPT_DIR}/vault/media_mode.json" ]; then
+        MEDIA_MODE="USB"
+    fi
     echo "===================================================================="
-    echo " [*] GVK_VAULT Виявлено: ${SCRIPT_DIR}"
+    echo " [*] GVK_VAULT Виявлено: ${SCRIPT_DIR} [Режим: ${MEDIA_MODE}]"
     echo "===================================================================="
     mkdir -p "${GVK_HOME}"
     if [ ! -f "${REPO_DIR}/core/main.py" ]; then
         seed_repo_from_disc_bundle "${REPO_DIR}" || true
     fi
-    if has_real_git && { [ -d "${REPO_DIR}/.git" ] || [ ! -f "${REPO_DIR}/core/main.py" ]; }; then
+    if [ "${MEDIA_MODE}" = "USB" ] && [ -f "${REPO_DIR}/core/main.py" ]; then
+        seed_repo_from_disc_bundle "${REPO_DIR}" || true
+    elif has_real_git && { [ -d "${REPO_DIR}/.git" ] || [ ! -f "${REPO_DIR}/core/main.py" ]; }; then
         if [ ! -d "${REPO_DIR}/.git" ]; then
             echo " [*] Перший запуск: клонування ядра GVK Private AI..."
             git clone "${REPO_URL}" "${REPO_DIR}" || sync_repo_via_tarball "${REPO_DIR}"
@@ -730,7 +749,7 @@ else
     else
         sync_repo_via_tarball "${REPO_DIR}"
     fi
-    # Якщо на DVD core_bundle свіжіший за завантажене з GitHub репо — поверх накладаємо файли з DVD
+    # Якщо на носії core_bundle свіжіший за завантажене з GitHub репо — поверх накладаємо файли з носія
     if [ -f "${SCRIPT_DIR}/core_bundle/core/main.py" ] && { [ ! -f "${REPO_DIR}/core/main.py" ] || [ "${SCRIPT_DIR}/core_bundle/core/main.py" -nt "${REPO_DIR}/core/main.py" ]; }; then
         seed_repo_from_disc_bundle "${REPO_DIR}" || true
     fi
@@ -832,8 +851,12 @@ goto :resolve_py
 :dvd_mode
 set "REPO_DIR=%GVK_HOME%\repo"
 set "DISC_PATH=%SCRIPT_DIR%"
+set "MEDIA_MODE=DVD"
+if exist "%SCRIPT_DIR%\base\*.gguf" set "MEDIA_MODE=USB"
+if exist "%SCRIPT_DIR%\bin\*" set "MEDIA_MODE=USB"
+if exist "%SCRIPT_DIR%\vault\media_mode.json" set "MEDIA_MODE=USB"
 echo ====================================================================
-echo  [*] GVK_VAULT Disc Detected: %SCRIPT_DIR%
+echo  [*] GVK_VAULT Media Detected: %SCRIPT_DIR% [Mode: %MEDIA_MODE%]
 echo ====================================================================
 if not exist "%GVK_HOME%" mkdir "%GVK_HOME%"
 
@@ -841,7 +864,8 @@ if exist "%SCRIPT_DIR%\core_bundle\core\main.py" (
     if not exist "%REPO_DIR%" mkdir "%REPO_DIR%"
     xcopy "%SCRIPT_DIR%\core_bundle\*" "%REPO_DIR%\" /E /I /H /Y /Q >nul
     attrib -R "%REPO_DIR%\*.*" /S /D >nul 2>&1
-    echo  [OK] Seeded local GVK core from DVD ^(core_bundle^).
+    echo  [OK] Seeded local GVK core from %MEDIA_MODE% ^(core_bundle^).
+    if /I "%MEDIA_MODE%"=="USB" goto :resolve_py
 )
 
 where git >nul 2>&1
@@ -950,8 +974,6 @@ if exist "%GVK_HOME%\.venv\Scripts\python.exe" (
 
 :bootstrap_py
 if /I "%CMD_NAME%"=="status" goto :py_missing
-where curl.exe >nul 2>&1
-if errorlevel 1 goto :py_missing
 where tar.exe >nul 2>&1
 if errorlevel 1 goto :py_missing
 
@@ -962,6 +984,17 @@ if exist "%PY_TMP%" rmdir /S /Q "%PY_TMP%"
 if exist "%PY_ARCHIVE%" del /F /Q "%PY_ARCHIVE%"
 mkdir "%PY_TMP%"
 
+set "USB_PY_ARCHIVE="
+for %%F in ("%SCRIPT_DIR%\python_portable\*windows*.tar.gz") do set "USB_PY_ARCHIVE=%%~fF"
+if defined USB_PY_ARCHIVE (
+    echo  [*] [USB-MODE] Unpacking portable Python 3.12 from media: "%USB_PY_ARCHIVE%"...
+    tar.exe -xzf "%USB_PY_ARCHIVE%" -C "%PY_TMP%"
+    if not errorlevel 1 if exist "%PY_TMP%\python\python.exe" goto :py_extracted_ok
+)
+
+where curl.exe >nul 2>&1
+if errorlevel 1 goto :py_missing
+
 echo  [*] Python 3.10+ ^(with Tkinter^) not found — downloading portable Python 3.12 ^(~35 MB^)...
 curl.exe -fSL --retry 2 --connect-timeout 15 -o "%PY_ARCHIVE%" "%PORTABLE_PY_URL%"
 if errorlevel 1 goto :py_dl_failed
@@ -969,6 +1002,8 @@ if errorlevel 1 goto :py_dl_failed
 tar.exe -xzf "%PY_ARCHIVE%" -C "%PY_TMP%"
 if errorlevel 1 goto :py_dl_failed
 if not exist "%PY_TMP%\python\python.exe" goto :py_dl_failed
+
+:py_extracted_ok
 
 if exist "%GVK_HOME%\python" rmdir /S /Q "%GVK_HOME%\python"
 move "%PY_TMP%\python" "%GVK_HOME%\python" >nul
@@ -1140,6 +1175,187 @@ def build_disc_tree(
         f.write(RUN_BAT_TEMPLATE)
 
     print(f"[✓] Образ DVD-диска GVK_VAULT для '{persona_id}' успішно зібрано у: {output_disc_dir}")
+
+
+def fetch_usb_llama_bins(output_bins_dir: str, include_cuda_zip: bool = False) -> List[str]:
+    """
+    Автоматично завантажує кросплатформний набір релізних архівів `llama.cpp`
+    для офлайн USB-дистрибутиву:
+      - Windows Vulkan x64 (працює на AMD Radeon, Intel Arc/iGPU та NVIDIA)
+      - Windows CPU x64 (універсальний фолбек)
+      - macOS Apple Silicon ARM64 (Metal)
+      - macOS Intel x64
+      - Опційно (--include-cuda-zip): Windows CUDA 12.4 x64 + cudart DLLs
+    """
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if repo_root not in sys.path:
+        sys.path.insert(0, repo_root)
+    from updater import _download_with_resume, _fetch_latest_llama_release_with_assets
+
+    os.makedirs(output_bins_dir, exist_ok=True)
+    release = _fetch_latest_llama_release_with_assets()
+    tag = release.get("tag_name", "latest")
+    assets = release.get("assets") or []
+    print(f" [*] Отримано реліз llama.cpp: {tag} ({len(assets)} файлів)")
+
+    wanted_predicates = [
+        ("win-vulkan-x64", lambda n: n.startswith("llama-") and "win-vulkan-x64.zip" in n),
+        ("win-cpu-x64", lambda n: n.startswith("llama-") and "win-cpu-x64.zip" in n),
+        ("macos-arm64", lambda n: n.startswith("llama-") and "macos-arm64.tar.gz" in n),
+        ("macos-x64", lambda n: n.startswith("llama-") and "macos-x64.tar.gz" in n),
+    ]
+    if include_cuda_zip:
+        wanted_predicates.extend(
+            [
+                ("win-cuda-12.4-x64", lambda n: n.startswith("llama-") and "win-cuda-12.4-x64.zip" in n),
+                ("cudart-win-cuda-12.4-x64", lambda n: n.startswith("cudart-llama-") and "win-cuda-12.4-x64.zip" in n),
+            ]
+        )
+
+    downloaded_paths: List[str] = []
+    for label, pred in wanted_predicates:
+        matched = next((a for a in assets if pred(str(a.get("name", "")).lower())), None)
+        if not matched:
+            print(f" [!] Не знайдено асет для '{label}' у релізі {tag}")
+            continue
+        fname = matched["name"]
+        url = matched["browser_download_url"]
+        dst = os.path.join(output_bins_dir, fname)
+        expected_size = int(matched.get("size") or 0)
+        if os.path.isfile(dst) and (expected_size <= 0 or os.path.getsize(dst) == expected_size):
+            print(f" [OK] Уже завантажено: {fname} ({os.path.getsize(dst) // (1024 * 1024)} МБ)")
+            downloaded_paths.append(dst)
+            continue
+        _download_with_resume(url, dst, label=fname)
+        downloaded_paths.append(dst)
+    return downloaded_paths
+
+
+def build_usb_tree(
+    output_usb_dir: str,
+    master_key: bytes,
+    persona_id: str,
+    persona_build_dir: str,
+    base_model_path: Optional[str] = None,
+    llama_bins_dir: Optional[str] = None,
+    pascal_runtime_dir: Optional[str] = None,
+    embeddings_dir: Optional[str] = None,
+    fetch_bins: bool = False,
+    include_cuda_zip: bool = False,
+) -> None:
+    """
+    Формує повний офлайн USB-дистрибутив `GVK_VAULT [Mode: USB]` (під флешку 16–64 ГБ):
+      1. Базова структура `vault/`, `persona/`, `core_bundle/`, `run.bat`, `run.sh`, `run.command`.
+      2. Маркер `vault/media_mode.json` (`{"mode": "USB"}`).
+      3. Публічна базова модель `base/Qwen2.5-14B-Instruct-Q4_K_M.gguf` (~9.0 ГБ), яка при першому
+         запуску автоматично копіюється у `~/.gvk_ai/base/` без звернення до Hugging Face.
+      4. Кросплатформні бінарники `bin/`:
+         - Архівні релізи для Windows (Vulkan AMD/Intel/NVIDIA + CPU x64) та macOS (ARM64 + Intel x64).
+         - Готовий CUDA 12 / Pascal рантайм `bin/win-cuda-pascal/` із `cublas64_12.dll`, `cudart64_12.dll`, `ggml-cuda.dll`.
+      5. Опційно: офлайн RAG-модель `embeddings/paraphrase-multilingual-MiniLM-L12-v2/`.
+    """
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if repo_root not in sys.path:
+        sys.path.insert(0, repo_root)
+    from updater import DEFAULT_BASE_MODEL_FILENAME, DEFAULT_EMBEDDING_SHORT_NAME, _copy_file_with_progress
+
+    build_disc_tree(
+        output_disc_dir=output_usb_dir,
+        master_key=master_key,
+        persona_id=persona_id,
+        persona_build_dir=persona_build_dir,
+    )
+
+    # 1. Записуємо явний маркер USB-режиму
+    mode_meta = {
+        "mode": "USB",
+        "persona_id": persona_id,
+        "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    }
+    with open(os.path.join(output_usb_dir, "vault", "media_mode.json"), "w", encoding="utf-8") as f:
+        json.dump(mode_meta, f, indent=2, ensure_ascii=False)
+        f.write("\n")
+
+    # 2. Базова модель 14B -> <USB>/base/Qwen2.5-14B-Instruct-Q4_K_M.gguf
+    resolved_base = base_model_path
+    if not resolved_base:
+        default_repo_base = os.path.join(repo_root, "base", DEFAULT_BASE_MODEL_FILENAME)
+        if os.path.isfile(default_repo_base):
+            resolved_base = default_repo_base
+
+    if resolved_base and os.path.isfile(resolved_base):
+        usb_base_dir = os.path.join(output_usb_dir, "base")
+        os.makedirs(usb_base_dir, exist_ok=True)
+        dst_gguf = os.path.join(usb_base_dir, DEFAULT_BASE_MODEL_FILENAME)
+        if (
+            os.path.isfile(dst_gguf)
+            and os.path.getsize(dst_gguf) == os.path.getsize(resolved_base)
+        ):
+            print(f" [OK] Базова модель вже присутня на USB: {dst_gguf}")
+        else:
+            _copy_file_with_progress(
+                resolved_base,
+                dst_gguf,
+                label=f"Запис {os.path.basename(resolved_base)} у USB-образ",
+            )
+    else:
+        print(" [!] УВАГА: Базову модель не знайдено для копіювання в USB-образ (передайте --base-model).")
+
+    # 3. Бінарники llama-server (Windows Vulkan/CPU + macOS ARM64/x64 + CUDA DLLs)
+    usb_bin_dir = os.path.join(output_usb_dir, "bin")
+    os.makedirs(usb_bin_dir, exist_ok=True)
+
+    staging_bins = llama_bins_dir or os.path.join(repo_root, "base", "llama_bins")
+    if fetch_bins:
+        fetch_usb_llama_bins(staging_bins, include_cuda_zip=include_cuda_zip)
+
+    if os.path.isdir(staging_bins):
+        for fname in sorted(os.listdir(staging_bins)):
+            src_f = os.path.join(staging_bins, fname)
+            if os.path.isfile(src_f) and fname.lower().endswith((".zip", ".tar.gz", ".tgz")):
+                dst_f = os.path.join(usb_bin_dir, fname)
+                if not (os.path.isfile(dst_f) and os.path.getsize(dst_f) == os.path.getsize(src_f)):
+                    shutil.copy2(src_f, dst_f)
+                print(f" [✓] Додано архів llama-server у USB bin/: {fname}")
+
+    # 3b. Копіювання готового CUDA 12 / Pascal рантайму (з cublas64_12.dll, cudart64_12.dll, ggml-cuda.dll)
+    resolved_pascal = pascal_runtime_dir
+    if not resolved_pascal:
+        default_pascal = os.path.join(repo_root, "base", "llama-pascal-runtime")
+        if os.path.isdir(default_pascal):
+            resolved_pascal = default_pascal
+
+    if resolved_pascal and os.path.isdir(resolved_pascal):
+        usb_cuda_dir = os.path.join(usb_bin_dir, "win-cuda-pascal")
+        os.makedirs(usb_cuda_dir, exist_ok=True)
+        copied_cuda = 0
+        for fname in sorted(os.listdir(resolved_pascal)):
+            src_f = os.path.join(resolved_pascal, fname)
+            if not os.path.isfile(src_f):
+                continue
+            fl = fname.lower()
+            if fl == "llama-server.exe" or fl.endswith(".dll") or fl.startswith("license"):
+                shutil.copy2(src_f, os.path.join(usb_cuda_dir, fname))
+                copied_cuda += 1
+        print(f" [✓] Додано Windows NVIDIA CUDA 12 рантайм у USB bin/win-cuda-pascal/ ({copied_cuda} файлів)")
+
+    # 4. Опційна офлайн RAG-модель embeddings/paraphrase-multilingual-MiniLM-L12-v2
+    resolved_emb = embeddings_dir
+    if not resolved_emb:
+        for cand_emb in (
+            os.path.join(repo_root, "base", "embeddings", DEFAULT_EMBEDDING_SHORT_NAME),
+            os.path.join(os.path.expanduser("~/.gvk_ai"), "embeddings", DEFAULT_EMBEDDING_SHORT_NAME),
+        ):
+            if os.path.isdir(cand_emb) and os.path.isfile(os.path.join(cand_emb, "config.json")):
+                resolved_emb = cand_emb
+                break
+
+    if resolved_emb and os.path.isdir(resolved_emb):
+        usb_emb_dst = os.path.join(output_usb_dir, "embeddings", DEFAULT_EMBEDDING_SHORT_NAME)
+        shutil.copytree(resolved_emb, usb_emb_dst, dirs_exist_ok=True)
+        print(f" [✓] Додано офлайн RAG-модель у USB embeddings/: {usb_emb_dst}")
+
+    print(f"[✓] Повний USB-дистрибутив GVK_VAULT [Mode: USB] зібрано у: {output_usb_dir}")
 
 
 # =====================================================================
@@ -1730,6 +1946,38 @@ def main() -> None:
     p_iso.add_argument("-o", "--output", required=True, help="Вихідний шлях до файлу .iso")
     p_iso.add_argument("--volume-name", default="GVK_VAULT", help="Мітка тому DVD (за замовч. GVK_VAULT)")
 
+    # 9. fetch-usb-bins
+    p_fbins = sub.add_parser(
+        "fetch-usb-bins",
+        help="Завантажити релізні архіви llama.cpp (Windows Vulkan/CPU + macOS ARM64/Intel) для офлайн USB",
+    )
+    p_fbins.add_argument("-o", "--output-dir", default="base/llama_bins", help="Папка збереження архівів")
+    p_fbins.add_argument(
+        "--include-cuda-zip",
+        action="store_true",
+        help="Додатково скачати офіційні архіви win-cuda-12.4-x64.zip + cudart-llama-*.zip (~720 МБ)",
+    )
+
+    # 10. build-usb
+    p_usb = sub.add_parser(
+        "build-usb",
+        help="Зібрати повний офлайн USB-дистрибутив GVK_VAULT [Mode: USB] з моделлю 14B та бінарниками Win/macOS/CUDA",
+    )
+    p_usb.add_argument("-k", "--key-file", required=True, help="Шлях до файлу master.key")
+    p_usb.add_argument("--id", default="friend_1", help="ID персонажа (за замовч. friend_1)")
+    p_usb.add_argument(
+        "--persona-dir",
+        default="personas_encrypted/friend_1",
+        help="Папка зібраного персонажа (за замовч. personas_encrypted/friend_1)",
+    )
+    p_usb.add_argument("-o", "--output-dir", required=True, help="Вихідна папка або буква USB-диска (напр. dist/GVK_VAULT_USB або E:\\)")
+    p_usb.add_argument("--base-model", default=None, help="Шлях до Qwen2.5-14B-Instruct-Q4_K_M.gguf (за замовч. base/Qwen2.5-14B-Instruct-Q4_K_M.gguf)")
+    p_usb.add_argument("--llama-bins-dir", default=None, help="Папка з архівами llama.cpp (за замовч. base/llama_bins)")
+    p_usb.add_argument("--pascal-runtime-dir", default=None, help="Папка з CUDA DLL рантаймом (за замовч. base/llama-pascal-runtime)")
+    p_usb.add_argument("--embeddings-dir", default=None, help="Опційно: папка з офлайн моделлю paraphrase-multilingual-MiniLM-L12-v2")
+    p_usb.add_argument("--fetch-bins", action="store_true", help="Автоматично докачати відсутні архіви Win/macOS llama.cpp з GitHub")
+    p_usb.add_argument("--include-cuda-zip", action="store_true", help="При --fetch-bins також скачати офіційні CUDA 12.4 zip-архіви")
+
     args = parser.parse_args()
 
     if args.cmd == "self-test":
@@ -1802,6 +2050,24 @@ def main() -> None:
 
     elif args.cmd == "build-iso":
         build_disc_iso(args.input_dir, args.output, volume_name=args.volume_name)
+
+    elif args.cmd == "fetch-usb-bins":
+        fetch_usb_llama_bins(args.output_dir, include_cuda_zip=args.include_cuda_zip)
+
+    elif args.cmd == "build-usb":
+        key = _load_or_prompt_key(args.key_file)
+        build_usb_tree(
+            output_usb_dir=args.output_dir,
+            master_key=key,
+            persona_id=args.id,
+            persona_build_dir=args.persona_dir,
+            base_model_path=args.base_model,
+            llama_bins_dir=args.llama_bins_dir,
+            pascal_runtime_dir=args.pascal_runtime_dir,
+            embeddings_dir=args.embeddings_dir,
+            fetch_bins=args.fetch_bins,
+            include_cuda_zip=args.include_cuda_zip,
+        )
 
 
 if __name__ == "__main__":

@@ -50,7 +50,7 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # КОНСТАНТИ ВІКНА ТА ПРИГЛУШЕНОЇ ПАЛІТРИ ТЕРМІНАЛУ
 # =====================================================================
 APP_NAME = "GVK PRIVATE AI"
-APP_HEADER = "GVK PRIVATE AI [Release 1.1.0 - Hopeful Dawn]"
+APP_HEADER = "GVK PRIVATE AI [Release 1.1.1 - Optical Funeral]"
 WINDOW_WIDTH = 1280
 WINDOW_HEIGHT = 720
 DEFAULT_WAIT_SECONDS = 15
@@ -178,7 +178,7 @@ WARNING_SCREENS: List[Tuple[str, str]] = [
     ),
     (
         "ЕКСПОРТНИЙ КОНТРОЛЬ ТА ОБМЕЖЕННЯ ОБІГУ",
-        "Даний оптичний носій містить алгоритми нелінійної оптимізації та нейромережеві моделі, "
+        "Даний фізичний носій (оптичний диск або твердотільний USB-накопичувач) містить алгоритми нелінійної оптимізації та нейромережеві моделі, "
         "що класифікуються як технології подвійного призначення. Несанкціонований експорт, реекспорт або "
         "передача цього програмного забезпечення на території держав, що перебувають під санкціями ООН "
         "або РНБО України, суворо заборонені.",
@@ -339,9 +339,28 @@ def translate_sudo_key(event: tk.Event) -> Optional[str]:
     return None
 
 
+def _has_non_text_modifier(event: tk.Event) -> bool:
+    """Перевіряє, чи натиснуто Control/Command/Alt (ігнорує NumLock 0x8 на Windows)."""
+    state = int(getattr(event, "state", 0) or 0)
+    if sys.platform.startswith("win"):
+        # На Windows 0x8 — це NumLock; 0x20000 — Alt; AltGr (0x4|0x20000) може друкувати символи
+        is_ctrl = bool(state & 0x4)
+        is_alt = bool(state & 0x20000)
+        return is_ctrl != is_alt
+    if sys.platform == "darwin":
+        return bool(state & 0x4) or bool(state & 0x8) or bool(state & 0x10) or bool(state & 0x40000)
+    return bool(state & 0x4) or bool(state & 0x8)
+
+
 def _is_paste_event(event: tk.Event) -> bool:
     """Розпізнає Ctrl+V / Cmd+V незалежно від розкладки (EN / UA / RU / DE)."""
-    has_mod = bool(event.state & 0x4) or bool(event.state & 0x8) or bool(event.state & 0x40000)
+    state = int(getattr(event, "state", 0) or 0)
+    if sys.platform.startswith("win"):
+        has_mod = bool(state & 0x4) and not bool(state & 0x20000)
+    elif sys.platform == "darwin":
+        has_mod = bool(state & 0x4) or bool(state & 0x8) or bool(state & 0x10) or bool(state & 0x40000)
+    else:
+        has_mod = bool(state & 0x4)
     if not has_mod:
         return False
     ks = (getattr(event, "keysym", "") or "").lower()
@@ -638,7 +657,7 @@ class TypingConfirmationModal(tk.Frame):
                 self._refresh_display()
             return
 
-        if event.char and event.char.isprintable() and not (event.state & 0x4) and not (event.state & 0x8):
+        if event.char and event.char.isprintable() and not _has_non_text_modifier(event):
             self.typed_text += event.char
             self._refresh_display()
 
@@ -913,7 +932,7 @@ class UserSelectorModal(tk.Frame):
             if _is_paste_event(event):
                 self.handle_paste()
                 return
-            if event.char and event.char.isprintable() and not (event.state & 0x4) and not (event.state & 0x8):
+            if event.char and event.char.isprintable() and not _has_non_text_modifier(event):
                 self.custom_text += event.char
                 self.status_label.config(text="")
                 self._refresh_highlights()
@@ -2285,7 +2304,7 @@ class ChatSessionModal(tk.Frame):
                 self._refresh_input()
             return
 
-        if event.char and event.char.isprintable() and not (event.state & 0x4) and not (event.state & 0x8):
+        if event.char and event.char.isprintable() and not _has_non_text_modifier(event):
             self.typed_text += event.char
             self._refresh_input()
 

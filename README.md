@@ -337,8 +337,9 @@ def calc_split(total: float, people: int = 2) -> str:
 ### Ретро-термінальний інтерфейс (`core/menu.py`)
 Побудований на стандартному **Tkinter** (`1280×720`, фіксоване вікно, моноширинний шрифт, приглушена термінальна палітра):
 
+(previously 1.1.0 - Hopeful Dawn)
 ```text
-┌─────────── GVK PRIVATE AI [Release 1.1.0 - Hopeful Dawn] ───────────┐
+┌─────────── GVK PRIVATE AI [Release 1.1.1 - Optical Funeral] ───────────┐
 │  [Braille-портрет 4 стани]   │ [Користувач]                         │
 │  idle / sleeping / smiling   │   /команда або звичайний текст       │
 │  talking / talking2          │                                      │

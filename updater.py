@@ -62,7 +62,9 @@ DEFAULT_BASE_MODEL_URL = (
     "Qwen2.5-14B-Instruct-Q4_K_M.gguf"
 )
 LLAMA_CPP_RELEASES_API = "https://api.github.com/repos/ggml-org/llama.cpp/releases/latest"
+LLAMA_CPP_RELEASES_LIST_API = "https://api.github.com/repos/ggml-org/llama.cpp/releases?per_page=10"
 DEFAULT_EMBEDDING_MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+DEFAULT_EMBEDDING_SHORT_NAME = "paraphrase-multilingual-MiniLM-L12-v2"
 
 MIN_PYTHON_VERSION = (3, 10)
 MIN_TK_VERSION = 8.6
@@ -223,6 +225,122 @@ def find_gvk_disc_path(explicit_path: Optional[str] = None) -> Optional[str]:
     return None
 
 
+def detect_media_mode(disc_path: Optional[str]) -> Dict[str, object]:
+    """
+    Визначає режим носія GVK_VAULT:
+      - 'USB' (якщо є vault/media_mode.json з mode=USB, або на носії присутні base/*.gguf, bin/, embeddings/, python_portable/)
+      - 'DVD' (класичний легкий DVD-R ~150 МБ із хмарним докачуванням)
+      - 'NONE' (якщо фізичний носій не підключено)
+    """
+    if not disc_path or not os.path.isdir(disc_path):
+        return {
+            "mode": "NONE",
+            "disc_path": None,
+            "has_base_model": False,
+            "has_llama_bins": False,
+            "has_embeddings": False,
+            "has_portable_python": False,
+        }
+
+    explicit_mode = None
+    mode_json_path = os.path.join(disc_path, "vault", "media_mode.json")
+    if os.path.isfile(mode_json_path):
+        try:
+            with open(mode_json_path, "r", encoding="utf-8") as f:
+                mdata = json.load(f)
+            raw_m = str(mdata.get("mode") or "").strip().upper()
+            if raw_m in ("USB", "DVD"):
+                explicit_mode = raw_m
+        except (OSError, json.JSONDecodeError):
+            pass
+
+    disc_base_dir = os.path.join(disc_path, "base")
+    has_base = False
+    if os.path.isdir(disc_base_dir):
+        for gpath in glob.glob(os.path.join(disc_base_dir, "*.gguf")):
+            if _is_valid_gguf_file(gpath):
+                has_base = True
+                break
+
+    disc_bin_dir = os.path.join(disc_path, "bin")
+    has_bins = False
+    if os.path.isdir(disc_bin_dir):
+        for entry in os.listdir(disc_bin_dir):
+            el = entry.lower()
+            if (
+                el.endswith((".zip", ".tar.gz", ".tgz", ".exe"))
+                or el == "llama-server"
+                or os.path.isdir(os.path.join(disc_bin_dir, entry))
+            ):
+                has_bins = True
+                break
+
+    disc_emb_dir = os.path.join(disc_path, "embeddings")
+    has_emb = os.path.isdir(disc_emb_dir) and any(True for _ in os.listdir(disc_emb_dir))
+
+    disc_py_dir = os.path.join(disc_path, "python_portable")
+    has_py = os.path.isdir(disc_py_dir) and any(
+        f.endswith((".tar.gz", ".tgz", ".zip")) for f in os.listdir(disc_py_dir)
+    )
+
+    mode = explicit_mode or ("USB" if (has_base or has_bins or has_emb or has_py) else "DVD")
+    return {
+        "mode": mode,
+        "disc_path": disc_path,
+        "has_base_model": has_base,
+        "has_llama_bins": has_bins,
+        "has_embeddings": has_emb,
+        "has_portable_python": has_py,
+    }
+
+
+def _copy_file_with_progress(src: str, dst: str, label: str = "Копіювання") -> str:
+    """
+    Потоково копіює великий файл (наприклад 9 ГБ GGUF із USB на SSD ~/.gvk_ai/base/)
+    блоками по 8 МБ із прогрес-баром та атомарним перейменуванням .part -> dst.
+    """
+    os.makedirs(os.path.dirname(os.path.abspath(dst)), exist_ok=True)
+    part_path = dst + ".part"
+    total_size = os.path.getsize(src)
+    copied = 0
+    chunk_size = 8 * 1024 * 1024  # 8 МБ
+    t0 = time.time()
+
+    if os.path.exists(dst):
+        try:
+            os.chmod(dst, 0o644)
+        except OSError:
+            pass
+
+    with open(src, "rb") as f_in, open(part_path, "wb") as f_out:
+        while True:
+            buf = f_in.read(chunk_size)
+            if not buf:
+                break
+            f_out.write(buf)
+            copied += len(buf)
+            elapsed = max(time.time() - t0, 1e-3)
+            speed_mb = (copied / (1024 * 1024)) / elapsed
+            if total_size > 0:
+                pct = min(100.0, (copied / total_size) * 100.0)
+                print(
+                    f"\r [*] {label}: {pct:5.1f}% "
+                    f"({_format_size(copied)} / {_format_size(total_size)}) [{speed_mb:.1f} МБ/с]",
+                    end="",
+                    flush=True,
+                )
+            else:
+                print(f"\r [*] {label}: {_format_size(copied)} [{speed_mb:.1f} МБ/с]", end="", flush=True)
+
+    print()
+    try:
+        os.chmod(part_path, 0o644)
+    except OSError:
+        pass
+    os.replace(part_path, dst)
+    return dst
+
+
 def _is_valid_gguf_file(file_path: str) -> bool:
     try:
         if not os.path.isfile(file_path) or os.path.getsize(file_path) < 4:
@@ -350,6 +468,7 @@ def get_gvk_paths(gvk_home: str = DEFAULT_GVK_HOME) -> Dict[str, str]:
         "home": gvk_home,
         "base": os.path.join(gvk_home, "base"),
         "bin": os.path.join(gvk_home, "bin"),
+        "embeddings": os.path.join(gvk_home, "embeddings"),
         "personas": os.path.join(gvk_home, "personas"),
         "registry": os.path.join(gvk_home, "registry"),
         "logs": os.path.join(gvk_home, "logs"),
@@ -702,13 +821,29 @@ def verify_and_import_disc(
     gvk_home: str = DEFAULT_GVK_HOME,
 ) -> Dict[str, Optional[object]]:
     """
-    Виявляє DVD `GVK_VAULT`, перевіряє `vault/master.key`, `origin.sig`, SHA-256
+    Виявляє носій `GVK_VAULT` (DVD або USB), перевіряє `vault/master.key`, `origin.sig`, SHA-256
     та заголовки `GVK1`, реєструє підпис у `~/.gvk_ai/registry/` і копіює `.enc` на SSD.
     """
     paths = init_gvk_home(gvk_home)
     detected_disc = find_gvk_disc_path(disc_path)
     if not detected_disc:
-        return {"found": False, "imported": False, "persona_id": None, "disc_path": None, "master_key": None}
+        return {
+            "found": False,
+            "imported": False,
+            "persona_id": None,
+            "disc_path": None,
+            "master_key": None,
+            "media_mode": "NONE",
+            "media_info": detect_media_mode(None),
+        }
+
+    media_info = detect_media_mode(detected_disc)
+    media_mode = str(media_info.get("mode") or "DVD")
+    print(
+        f" [✓] Виявлено носій GVK_VAULT: {detected_disc} "
+        f"[Режим: {media_mode} | Модель на носії: {'ТАК' if media_info.get('has_base_model') else 'НІ'} | "
+        f"Бінарники: {'ТАК' if media_info.get('has_llama_bins') else 'НІ'}]"
+    )
 
     key_path = os.path.join(detected_disc, "vault", "master.key")
     with open(key_path, "rb") as f:
@@ -718,13 +853,15 @@ def verify_and_import_disc(
 
     disc_persona_dir = os.path.join(detected_disc, "persona")
     if not os.path.isdir(disc_persona_dir):
-        print(f" [OK] Диск GVK_VAULT виявлено ({detected_disc}), папка persona/ відсутня — лише ключ.")
+        print(f" [OK] Носій GVK_VAULT ({media_mode}) виявлено ({detected_disc}), папка persona/ відсутня — лише ключ.")
         return {
             "found": True,
             "imported": False,
             "persona_id": None,
             "disc_path": detected_disc,
             "master_key": master_key,
+            "media_mode": media_mode,
+            "media_info": media_info,
         }
 
     manifest = _validate_manifest_and_files(disc_persona_dir, master_key=master_key)
@@ -732,7 +869,7 @@ def verify_and_import_disc(
 
     sig_path = os.path.join(disc_persona_dir, "origin.sig")
     if not os.path.isfile(sig_path):
-        raise FileNotFoundError(f"На DVD {detected_disc} відсутній підпис persona/origin.sig!")
+        raise FileNotFoundError(f"На носії {detected_disc} відсутній підпис persona/origin.sig!")
     with open(sig_path, "rb") as f:
         sig_bytes = f.read()
 
@@ -778,7 +915,7 @@ def verify_and_import_disc(
     if already_cached:
         print(
             f" [OK] Персонаж '{persona_id}' вже активований у кеші (v{cached_ver}) — "
-            f"повторне копіювання з DVD пропущено."
+            f"повторне копіювання з {media_mode} пропущено."
         )
         return {
             "found": True,
@@ -786,6 +923,8 @@ def verify_and_import_disc(
             "persona_id": persona_id,
             "disc_path": detected_disc,
             "master_key": master_key,
+            "media_mode": media_mode,
+            "media_info": media_info,
         }
 
     # Копіюємо .enc контейнери та manifest.json у кеш SSD (без origin.sig, master.key і без Read-Only біта DVD)
@@ -802,12 +941,12 @@ def verify_and_import_disc(
         "adapter_sha256": manifest["sha256"]["adapter"],
         "payload_sha256": manifest["sha256"]["payload"],
         "updated_at": int(time.time()),
-        "source": f"dvd:{detected_disc}",
+        "source": f"{media_mode.lower()}:{detected_disc}",
     }
     _save_activated_registry(paths["registry"], registry_data)
 
     print(
-        f" [✓] Активовано та імпортовано з DVD '{persona_id}' (v{manifest.get('version', '1.0.0')}) "
+        f" [✓] Активовано та імпортовано з {media_mode} '{persona_id}' (v{manifest.get('version', '1.0.0')}) "
         f"-> {target_persona_dir}"
     )
     return {
@@ -816,6 +955,8 @@ def verify_and_import_disc(
         "persona_id": persona_id,
         "disc_path": detected_disc,
         "master_key": master_key,
+        "media_mode": media_mode,
+        "media_info": media_info,
     }
 
 
@@ -923,14 +1064,25 @@ def sync_activated_personas(
 
 
 # =====================================================================
-# 5. БАЗОВА МОДЕЛЬ 14B (З ЛОКАЛЬНОГО КЕШУ АБО HUGGING FACE)
+# 5. БАЗОВА МОДЕЛЬ 14B (З ЛОКАЛЬНОГО КЕШУ, USB-НОСІЯ АБО HUGGING FACE)
 # =====================================================================
-def _collect_base_model_candidates(gvk_home: str, repo_root: str) -> Tuple[List[str], List[str]]:
-    """Повертає (кандидати в кеші gvk_home/base, локальні кандидати в env/репо)."""
+def _collect_base_model_candidates(
+    gvk_home: str,
+    repo_root: str,
+    disc_path: Optional[str] = None,
+) -> Tuple[List[str], List[str], List[str]]:
+    """Повертає (кандидати в кеші gvk_home/base, кандидати на USB-носії disc_path/base, локальні кандидати в env/репо)."""
     paths = get_gvk_paths(gvk_home)
     cache_candidates = [os.path.join(paths["base"], DEFAULT_BASE_MODEL_FILENAME)]
     if os.path.isdir(paths["base"]):
         cache_candidates.extend(sorted(glob.glob(os.path.join(paths["base"], "*.gguf"))))
+
+    disc_candidates: List[str] = []
+    if disc_path and os.path.isdir(disc_path):
+        disc_base = os.path.join(disc_path, "base")
+        disc_candidates.append(os.path.join(disc_base, DEFAULT_BASE_MODEL_FILENAME))
+        if os.path.isdir(disc_base):
+            disc_candidates.extend(sorted(glob.glob(os.path.join(disc_base, "*.gguf"))))
 
     local_candidates: List[str] = []
     env_model = os.environ.get("GVK_BASE_MODEL")
@@ -941,16 +1093,19 @@ def _collect_base_model_candidates(gvk_home: str, repo_root: str) -> Tuple[List[
     if os.path.isdir(repo_base_dir):
         local_candidates.extend(sorted(glob.glob(os.path.join(repo_base_dir, "*.gguf"))))
     local_candidates.append(os.path.join(repo_root, "base_model.gguf"))
-    return cache_candidates, local_candidates
+    return cache_candidates, disc_candidates, local_candidates
 
 
 def find_base_model_path(
     gvk_home: str = DEFAULT_GVK_HOME,
     repo_root: str = DEFAULT_REPO_ROOT,
+    disc_path: Optional[str] = None,
 ) -> Optional[str]:
     """Read-only пошук валідної базової GGUF-моделі без створення файлів чи симлінків."""
-    cache_candidates, local_candidates = _collect_base_model_candidates(gvk_home, repo_root)
-    for cand in cache_candidates + local_candidates:
+    cache_candidates, disc_candidates, local_candidates = _collect_base_model_candidates(
+        gvk_home, repo_root, disc_path=disc_path
+    )
+    for cand in cache_candidates + disc_candidates + local_candidates:
         if cand and _is_valid_gguf_file(cand):
             return os.path.realpath(cand) if os.path.islink(cand) else cand
     return None
@@ -961,20 +1116,45 @@ def ensure_base_model(
     repo_root: str = DEFAULT_REPO_ROOT,
     download: bool = True,
     model_url: str = DEFAULT_BASE_MODEL_URL,
+    disc_path: Optional[str] = None,
 ) -> Optional[str]:
     """
     Забезпечує наявність публічної базової моделі `Qwen2.5-14B-Instruct-Q4_K_M.gguf`
-    у `~/.gvk_ai/base/`. Спершу шукає валідний GGUF у локальних шляхах (і створює symlink),
-    інакше завантажує з Hugging Face із підтримкою докачування (HTTP Range).
+    у `~/.gvk_ai/base/`:
+      1. Якщо модель уже в `~/.gvk_ai/base/` -> використовує її.
+      2. Якщо модель є на USB-носії (`<disc_path>/base/*.gguf`) -> копіює її у `~/.gvk_ai/base/`
+         із прогрес-баром (щоб `llama-server` читав модель зі швидкого SSD і не залежав від швидкості USB).
+      3. Якщо модель є в локальному репозиторії (`repo_root/base/`) -> створює symlink або повертає локальний шлях.
+      4. Інакше завантажує з Hugging Face із підтримкою докачування (HTTP Range).
     """
     paths = init_gvk_home(gvk_home)
     target_path = os.path.join(paths["base"], DEFAULT_BASE_MODEL_FILENAME)
-    cache_candidates, local_candidates = _collect_base_model_candidates(gvk_home, repo_root)
+    cache_candidates, disc_candidates, local_candidates = _collect_base_model_candidates(
+        gvk_home, repo_root, disc_path=disc_path
+    )
 
     for existing in cache_candidates:
         if existing and _is_valid_gguf_file(existing):
-            print(f" [OK] Базова модель готова: {existing} ({_format_size(os.path.getsize(existing))})")
+            print(f" [OK] Базова модель готова в кеші: {existing} ({_format_size(os.path.getsize(existing))})")
             return existing
+
+    # USB-режим: копіюємо модель із флешки в ~/.gvk_ai/base/
+    for usb_cand in disc_candidates:
+        if usb_cand and _is_valid_gguf_file(usb_cand):
+            src_size = os.path.getsize(usb_cand)
+            print(
+                f" [*] [USB-РЕЖИМ] Знайдено базову модель на носії: {usb_cand} ({_format_size(src_size)}).\n"
+                f"     Копіювання у локальний кеш SSD ({target_path})..."
+            )
+            _copy_file_with_progress(
+                usb_cand,
+                target_path,
+                label=f"Копіювання {os.path.basename(usb_cand)} з USB",
+            )
+            if not _is_valid_gguf_file(target_path):
+                raise ValueError(f"Помилка копіювання GGUF із USB у {target_path}!")
+            print(f" [✓] Базову модель скопійовано з USB у кеш: {target_path}")
+            return target_path
 
     for cand in local_candidates:
         if cand and _is_valid_gguf_file(cand):
@@ -990,10 +1170,10 @@ def ensure_base_model(
                 return real_src
 
     if not download:
-        print(" [!] Базову модель не знайдено локально (завантаження вимкнено через --no-download).")
+        print(" [!] Базову модель не знайдено локально або на носії (завантаження вимкнено через --no-download).")
         return None
 
-    print(f" [*] Завантаження базової моделі 14B (~9.0 ГБ) із Hugging Face...")
+    print(f" [*] [DVD/CLOUD-РЕЖИМ] Завантаження базової моделі 14B (~9.0 ГБ) із Hugging Face...")
     print(f"     URL: {model_url}")
     _download_with_resume(model_url, target_path, label=DEFAULT_BASE_MODEL_FILENAME)
     if not _is_valid_gguf_file(target_path):
@@ -1004,7 +1184,7 @@ def ensure_base_model(
 
 
 # =====================================================================
-# 6. БІНАРНИК LLAMA-SERVER (ПОШУК АБО АВТОЗАВАНТАЖЕННЯ З GITHUB RELEASES)
+# 6. БІНАРНИК LLAMA-SERVER (З USB-НОСІЯ, КЕШУ АБО GITHUB RELEASES)
 # =====================================================================
 def _llama_server_names() -> Tuple[str, ...]:
     if platform.system().lower() == "windows":
@@ -1012,8 +1192,12 @@ def _llama_server_names() -> Tuple[str, ...]:
     return ("llama-server",)
 
 
-def find_llama_server(gvk_home: str = DEFAULT_GVK_HOME, repo_root: str = DEFAULT_REPO_ROOT) -> Optional[str]:
-    """Шукає виконуваний файл `llama-server` у `~/.gvk_ai/bin/`, репозиторії та PATH."""
+def find_llama_server(
+    gvk_home: str = DEFAULT_GVK_HOME,
+    repo_root: str = DEFAULT_REPO_ROOT,
+    disc_path: Optional[str] = None,
+) -> Optional[str]:
+    """Шукає виконуваний файл `llama-server` у `~/.gvk_ai/bin/`, репозиторії, на носії та в PATH."""
     names = _llama_server_names()
     bin_dir = os.path.join(os.path.abspath(os.path.expanduser(gvk_home)), "bin")
     for name in names:
@@ -1021,12 +1205,19 @@ def find_llama_server(gvk_home: str = DEFAULT_GVK_HOME, repo_root: str = DEFAULT
         if os.path.isfile(cand):
             return cand
 
-    runtime_dir = os.path.join(repo_root, "base", "llama-pascal-runtime")
-    if os.path.isdir(runtime_dir):
-        for root, _, files in os.walk(runtime_dir):
+    for base_root in ([repo_root] + ([disc_path] if disc_path else [])):
+        runtime_dir = os.path.join(base_root, "base", "llama-pascal-runtime")
+        if os.path.isdir(runtime_dir):
+            for root, _, files in os.walk(runtime_dir):
+                for name in names:
+                    if name in files:
+                        return os.path.join(root, name)
+        direct_bin_dir = os.path.join(base_root, "bin")
+        if os.path.isdir(direct_bin_dir):
             for name in names:
-                if name in files:
-                    return os.path.join(root, name)
+                cand = os.path.join(direct_bin_dir, name)
+                if os.path.isfile(cand):
+                    return cand
 
     for name in names:
         found = shutil.which(name)
@@ -1043,17 +1234,27 @@ def _has_windows_vulkan() -> bool:
     return os.path.isfile(os.path.join(sys_root, "System32", "vulkan-1.dll"))
 
 
-def _select_llama_release_asset(assets: List[dict]) -> Optional[dict]:
+def _has_nvidia_gpu() -> bool:
+    """Перевіряє наявність драйвера NVIDIA CUDA (`nvcuda.dll` у Windows або `nvidia-smi`)."""
+    if os.name == "nt":
+        sys_root = os.environ.get("SystemRoot", r"C:\Windows")
+        if os.path.isfile(os.path.join(sys_root, "System32", "nvcuda.dll")):
+            return True
+    return shutil.which("nvidia-smi") is not None
+
+
+def _select_llama_release_asset(assets: List[dict], prefer_cuda: bool = False) -> Optional[dict]:
     sys_name = platform.system().lower()
     arch = platform.machine().lower()
     is_arm = arch in ("arm64", "aarch64")
     has_win_vulkan = _has_windows_vulkan() if sys_name == "windows" else False
+    has_nv = (_has_nvidia_gpu() or prefer_cuda) if sys_name == "windows" else False
 
     def matches(name: str) -> int:
         n = name.lower()
         if not (n.endswith(".zip") or n.endswith(".tar.gz") or n.endswith(".tgz")):
             return -1
-        if "llama-" not in n:
+        if "llama-" not in n or n.startswith("cudart-llama-"):
             return -1
         if sys_name == "darwin":
             if "macos" not in n and "darwin" not in n:
@@ -1069,16 +1270,29 @@ def _select_llama_release_asset(assets: List[dict]) -> Optional[dict]:
             if is_arm and ("arm64" in n or "aarch64" in n):
                 return 90
             if not is_arm and ("x64" in n or "x86_64" in n):
-                return 100 if "vulkan" not in n and "sycl" not in n else 80
+                return 100 if "vulkan" not in n and "sycl" not in n and "rocm" not in n and "cuda" not in n else 80
             return -1
         if sys_name == "windows":
             if "win" not in n:
                 return -1
+            if is_arm:
+                if "arm64" in n and "vulkan" in n:
+                    return 100
+                if "arm64" in n and "cpu" in n:
+                    return 95
+                return -1
+            if "arm64" in n:
+                return -1
+            # Для офлайн-папки з CUDA або якщо prefer_cuda=True і є NVIDIA GPU
+            if prefer_cuda and has_nv and "cuda-12" in n and "x64" in n:
+                return 105
             if "vulkan" in n and "x64" in n:
                 return 100 if has_win_vulkan else 75
             if "cpu-x64" in n:
                 return 90 if has_win_vulkan else 100
-            if "x64" in n and "cuda" not in n and "sycl" not in n:
+            if has_nv and "cuda-12" in n and "x64" in n:
+                return 88
+            if "x64" in n and "cuda" not in n and "sycl" not in n and "rocm" not in n and "openvino" not in n:
                 return 85
             if "cuda" in n and "x64" in n:
                 return 70
@@ -1093,6 +1307,21 @@ def _select_llama_release_asset(assets: List[dict]) -> Optional[dict]:
             best_score = score
             best_asset = asset
     return best_asset
+
+
+def _select_cudart_asset(assets: List[dict], chosen_llama_name: str = "") -> Optional[dict]:
+    """Знаходить супутній архів `cudart-llama-bin-win-cuda-12.*.zip` для Windows CUDA збірки."""
+    want_12 = "cuda-12" in chosen_llama_name.lower() or not chosen_llama_name
+    for asset in assets:
+        n = asset.get("name", "").lower()
+        if n.startswith("cudart-llama-") and "win" in n and "x64" in n and n.endswith(".zip"):
+            if want_12 and "cuda-12" in n:
+                return asset
+    for asset in assets:
+        n = asset.get("name", "").lower()
+        if n.startswith("cudart-llama-") and "win" in n and "x64" in n and n.endswith(".zip"):
+            return asset
+    return None
 
 
 def _extract_llama_archive(archive_path: str, bin_dir: str) -> Optional[str]:
@@ -1127,14 +1356,141 @@ def _extract_llama_archive(archive_path: str, bin_dir: str) -> Optional[str]:
     return found_server
 
 
+def _install_llama_from_directory(src_dir: str, dst_bin_dir: str) -> Optional[str]:
+    """Копіює розпакований рантайм (наприклад `llama-pascal-runtime` із CUDA DLL) у `~/.gvk_ai/bin/`."""
+    wanted_bins = set(_llama_server_names())
+    lib_exts = (".dylib", ".so", ".dll", ".metal", ".metallib")
+    found_server = None
+    os.makedirs(dst_bin_dir, exist_ok=True)
+    for root, _, files in os.walk(src_dir):
+        for fname in files:
+            if fname in wanted_bins or any(fname.lower().endswith(ext) for ext in lib_exts):
+                src = os.path.join(root, fname)
+                dst = os.path.join(dst_bin_dir, fname)
+                _copy_writable(src, dst)
+                if fname in wanted_bins:
+                    os.chmod(dst, os.stat(dst).st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+                    found_server = dst
+    return found_server
+
+
+def _try_install_llama_from_usb(disc_path: Optional[str], repo_root: str, dst_bin_dir: str) -> Optional[str]:
+    """
+    Перевіряє офлайн-бандли `llama-server` на USB-носії (`<disc_path>/bin/`) або в `<repo_root>/base/llama_bins/`:
+      1. Якщо на Windows виявлено NVIDIA GPU і на носії є папка `bin/win-cuda-pascal/` (або `base/llama-pascal-runtime`),
+         або архів `llama-*-bin-win-cuda-*.zip` (+ `cudart-llama-*.zip`) -> встановлює її у `~/.gvk_ai/bin/`.
+      2. Інакше підбирає найкращий архів із `<disc_path>/bin/` через `_select_llama_release_asset`
+         (win-vulkan-x64, win-cpu-x64, macos-arm64, macos-x64) і розпаковує в `~/.gvk_ai/bin/`.
+    """
+    search_dirs: List[str] = []
+    if disc_path and os.path.isdir(disc_path):
+        search_dirs.append(os.path.join(disc_path, "bin"))
+        search_dirs.append(os.path.join(disc_path, "base", "llama_bins"))
+    search_dirs.append(os.path.join(repo_root, "base", "llama_bins"))
+
+    sys_name = platform.system().lower()
+    has_nv = _has_nvidia_gpu() if sys_name == "windows" else False
+
+    for bdir in search_dirs:
+        if not os.path.isdir(bdir):
+            continue
+
+        # 1. Спочатку перевіряємо архіви (.zip / .tar.gz) у папці bin/
+        local_assets: List[dict] = []
+        for fname in sorted(os.listdir(bdir)):
+            fpath = os.path.join(bdir, fname)
+            if os.path.isfile(fpath) and fname.lower().endswith((".zip", ".tar.gz", ".tgz")):
+                local_assets.append({"name": fname, "local_path": fpath})
+
+        if local_assets:
+            picked = _select_llama_release_asset(local_assets, prefer_cuda=has_nv)
+            if picked and picked.get("local_path"):
+                archive_path = str(picked["local_path"])
+                print(f" [*] [USB-РЕЖИМ] Встановлення llama-server з офлайн-архіву: {os.path.basename(archive_path)}...")
+                # Якщо обрано CUDA-збірку і поруч є cudart-llama-*.zip — розпаковуємо CUDA DLLs також
+                if "cuda" in picked["name"].lower():
+                    cudart = _select_cudart_asset(local_assets, picked["name"])
+                    if cudart and cudart.get("local_path"):
+                        print(f" [*] [USB-РЕЖИМ] Розпакування CUDA DLLs: {cudart['name']}...")
+                        _extract_llama_archive(str(cudart["local_path"]), dst_bin_dir)
+                srv = _extract_llama_archive(archive_path, dst_bin_dir)
+                if srv:
+                    print(f" [✓] llama-server встановлено з USB у: {srv}")
+                    return srv
+
+        # 2. Якщо на Windows + NVIDIA і є готова папка win-cuda-pascal або llama-pascal-runtime на USB
+        if sys_name == "windows":
+            for sub_name in ("win-cuda-pascal", "llama-pascal-runtime", "win-x64"):
+                sub_dir = os.path.join(bdir, sub_name)
+                if os.path.isdir(sub_dir) and os.path.isfile(os.path.join(sub_dir, "llama-server.exe")):
+                    print(f" [*] [USB-РЕЖИМ] Копіювання готового рантайму llama-server із {sub_dir}...")
+                    srv = _install_llama_from_directory(sub_dir, dst_bin_dir)
+                    if srv:
+                        print(f" [✓] llama-server встановлено з USB у: {srv}")
+                        return srv
+
+    if sys_name == "windows" and disc_path:
+        pascal_usb = os.path.join(disc_path, "base", "llama-pascal-runtime")
+        if os.path.isdir(pascal_usb) and os.path.isfile(os.path.join(pascal_usb, "llama-server.exe")):
+            print(f" [*] [USB-РЕЖИМ] Копіювання llama-pascal-runtime із {pascal_usb}...")
+            srv = _install_llama_from_directory(pascal_usb, dst_bin_dir)
+            if srv:
+                print(f" [✓] llama-server встановлено з USB у: {srv}")
+                return srv
+
+    return None
+
+
+def _fetch_latest_llama_release_with_assets() -> dict:
+    """
+    Отримує останній реліз `ggml-org/llama.cpp` із бінарними асетами.
+    Якщо `/releases/latest` вказує на тег без бінарників (наприклад `v1.0.0` із `nightly-tag.txt`),
+    автоматично перевіряє список `/releases?per_page=10` і знаходить перший `b*` реліз із бінарними архівами.
+    """
+    headers = {"User-Agent": "GVK-Private-AI-Updater/1.0", "Accept": "application/vnd.github+json"}
+    ssl_ctx = _build_ssl_context()
+
+    try:
+        req = urllib.request.Request(LLAMA_CPP_RELEASES_API, headers=headers)
+        with urllib.request.urlopen(req, timeout=30, context=ssl_ctx) as resp:
+            release = json.loads(resp.read().decode("utf-8"))
+        if _select_llama_release_asset(release.get("assets") or []) is not None:
+            return release
+    except Exception:
+        release = {}
+
+    req_list = urllib.request.Request(LLAMA_CPP_RELEASES_LIST_API, headers=headers)
+    with urllib.request.urlopen(req_list, timeout=30, context=ssl_ctx) as resp:
+        releases_list = json.loads(resp.read().decode("utf-8"))
+
+    if isinstance(releases_list, list):
+        for rel in releases_list:
+            if isinstance(rel, dict) and _select_llama_release_asset(rel.get("assets") or []) is not None:
+                return rel
+        if releases_list and isinstance(releases_list[0], dict):
+            return releases_list[0]
+    return release
+
+
 def ensure_llama_server(
     gvk_home: str = DEFAULT_GVK_HOME,
     repo_root: str = DEFAULT_REPO_ROOT,
     download: bool = True,
+    disc_path: Optional[str] = None,
 ) -> Optional[str]:
-    """Знаходить або скачує `llama-server` із GitHub Releases `ggml-org/llama.cpp`."""
+    """Знаходить `llama-server` у кеші, встановлює з USB-носія (`bin/`) або скачує з GitHub Releases `ggml-org/llama.cpp`."""
     paths = init_gvk_home(gvk_home)
-    existing = find_llama_server(paths["home"], repo_root)
+    cached_bin = os.path.join(paths["bin"], _llama_server_names()[0])
+    if os.path.isfile(cached_bin):
+        print(f" [OK] llama-server готовий у кеші: {cached_bin}")
+        return cached_bin
+
+    # Спроба встановити з USB-носія (або base/llama_bins) у ~/.gvk_ai/bin/
+    usb_installed = _try_install_llama_from_usb(disc_path, repo_root, paths["bin"])
+    if usb_installed:
+        return usb_installed
+
+    existing = find_llama_server(paths["home"], repo_root, disc_path=disc_path)
     if existing:
         print(f" [OK] llama-server готовий: {existing}")
         return existing
@@ -1144,12 +1500,7 @@ def ensure_llama_server(
         return None
 
     print(" [*] Запит останнього релізу ggml-org/llama.cpp на GitHub...")
-    req = urllib.request.Request(
-        LLAMA_CPP_RELEASES_API,
-        headers={"User-Agent": "GVK-Private-AI-Updater/1.0", "Accept": "application/vnd.github+json"},
-    )
-    with urllib.request.urlopen(req, timeout=30, context=_build_ssl_context()) as resp:
-        release = json.loads(resp.read().decode("utf-8"))
+    release = _fetch_latest_llama_release_with_assets()
 
     asset = _select_llama_release_asset(release.get("assets") or [])
     if not asset:
@@ -1173,11 +1524,34 @@ def ensure_embedding_model(
     venv_python: Optional[str],
     model_name: str = DEFAULT_EMBEDDING_MODEL,
     download: bool = True,
+    gvk_home: str = DEFAULT_GVK_HOME,
+    disc_path: Optional[str] = None,
 ) -> bool:
     """
-    Перевіряє та прекешує ембедінг-модель RAG (`sentence-transformers`) у `.venv`,
+    Перевіряє та прекешує ембедінг-модель RAG (`sentence-transformers`) у `.venv` або `~/.gvk_ai/embeddings/`,
     щоб GUI не підвисав на холодному старті і працював в офлайні.
+    Якщо на USB-носії є `<disc_path>/embeddings/paraphrase-multilingual-MiniLM-L12-v2`, копіює її в кеш.
     """
+    paths = init_gvk_home(gvk_home)
+    local_emb_dst = os.path.join(paths["embeddings"], DEFAULT_EMBEDDING_SHORT_NAME)
+
+    if os.path.isdir(local_emb_dst) and os.path.isfile(os.path.join(local_emb_dst, "config.json")):
+        print(f" [OK] RAG-модель готова в локальному кеші: {local_emb_dst}")
+        return True
+
+    if disc_path and os.path.isdir(disc_path):
+        usb_emb_src = os.path.join(disc_path, "embeddings", DEFAULT_EMBEDDING_SHORT_NAME)
+        if os.path.isdir(usb_emb_src) and os.path.isfile(os.path.join(usb_emb_src, "config.json")):
+            print(f" [*] [USB-РЕЖИМ] Копіювання RAG-моделі з носія: {usb_emb_src} -> {local_emb_dst}...")
+            for root, _, files in os.walk(usb_emb_src):
+                rel_dir = os.path.relpath(root, usb_emb_src)
+                target_sub = local_emb_dst if rel_dir == "." else os.path.join(local_emb_dst, rel_dir)
+                os.makedirs(target_sub, exist_ok=True)
+                for fname in files:
+                    _copy_writable(os.path.join(root, fname), os.path.join(target_sub, fname))
+            print(f" [✓] RAG-модель скопійовано з USB у: {local_emb_dst}")
+            return True
+
     if not venv_python or not os.path.isfile(venv_python):
         return False
 
@@ -1215,18 +1589,19 @@ def ensure_embedding_model(
     dl_code = (
         "import sys; "
         "from sentence_transformers import SentenceTransformer; "
-        "SentenceTransformer(sys.argv[1], device='cpu')"
+        "m = SentenceTransformer(sys.argv[1], device='cpu'); "
+        "m.save(sys.argv[2]) if len(sys.argv) > 2 and sys.argv[2] else None"
     )
     try:
         res_dl = subprocess.run(
-            [venv_python, "-c", dl_code, model_name],
+            [venv_python, "-c", dl_code, model_name, local_emb_dst],
             env=env,
             capture_output=True,
             text=True,
             timeout=600,
         )
         if res_dl.returncode == 0:
-            print(f" [✓] RAG-модель успішно кешовано: {model_name}")
+            print(f" [✓] RAG-модель успішно кешовано: {local_emb_dst}")
             return True
         err_tail = (res_dl.stderr or res_dl.stdout or "").strip().splitlines()[-3:]
         print(f" [!] Не вдалося кешувати RAG-модель (офлайн?): {' | '.join(err_tail)}")
@@ -1246,7 +1621,7 @@ def run_sync(
     skip_pip: bool = False,
     pull: bool = False,
 ) -> dict:
-    """Повний цикл синхронізації GVK Private AI."""
+    """Повний цикл синхронізації GVK Private AI (підтримує як DVD-режим, так і повний офлайн USB-режим)."""
     print("====================================================================")
     print(" [*] GVK Private AI — Синхронізація та перевірка оточення (updater)")
     print("====================================================================")
@@ -1258,18 +1633,33 @@ def run_sync(
 
     venv_info = ensure_venv_and_requirements(paths["home"], repo_root, skip_pip=skip_pip)
     disc_info = verify_and_import_disc(disc_path=disc_path, gvk_home=paths["home"])
+    detected_disc = str(disc_info.get("disc_path")) if disc_info.get("disc_path") else None
+    media_mode = str(disc_info.get("media_mode") or "NONE")
     master_key = disc_info.get("master_key")
     sync_info = sync_activated_personas(
         gvk_home=paths["home"],
         repo_root=repo_root,
         master_key=master_key if isinstance(master_key, bytes) else None,
     )
-    base_model_path = ensure_base_model(paths["home"], repo_root, download=download)
-    llama_path = ensure_llama_server(paths["home"], repo_root, download=download)
-    emb_ok = ensure_embedding_model(venv_info.get("python"), download=download) if venv_info.get("python") else False
+    base_model_path = ensure_base_model(
+        paths["home"], repo_root, download=download, disc_path=detected_disc
+    )
+    llama_path = ensure_llama_server(
+        paths["home"], repo_root, download=download, disc_path=detected_disc
+    )
+    emb_ok = (
+        ensure_embedding_model(
+            venv_info.get("python"),
+            download=download,
+            gvk_home=paths["home"],
+            disc_path=detected_disc,
+        )
+        if venv_info.get("python") or detected_disc
+        else False
+    )
 
     print("====================================================================")
-    print(f" [✓] Кеш GVK: {paths['home']}")
+    print(f" [✓] Кеш GVK: {paths['home']} [Режим носія: {media_mode}]")
     print("====================================================================")
     return {
         "paths": paths,
@@ -1277,6 +1667,7 @@ def run_sync(
         "disc_found": bool(disc_info.get("found")),
         "disc_imported": bool(disc_info.get("imported")),
         "disc_persona": disc_info.get("persona_id"),
+        "media_mode": media_mode,
         "personas_sync": sync_info,
         "base_model": base_model_path,
         "llama_server": llama_path,
@@ -1285,7 +1676,7 @@ def run_sync(
 
 
 def run_status(gvk_home: str = DEFAULT_GVK_HOME, repo_root: str = DEFAULT_REPO_ROOT) -> None:
-    """Виводить поточний статус кешу, активованих персонажів, моделі та .venv (read-only)."""
+    """Виводить поточний статус кешу, активованих персонажів, моделі, режиму носія (DVD/USB) та .venv (read-only)."""
     paths = get_gvk_paths(gvk_home)
     home_exists = os.path.isdir(paths["home"])
     venv_dir = resolve_venv_dir(paths["home"], repo_root)
@@ -1295,9 +1686,10 @@ def run_status(gvk_home: str = DEFAULT_GVK_HOME, repo_root: str = DEFAULT_REPO_R
     has_tk, tk_ver, py_ver = _probe_python_tk(py_path)
     tk_desc = f"Python {py_ver[0]}.{py_ver[1]}, Tk {tk_ver}" if has_tk else "Tk MISSING"
     registry = _load_activated_registry(paths["registry"])
-    base_path = find_base_model_path(paths["home"], repo_root)
-    llama_path = find_llama_server(paths["home"], repo_root)
     disc = find_gvk_disc_path(None)
+    media_info = detect_media_mode(disc)
+    base_path = find_base_model_path(paths["home"], repo_root, disc_path=disc)
+    llama_path = find_llama_server(paths["home"], repo_root, disc_path=disc)
 
     print("====================================================================")
     print(" [*] GVK Private AI — Статус локального вузла")
@@ -1307,14 +1699,23 @@ def run_status(gvk_home: str = DEFAULT_GVK_HOME, repo_root: str = DEFAULT_REPO_R
     print(f" Python .venv    : {venv_dir} ({tk_desc}, requirements: {req_status})")
     print(f" Базова модель   : {base_path or 'НЕ ЗНАЙДЕНО'}")
     print(f" llama-server    : {llama_path or 'НЕ ЗНАЙДЕНО'}")
-    print(f" DVD GVK_VAULT   : {disc or 'Не вставлено'}")
+    if disc:
+        print(
+            f" Носій GVK_VAULT : {disc} [Режим: {media_info['mode']} | "
+            f"base_gguf={media_info['has_base_model']} | bins={media_info['has_llama_bins']}]"
+        )
+    else:
+        print(" Носій GVK_VAULT : Не вставлено")
     print(f" Активовані ({len(registry)}):")
     if not registry:
         print("   - (немає жодного активованого origin.sig)")
     else:
         for pid, meta in sorted(registry.items()):
             sig_ok = os.path.isfile(os.path.join(paths["registry"], f"{pid}.sig"))
-            print(f"   - {pid} [v{meta.get('version', '?')}, origin.sig={'OK' if sig_ok else 'MISSING'}]")
+            print(
+                f"   - {pid} [v{meta.get('version', '?')}, source={meta.get('source', '?')}, "
+                f"origin.sig={'OK' if sig_ok else 'MISSING'}]"
+            )
     print("====================================================================")
 
 
@@ -1441,14 +1842,19 @@ def run_self_test() -> None:
         assert not os.path.exists(os.path.join(paths["personas"], "friend_2"))
         print("       [OK] friend_1 оновлено до v1.1.0; friend_2 без origin.sig проігноровано.")
 
-        # 4. Локальний лінк базової моделі GGUF
-        print(" [4/6] Перевірка підхоплення локальної базової моделі GGUF...")
-        local_gguf = os.path.join(repo_root, "base_model.gguf")
-        with open(local_gguf, "wb") as f:
-            f.write(b"GGUF" + b"\x00" * 1024)
-        base_out = ensure_base_model(gvk_home=gvk_home, repo_root=repo_root, download=False)
-        assert base_out and _is_valid_gguf_file(base_out)
-        print(f"       [OK] Базову модель підключено у: {base_out}")
+        # 4. Локальний лінк та USB-копіювання базової моделі GGUF
+        print(" [4/6] Перевірка підхоплення локальної та USB базової моделі GGUF...")
+        assert detect_media_mode(disc_dir)["mode"] == "DVD"
+        usb_base_dir = os.path.join(disc_dir, "base")
+        os.makedirs(usb_base_dir, exist_ok=True)
+        usb_gguf = os.path.join(usb_base_dir, DEFAULT_BASE_MODEL_FILENAME)
+        with open(usb_gguf, "wb") as f:
+            f.write(b"GGUF" + b"\x01" * 2048)
+        assert detect_media_mode(disc_dir)["mode"] == "USB"
+        base_out = ensure_base_model(gvk_home=gvk_home, repo_root=repo_root, download=False, disc_path=disc_dir)
+        assert base_out == os.path.join(paths["base"], DEFAULT_BASE_MODEL_FILENAME)
+        assert _is_valid_gguf_file(base_out) and os.path.getsize(base_out) == 2052
+        print(f"       [OK] Базову модель скопійовано з USB у кеш: {base_out}")
 
         # 5. Пошук бінарника llama-server
         print(" [5/6] Перевірка виявлення локального бінарника llama-server...")

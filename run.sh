@@ -136,11 +136,24 @@ bootstrap_portable_python() {
     tmp_dir="$(mktemp -d "${GVK_HOME}/py_dl_XXXXXX")"
     archive="${tmp_dir}/python.tar.gz"
 
-    echo " [*] Python 3.10+ (з Tk >= 8.6) не знайдено — завантажуємо портативний Python ${PORTABLE_PY_VER} (~35 МБ)..." >&2
-    if ! curl -fSL --retry 2 --connect-timeout 15 -o "${archive}" "${py_url}"; then
-        rm -rf "${tmp_dir}"
-        echo " [X] Не вдалося завантажити портативний Python. Перевірте інтернет або встановіть Python 3.12 вручну." >&2
-        return 1
+    local usb_py_cand=""
+    for cand_f in "${SCRIPT_DIR}/python_portable/"*"${triple}"*.tar.gz; do
+        if [ -f "${cand_f}" ]; then
+            usb_py_cand="${cand_f}"
+            break
+        fi
+    done
+
+    if [ -n "${usb_py_cand}" ]; then
+        echo " [*] [USB-РЕЖИМ] Встановлення портативного Python ${PORTABLE_PY_VER} із носія: $(basename "${usb_py_cand}")..." >&2
+        cp "${usb_py_cand}" "${archive}"
+    else
+        echo " [*] Python 3.10+ (з Tk >= 8.6) не знайдено — завантажуємо портативний Python ${PORTABLE_PY_VER} (~35 МБ)..." >&2
+        if ! curl -fSL --retry 2 --connect-timeout 15 -o "${archive}" "${py_url}"; then
+            rm -rf "${tmp_dir}"
+            echo " [X] Не вдалося завантажити портативний Python. Перевірте інтернет або встановіть Python 3.12 вручну." >&2
+            return 1
+        fi
     fi
 
     if ! tar -xzf "${archive}" -C "${tmp_dir}" || [ ! -x "${tmp_dir}/python/bin/python3" ]; then
@@ -237,14 +250,20 @@ if [ -f "${SCRIPT_DIR}/core/main.py" ] && [ -f "${SCRIPT_DIR}/updater.py" ]; the
 else
     REPO_DIR="${GVK_HOME}/repo"
     DISC_ARGS=(--disc-path "${SCRIPT_DIR}")
+    MEDIA_MODE="DVD"
+    if [ -d "${SCRIPT_DIR}/base" ] || [ -d "${SCRIPT_DIR}/bin" ] || [ -f "${SCRIPT_DIR}/vault/media_mode.json" ]; then
+        MEDIA_MODE="USB"
+    fi
     echo "===================================================================="
-    echo " [*] GVK_VAULT Виявлено: ${SCRIPT_DIR}"
+    echo " [*] GVK_VAULT Виявлено: ${SCRIPT_DIR} [Режим: ${MEDIA_MODE}]"
     echo "===================================================================="
     mkdir -p "${GVK_HOME}"
     if [ ! -f "${REPO_DIR}/core/main.py" ]; then
         seed_repo_from_disc_bundle "${REPO_DIR}" || true
     fi
-    if has_real_git && { [ -d "${REPO_DIR}/.git" ] || [ ! -f "${REPO_DIR}/core/main.py" ]; }; then
+    if [ "${MEDIA_MODE}" = "USB" ] && [ -f "${REPO_DIR}/core/main.py" ]; then
+        seed_repo_from_disc_bundle "${REPO_DIR}" || true
+    elif has_real_git && { [ -d "${REPO_DIR}/.git" ] || [ ! -f "${REPO_DIR}/core/main.py" ]; }; then
         if [ ! -d "${REPO_DIR}/.git" ]; then
             echo " [*] Перший запуск: клонування ядра GVK Private AI..."
             git clone "${REPO_URL}" "${REPO_DIR}" || sync_repo_via_tarball "${REPO_DIR}"
@@ -255,7 +274,7 @@ else
     else
         sync_repo_via_tarball "${REPO_DIR}"
     fi
-    # Якщо на DVD core_bundle свіжіший за завантажене з GitHub репо — поверх накладаємо файли з DVD
+    # Якщо на носії core_bundle свіжіший за завантажене з GitHub репо — поверх накладаємо файли з носія
     if [ -f "${SCRIPT_DIR}/core_bundle/core/main.py" ] && { [ ! -f "${REPO_DIR}/core/main.py" ] || [ "${SCRIPT_DIR}/core_bundle/core/main.py" -nt "${REPO_DIR}/core/main.py" ]; }; then
         seed_repo_from_disc_bundle "${REPO_DIR}" || true
     fi

@@ -200,7 +200,13 @@ def acquire_master_key(
             raw_key = f.read()
         if len(raw_key) != KEY_SIZE:
             raise ValueError(f"Пошкоджений master.key на диску ({len(raw_key)} байтів замість {KEY_SIZE}).")
-        print(f" [✓] Апаратний ключ доступу GVK_VAULT зчитано з носія: {detected_disc}")
+        is_usb = (
+            os.path.isdir(os.path.join(detected_disc, "base"))
+            or os.path.isdir(os.path.join(detected_disc, "bin"))
+            or os.path.isfile(os.path.join(detected_disc, "vault", "media_mode.json"))
+        )
+        mode_tag = "USB" if is_usb else "DVD"
+        print(f" [✓] Апаратний ключ доступу GVK_VAULT [{mode_tag}] зчитано з носія: {detected_disc}")
         return bytearray(raw_key), key_file
 
     # Fallback: Крипто-челендж / Ручне введення секретної майстер-фрази

@@ -165,10 +165,11 @@ def resolve_runtime_paths(
     ram_root: Optional[str] = None,
     repo_root: str = REPO_ROOT,
     gvk_home: str = DEFAULT_GVK_HOME,
+    disc_path: Optional[str] = None,
 ) -> Dict[str, Optional[str]]:
     """
     Уніфіковано знаходить шляхи як у режимі розробки (локальний репозиторій),
-    так і в продакшні (`~/.gvk_ai` + RAM-диск):
+    так і в продакшні (`~/.gvk_ai` + RAM-диск + DVD/USB носій):
       - `persona_dir`: директорія з `persona_config.json`, `prompt.txt`, `portraits/`, `memory.faiss`
       - `adapter_path`: шлях до `<persona_id>.gguf`
       - `base_model_path`: шлях до `Qwen2.5-14B-Instruct-Q4_K_M.gguf`
@@ -229,8 +230,8 @@ def resolve_runtime_paths(
             adapter_path = os.path.abspath(cand)
             break
 
-    base_model_path = find_base_model_path(gvk_home=gvk_home_abs, repo_root=repo_root)
-    llama_server_path = find_llama_server(gvk_home=gvk_home_abs, repo_root=repo_root)
+    base_model_path = find_base_model_path(gvk_home=gvk_home_abs, repo_root=repo_root, disc_path=disc_path)
+    llama_server_path = find_llama_server(gvk_home=gvk_home_abs, repo_root=repo_root, disc_path=disc_path)
 
     resolved = {
         "persona_id": persona_id,
@@ -248,7 +249,7 @@ def resolve_runtime_paths(
 # =====================================================================
 class GVKOrchestrator:
     """
-    Керує контекстом бесіди, системним промптом, історією повідомлень
+    Керує контекстом бесіди, системним промптом, історії повідомлень
     та викликами `llama-server` для обраного персонажа.
     """
 
@@ -266,11 +267,13 @@ class GVKOrchestrator:
         self.gvk_home = gvk_home
         self.vault = vault
 
+        vault_disc = getattr(vault, "disc_path", None) if vault is not None else None
         self.paths = resolve_runtime_paths(
             persona_id=persona_id,
             ram_root=ram_root,
             repo_root=repo_root,
             gvk_home=gvk_home,
+            disc_path=vault_disc,
         )
         self.persona_dir = self.paths["persona_dir"]
         if not self.persona_dir:

@@ -418,8 +418,16 @@ class EmbeddingEngine:
         from sentence_transformers import SentenceTransformer
 
         torch.set_num_threads(1)
+        gvk_home = os.path.abspath(os.path.expanduser(os.environ.get("GVK_HOME") or "~/.gvk_ai"))
+        short_name = model_name.split("/")[-1]
+        local_emb_dir = os.path.join(gvk_home, "embeddings", short_name)
+        load_target = (
+            local_emb_dir
+            if (os.path.isdir(local_emb_dir) and os.path.isfile(os.path.join(local_emb_dir, "config.json")))
+            else model_name
+        )
         try:
-            model = SentenceTransformer(model_name, device="cpu", local_files_only=True)
+            model = SentenceTransformer(load_target, device="cpu", local_files_only=True)
         except Exception:
             model = SentenceTransformer(model_name, device="cpu")
         _MODEL_CACHE[model_name] = model

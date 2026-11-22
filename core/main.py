@@ -44,7 +44,7 @@ from core.menu import (
     run_self_test as run_menu_self_test,
 )
 from core.orchestrator import DEFAULT_RAG_HEADER, GVKOrchestrator, calculate_age
-from updater import DEFAULT_GVK_HOME
+from updater import DEFAULT_GVK_HOME, detect_media_mode
 
 
 # =====================================================================
@@ -531,6 +531,15 @@ def main() -> None:
     local_persona_dir = os.path.join(REPO_ROOT, "personas", "friend_1")
     detected_disc = find_gvk_disc_path(args.disc_path) if (args.disc_path or not os.path.isdir(local_persona_dir)) else None
     gvk_home_abs = os.path.abspath(os.path.expanduser(DEFAULT_GVK_HOME))
+    media_info = detect_media_mode(detected_disc)
+    if detected_disc:
+        logger.info(
+            "Виявлено носій GVK_VAULT: %s [Режим: %s, base_gguf=%s, bins=%s]",
+            detected_disc,
+            media_info["mode"],
+            media_info["has_base_model"],
+            media_info["has_llama_bins"],
+        )
 
     use_vault = bool(args.disc_path) or (
         not os.path.isdir(local_persona_dir)
