@@ -35,6 +35,7 @@ if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
 from core.memory_rag import DEFAULT_SIMILARITY_THRESHOLD, MemoryRAG, build_rag_index, register_persona_lexicon
+from core.roster import extract_roster_mappings, load_roster_data
 from core.skill_runner import SkillRunner, strip_skill_tags
 from updater import DEFAULT_GVK_HOME, find_base_model_path, find_llama_server
 
@@ -65,48 +66,17 @@ def load_roster_mappings(
     persona_dir: Optional[str] = None,
 ) -> Tuple[Dict[str, str], Dict[str, str], Optional[str]]:
     """
-    Завантажує реальні відповідності імен/описів із git-ignored `roster.json`
-    (RAM-диск -> локальний `personas/roster.json` -> `persona_dir` -> `~/.gvk_ai`).
+    Завантажує відповідності імен/описів із єдиного git-ignored `roster.json`
+    через `core.roster` (RAM-диск -> локальний `personas/roster.json` -> `~/.gvk_ai`).
     """
-    gvk_home_abs = os.path.abspath(os.path.expanduser(gvk_home))
-    candidates: List[str] = []
-    if ram_root:
-        candidates.append(os.path.join(ram_root, "personas", "roster.json"))
-        candidates.append(os.path.join(ram_root, "personas", persona_id, "roster.json"))
-    candidates.append(os.path.join(repo_root, "personas", "roster.json"))
-    if persona_dir:
-        candidates.append(os.path.join(persona_dir, "roster.json"))
-    candidates.append(os.path.join(repo_root, "personas", persona_id, "roster.json"))
-    candidates.append(os.path.join(gvk_home_abs, "personas", "roster.json"))
-    candidates.append(os.path.join(gvk_home_abs, "personas", persona_id, "roster.json"))
-
-    ua_to_ru: Dict[str, str] = {}
-    descriptions: Dict[str, str] = {}
-    default_user_name: Optional[str] = None
-    for path in candidates:
-        if not os.path.isfile(path):
-            continue
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-        except (OSError, json.JSONDecodeError) as exc:
-            logger.warning("Не вдалося прочитати roster.json (%s): %s", path, exc)
-            continue
-        if not isinstance(data, dict):
-            continue
-        raw_ua_to_ru = data.get("ua_to_ru_names")
-        if isinstance(raw_ua_to_ru, dict):
-            ua_to_ru.update({str(k): str(v) for k, v in raw_ua_to_ru.items()})
-        raw_desc = data.get("interlocutor_descriptions")
-        if isinstance(raw_desc, dict):
-            descriptions.update({str(k): str(v) for k, v in raw_desc.items()})
-        raw_users = data.get("users_dict")
-        if isinstance(raw_users, dict):
-            u2 = raw_users.get("2") or raw_users.get(2)
-            if isinstance(u2, dict) and u2.get("name"):
-                default_user_name = str(u2["name"])
-        break
-    return ua_to_ru, descriptions, default_user_name
+    roster = load_roster_data(
+        ram_root=ram_root,
+        repo_root=repo_root,
+        gvk_home=gvk_home,
+        persona_id=persona_id,
+        persona_dir=persona_dir,
+    )
+    return extract_roster_mappings(roster)
 
 PERSONAL_PROMPT_TEMPLATE = "Собеседник в этом диалоге: {description}."
 GROUP_PROMPT_TEMPLATE = (

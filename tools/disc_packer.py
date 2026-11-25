@@ -373,11 +373,18 @@ def compute_sha256(file_path: str) -> str:
     return h.hexdigest()
 
 
-def pack_payload_encrypted(source_dir: str, output_enc_path: str, master_key: bytes) -> str:
+def pack_payload_encrypted(
+    source_dir: str,
+    output_enc_path: str,
+    master_key: bytes,
+    roster_path: Optional[str] = None,
+) -> str:
     """
     Збирає вміст папки особистості (persona_config.json, prompt.txt, portraits/,
     memory.faiss, tools.py) у стиснутий TAR.GZ архів прямо в оперативній пам'яті
     та одразу шифрує його у файл `payload.tar.enc` (Zero-Plaintext-At-Rest).
+    Якщо всередині `source_dir` немає `roster.json`, автоматично підхоплює спільний
+    `roster_path` або `../roster.json` (наприклад `personas/roster.json`).
     Повертає SHA-256 геш створеного `payload.tar.enc`.
     """
     if not os.path.isdir(source_dir):
@@ -393,12 +400,24 @@ def pack_payload_encrypted(source_dir: str, output_enc_path: str, master_key: by
         return tarinfo
 
     tar_buffer = io.BytesIO()
+    has_roster = False
     with tarfile.open(fileobj=tar_buffer, mode="w:gz") as tar:
         for entry in sorted(os.listdir(source_dir)):
             if entry.startswith(".") or entry in ("__pycache__", "raw"):
                 continue
+            if entry == "roster.json":
+                has_roster = True
             full_path = os.path.join(source_dir, entry)
             tar.add(full_path, arcname=entry, filter=_tar_filter)
+
+        if not has_roster:
+            shared_roster = (
+                roster_path
+                if roster_path
+                else os.path.join(os.path.dirname(os.path.abspath(source_dir)), "roster.json")
+            )
+            if shared_roster and os.path.isfile(shared_roster):
+                tar.add(shared_roster, arcname="roster.json", filter=_tar_filter)
 
     tar_bytes = tar_buffer.getvalue()
     tar_stream = io.BytesIO(tar_bytes)
@@ -1796,6 +1815,10 @@ def run_self_test() -> None:
 
     print(" [4/5] Перевірка пакування та розпакування payload.tar.enc у пам'яті...")
     with tempfile.TemporaryDirectory() as tmpdir:
+        shared_roster_src = os.path.join(tmpdir, "roster.json")
+        with open(shared_roster_src, "w", encoding="utf-8") as rf:
+            json.dump({"users_dict": {"2": {"name": "Учасник 02", "locked": False, "experimental": False}}}, rf)
+
         src_payload = os.path.join(tmpdir, "src_payload")
         os.makedirs(os.path.join(src_payload, "portraits", "raw"), exist_ok=True)
         with open(os.path.join(src_payload, "prompt.txt"), "w", encoding="utf-8") as f:
@@ -1813,6 +1836,7 @@ def run_self_test() -> None:
         ram_extract_dir = os.path.join(tmpdir, "ram_extracted")
         unpack_payload_decrypted(enc_payload_path, ram_extract_dir, master_key)
         assert os.path.isfile(os.path.join(ram_extract_dir, "prompt.txt"))
+        assert os.path.isfile(os.path.join(ram_extract_dir, "roster.json")), "Спільний ../roster.json має пакуватися автоматично!"
         assert os.path.isfile(os.path.join(ram_extract_dir, "portraits", "мовчить.txt"))
         assert not os.path.exists(os.path.join(ram_extract_dir, "portraits", ".DS_Store")), ".DS_Store не має пакуватися!"
         assert not os.path.exists(os.path.join(ram_extract_dir, "portraits", "raw")), "portraits/raw/ не має пакуватися!"
@@ -1923,6 +1947,7 @@ def main() -> None:
     p_pack.add_argument("--id", required=True, help="ID персонажа (friend_1, friend_2, friend_3)")
     p_pack.add_argument("--adapter", required=True, help="Шлях до відкритого файлу adapter.gguf")
     p_pack.add_argument("--payload-dir", required=True, help="Шлях до папки з prompt.txt, portraits/, memory.faiss")
+    p_pack.add_argument("--roster", default=None, help="Опційно: шлях до спільного roster.json (за замовч. ../roster.json)")
     p_pack.add_argument("-o", "--output-dir", required=True, help="Вихідна папка для зашифрованих файлів")
     p_pack.add_argument("--version", default="1.0.0", help="Версія пакета (за замовч. 1.0.0)")
 
@@ -2019,7 +2044,7 @@ def main() -> None:
         sig_path = os.path.join(args.output_dir, "origin.sig")
 
         adapter_sha = encrypt_file(args.adapter, adapter_enc, key)
-        payload_sha = pack_payload_encrypted(args.payload_dir, payload_enc, key)
+        payload_sha = pack_payload_encrypted(args.payload_dir, payload_enc, key, roster_path=args.roster)
         manifest_path = write_public_manifest(
             args.output_dir,
             persona_id=args.id,

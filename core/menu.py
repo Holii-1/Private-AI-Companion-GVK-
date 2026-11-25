@@ -45,6 +45,10 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 logger = logging.getLogger("gvk.menu")
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
+
+from core.roster import load_roster_data
 
 # =====================================================================
 # КОНСТАНТИ ВІКНА ТА ПРИГЛУШЕНОЇ ПАЛІТРИ ТЕРМІНАЛУ
@@ -218,35 +222,14 @@ def load_roster_config(
     gvk_home: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    Завантажує приватний `roster.json` (з RAM-диска або локального `personas/`),
-    якщо він доступний, повертаючи словник із реальними іменами та текстами.
+    Завантажує єдиний приватний `roster.json` через `core.roster.load_roster_data`
+    (з RAM-диска, локального `personas/roster.json` або `~/.gvk_ai`).
     """
-    candidates: List[str] = []
-    home_abs = os.path.abspath(os.path.expanduser(gvk_home or os.environ.get("GVK_HOME") or "~/.gvk_ai"))
-    for root_dir in (ram_root, repo_root, home_abs):
-        if not root_dir:
-            continue
-        p_base = os.path.join(root_dir, "personas")
-        candidates.append(os.path.join(p_base, "roster.json"))
-        candidates.append(os.path.join(p_base, "friend_1", "roster.json"))
-        if os.path.isdir(p_base):
-            candidates.extend(sorted(glob.glob(os.path.join(p_base, "friend_*", "roster.json"))))
-
-    seen = set()
-    for path in candidates:
-        norm = os.path.abspath(path)
-        if norm in seen:
-            continue
-        seen.add(norm)
-        if os.path.isfile(norm):
-            try:
-                with open(norm, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                if isinstance(data, dict):
-                    return data
-            except (OSError, json.JSONDecodeError) as exc:
-                logger.warning("Не вдалося прочитати roster.json (%s): %s", norm, exc)
-    return {}
+    return load_roster_data(
+        ram_root=ram_root,
+        repo_root=repo_root,
+        gvk_home=gvk_home,
+    )
 
 
 def apply_roster_config(roster: Dict[str, Any]) -> None:
@@ -1751,17 +1734,40 @@ class ChatSessionModal(tk.Frame):
         self._set_emotion("idle")
         self._reset_afk_timer()
 
-    def _build_dossier_panel(self, dossier_info: Optional[Dict[str, str]]) -> None:
-        if not dossier_info:
-            return
+    def _compute_left_pane_width(self) -> int:
         try:
             portrait_w = int(float(self.portrait_canvas.cget("width") or 0))
         except (TypeError, ValueError):
             portrait_w = 0
-        pane_w = max(portrait_w, 460)
-        wrap_w = max(240, pane_w - 24)
+        has_portrait = bool(self.portrait_canvas.portrait_text) and portrait_w > 1
+        return portrait_w if has_portrait else 460
 
-        tk.Frame(self.left_pane, bg=BG_BLACK, width=pane_w, height=0).pack(side=tk.TOP)
+    def _sync_left_pane_width(self) -> None:
+        if not self.dossier_frame.winfo_manager():
+            return
+        pane_w = self._compute_left_pane_width()
+        wrap_w = max(60, pane_w - 24)
+        self.left_pane.config(width=pane_w)
+        self.left_pane.pack_propagate(False)
+        for lbl in (
+            self.dossier_title_label,
+            self.dossier_desc_label,
+            self.dossier_style_label,
+            self.dossier_rag_label,
+            self.dossier_skill_label,
+            self.dossier_emotion_label,
+        ):
+            if lbl is not None and lbl.winfo_exists():
+                lbl.config(wraplength=wrap_w)
+
+    def _build_dossier_panel(self, dossier_info: Optional[Dict[str, str]]) -> None:
+        if not dossier_info:
+            return
+        pane_w = self._compute_left_pane_width()
+        wrap_w = max(60, pane_w - 24)
+
+        self.left_pane.config(width=pane_w)
+        self.left_pane.pack_propagate(False)
         self.portrait_sep.pack(side=tk.TOP, fill=tk.X, pady=(2, 3))
         self.dossier_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=12, pady=(2, 2))
 
@@ -1830,30 +1836,31 @@ class ChatSessionModal(tk.Frame):
                 line = raw_line.strip()
                 if not line:
                     continue
-                if " - " in line and self.dossier_font.measure(line) <= wrap_w:
+                if " - " in line:
                     cmd_part, desc_part = line.split(" - ", 1)
-                    row = tk.Frame(skills_box, bg=BG_BLACK)
-                    row.pack(anchor="w", fill=tk.X, pady=(0, 1))
-                    make_term_label(
-                        row,
-                        font=self.dossier_font,
-                        text=cmd_part,
-                        fg="#e0b566",
-                    ).pack(side=tk.LEFT, anchor="w")
-                    make_term_label(
-                        row,
-                        font=self.dossier_font,
-                        text=f" — {desc_part}",
-                        fg=TERM_WHITE,
-                    ).pack(side=tk.LEFT, anchor="w")
-                else:
-                    make_term_label(
-                        skills_box,
-                        font=self.dossier_font,
-                        text=line.replace(" - ", " — ", 1),
-                        fg=TERM_WHITE,
-                        wraplength=wrap_w,
-                    ).pack(anchor="w", pady=(0, 1))
+                    if self.dossier_font.measure(f"{cmd_part} — {desc_part}") <= wrap_w:
+                        row = tk.Frame(skills_box, bg=BG_BLACK)
+                        row.pack(anchor="w", fill=tk.X, pady=(0, 1))
+                        make_term_label(
+                            row,
+                            font=self.dossier_font,
+                            text=cmd_part,
+                            fg="#e0b566",
+                        ).pack(side=tk.LEFT, anchor="w")
+                        make_term_label(
+                            row,
+                            font=self.dossier_font,
+                            text=f" — {desc_part}",
+                            fg=TERM_WHITE,
+                        ).pack(side=tk.LEFT, anchor="w")
+                        continue
+                make_term_label(
+                    skills_box,
+                    font=self.dossier_font,
+                    text=line.replace(" - ", " — ", 1),
+                    fg=TERM_WHITE,
+                    wraplength=wrap_w,
+                ).pack(anchor="w", pady=(0, 1))
             self.dossier_skills_list_label = skills_box
 
         self.dossier_emotion_label = make_term_label(
@@ -1964,6 +1971,7 @@ class ChatSessionModal(tk.Frame):
                 self.portrait_canvas.pack(anchor="nw", padx=0, pady=0)
         elif is_packed:
             self.portrait_canvas.pack_forget()
+        self._sync_left_pane_width()
 
     def _set_status(self, text: str, fg: str = TERM_RED) -> None:
         if self.on_status is not None:
@@ -3411,6 +3419,30 @@ def run_self_test() -> None:
     app.root.update()
     assert app.top_peers_label.cget("text") == f"Співрозмовники: {p1_name}, {p3_name}"
     assert app.top_peers_label.cget("fg") == TERM_CYAN
+
+    # Перевірка, що вертикальний розділювач прилягає впритул до правого краю портрета навіть із довгим текстом профілю
+    dossier_modal = ChatSessionModal(
+        app.stage_frame,
+        user_name=user2_name,
+        persona_name=p1_name,
+        persona_color="#ffaa00",
+        portrait_text=("⣿" * 20 + "\n") * 4,
+        on_send_message=lambda _m, _cb: None,
+        on_back=app.show_main_menu,
+        term_font=app.term_font,
+        dossier_info={
+            "title": p1_name,
+            "description": "Дуже довгий опис профілю " * 10,
+            "style": "Дуже довгий стиль спілкування без розривів_одного_рядка_який_не_повинен_розсувати_панель",
+            "skills_summary": "cmd_very_long_command - Дуже довгий опис команди скіла для перевірки переносу",
+        },
+    )
+    app._set_modal(dossier_modal)
+    app.root.update_idletasks()
+    app.root.update()
+    expected_portrait_w = int(float(dossier_modal.portrait_canvas.cget("width")))
+    assert expected_portrait_w > 1
+    assert dossier_modal.left_pane.winfo_reqwidth() == expected_portrait_w
 
     app.show_main_menu()
     app.root.update()

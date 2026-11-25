@@ -128,6 +128,7 @@ gvk/
 │   ├── menu.py                  # Термінальний Tkinter GUI (1280x720), Braille-портрети, чат
 │   ├── orchestrator.py          # Контекст, RAG, slash/auto-скіли, llama-server, Cross-Talk
 │   ├── memory_rag.py            # Гібридний векторний + лексичний RAG (FAISS / ngram)
+│   ├── roster.py                # Єдиний завантажувач приватного personas/roster.json
 │   └── skill_runner.py          # 3-рівнева пісочниця скілів + slash-команди + тригери
 ├── data/                        # [private / git-ignored] memories.txt, memory.faiss, конфіги білдера
 ├── datasets/                    # [private / git-ignored] Скомпільовані ChatML-датасети (.jsonl)
@@ -137,8 +138,8 @@ gvk/
 ├── notebooks/                   # [git-tracked] Google Colab QLoRA 2-stage ноутбук
 │   └── Qwen2.5_14b_LoRA_trainer.ipynb
 ├── personas/                    # [private / git-ignored] Локальні розшифровані дані персонажів
-│   ├── roster.json              # Реальні імена UI, сплеш-екрани та описи співрозмовників
-│   └── friend_1/                # persona_config.json, prompt.txt, memory.faiss, portraits/, roster.json, tools.py
+│   ├── roster.json              # Єдиний реєстр імен UI, сплеш-екранів, перекладів UA->RU та описів співрозмовників
+│   └── friend_1/                # persona_config.json, prompt.txt, memory.faiss, portraits/, tools.py
 ├── personas_encrypted/          # [encrypted / git-tracked] Хмарне сховище зашифрованих оновлень
 │   ├── friend_1/                # manifest.json, adapter.gguf.enc, payload.tar.enc
 │   ├── friend_2/
