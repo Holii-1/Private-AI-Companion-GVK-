@@ -1,6 +1,16 @@
-cryptography>=42.0.0
-argon2-cffi>=23.1.0
-rich>=13.7.0
-requests>=2.31.0
-numpy>=1.26.0
-faiss-cpu>=1.8.0
+# GVK Private AI — Runtime & RAG Dependencies
+# gvk-runtime: python>=3.10, tk>=8.6
+#
+# Zero-Install: run.sh / run.bat автоматично завантажують портативний Python 3.12 + Tcl/Tk 8.6
+# у ~/.gvk_ai/python/, якщо в системі немає Python >= 3.10 або Tk >= 8.6.
+# Для ручного встановлення системного Python (опційно):
+#   - macOS:          brew install python@3.12 python-tk@3.12
+#   - Ubuntu/Debian:  sudo apt-get install -y python3.12 python3.12-venv python3-tk
+#   - Windows:        python.org (Python 3.12, галочка "Add python.exe to PATH")
+
+cryptography>=42.0.0; python_version>="3.10"
+argon2-cffi>=23.1.0; python_version>="3.10"
+certifi>=2024.0.0; python_version>="3.10"
+numpy>=1.26.0; python_version>="3.10"
+faiss-cpu>=1.8.0; python_version>="3.10"
+sentence-transformers>=3.0.0; python_version>="3.10"

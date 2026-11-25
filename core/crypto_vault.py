@@ -4,21 +4,22 @@ GVK Private AI — Крипто-сховище, RAM-диск та Демон Kil
 
 Runtime-модуль безпеки, що забезпечує принцип Zero-Plaintext-At-Rest:
   1. Здобуття ключа доступу (32 байти):
-     - Автоматичний пошук оптичного Blu-ray диска `GVK_VAULT` (macOS / Linux / Windows)
+     - Автоматичний пошук оптичного DVD-диска `GVK_VAULT` (macOS / Linux / Windows)
        і миттєве зчитування `vault/master.key` за 0.01 с.
      - Fallback-режим (якщо диска немає): консольний запит секретної майстер-фрази
        та деривація того самого 32-байтного ключа через Argon2id (256 МБ RAM).
-  2. Кросплатформне монтування ізольованого RAM-диска:
-     - macOS: блоковий пристрій у пам'яті (`hdiutil attach -nomount ram://...`) з APFS/HFS+,
+  2. Кросплатформне монтування ізольованого RAM-диска (512–1024 МБ під 16 ГБ ОЗП):
+     - macOS: блоковий пристрій у пам'яті (`hdiutil attach -nomount ram://...`) з HFS+,
        правами 0700 та примусовим вимкненням індексації Spotlight (`.metadata_never_index`).
      - Linux: вбудований розділ ядра `tmpfs` у `/dev/shm/gvk_runtime_<pid>` (`chmod 700`).
      - Windows: віртуальний RAM-диск (ImDisk) або ізольований тимчасовий буфер у пам'яті
        з примусовим зануленням (`0x00`) перед закриттям.
   3. Потокове дешифрування `.enc` контейнерів (AES-256-GCM чанками по 64 МБ) напряму в RAM-диск:
-     - Базова модель (`base_model.gguf.enc` -> `<ram>/base_model.gguf`).
-     - Персональні LoRA-адаптери (`adapter.gguf.enc` -> `<ram>/<friend_id>.gguf`).
+     - Персональні LoRA-адаптери (`adapter.gguf.enc` -> `<ram>/adapters/<friend_id>.gguf`).
      - Приватні архіви (`payload.tar.enc` -> `<ram>/personas/<friend_id>/` з промптами,
        ASCII-портретами емоцій `portraits/`, базою `memory.faiss` та `tools.py`).
+     - Публічна базова модель (`Qwen2.5-14B-Instruct-Q4_K_M.gguf`, ~9.0 ГБ) підключається
+       напряму з SSD (`~/.gvk_ai/base/`) через `--mmap` без подвійного копіювання в RAM-диск.
   4. Апаратний демон Kill-Switch (Heartbeat 3.0 с):
      - Окремий фоновий потік кожні 3 секунди перевіряє присутність `vault/master.key` на диску.
      - Якщо диск вийнято або спрацював апаратний тумблер на станції `GVK-DOCK // MK.I`:
@@ -75,25 +76,81 @@ from tools.disc_packer import (
     verify_origin_sig,
 )
 
-DEFAULT_RAMDISK_MB = 7168  # ~7 ГБ для базової моделі 7B (4.8 ГБ) + 3 LoRA + FAISS у RAM
+DEFAULT_RAMDISK_MB = 1024  # 1 ГБ для 3 LoRA (~420 МБ) + FAISS/промпти/портрети; база 14B іде через --mmap
+DEFAULT_BASE_MODEL_FILENAME = "Qwen2.5-14B-Instruct-Q4_K_M.gguf"
 KILL_SWITCH_INTERVAL_SEC = 3.0
 
 
 # =====================================================================
 # 1. ПОШУК ОПТИЧНОГО ДИСКА GVK_VAULT ТА ЗДОБУТТЯ MASTER.KEY
 # =====================================================================
+def find_base_model_path(
+    custom_path: Optional[str] = None,
+    gvk_home: Optional[str] = None,
+) -> Optional[str]:
+    """
+    Шукає публічну базову GGUF-модель для підключення у llama-server через `--mmap`.
+    Порядок пріоритету:
+      1. Явно переданий `custom_path`
+      2. Змінна середовища `GVK_BASE_MODEL`
+      3. `~/.gvk_ai/base/Qwen2.5-14B-Instruct-Q4_K_M.gguf` (або будь-який `.gguf` у `~/.gvk_ai/base/`)
+      4. Локальні шляхи в репозиторії (`base/Qwen2.5-14B-Instruct-Q4_K_M.gguf`, `base/*.gguf`, `base_model.gguf`)
+    """
+    home_dir = os.path.abspath(gvk_home or os.environ.get("GVK_HOME") or os.path.expanduser("~/.gvk_ai"))
+    home_base_dir = os.path.join(home_dir, "base")
+
+    candidates: List[str] = []
+    if custom_path:
+        candidates.append(os.path.abspath(os.path.expanduser(custom_path)))
+
+    env_model = os.environ.get("GVK_BASE_MODEL")
+    if env_model:
+        candidates.append(os.path.abspath(os.path.expanduser(env_model)))
+
+    candidates.append(os.path.join(home_base_dir, DEFAULT_BASE_MODEL_FILENAME))
+    if os.path.isdir(home_base_dir):
+        candidates.extend(sorted(glob.glob(os.path.join(home_base_dir, "*.gguf"))))
+
+    candidates.append(os.path.join(REPO_ROOT, "base", DEFAULT_BASE_MODEL_FILENAME))
+    repo_base_dir = os.path.join(REPO_ROOT, "base")
+    if os.path.isdir(repo_base_dir):
+        candidates.extend(sorted(glob.glob(os.path.join(repo_base_dir, "*.gguf"))))
+    candidates.append(os.path.join(REPO_ROOT, "base_model.gguf"))
+
+    seen = set()
+    for path in candidates:
+        if not path or path in seen:
+            continue
+        seen.add(path)
+        try:
+            if os.path.isfile(path) and os.path.getsize(path) > 0:
+                return path
+        except OSError:
+            continue
+
+    return None
+
+
+def _normalize_disc_path(raw_path: str) -> str:
+    """Нормалізує шлях до диска (зокрема Windows 'D:' -> 'D:\\' перед abspath)."""
+    p = os.path.expanduser(raw_path.strip())
+    if len(p) == 2 and p[1] == ":" and p[0].isalpha():
+        p = p + "\\"
+    return os.path.abspath(p)
+
+
 def find_gvk_disc_path(explicit_path: Optional[str] = None) -> Optional[str]:
     """
-    Шукає змонтований оптичний носій Blu-ray `GVK_VAULT` (або перевіряє переданий шлях).
+    Шукає змонтований оптичний DVD-носій `GVK_VAULT` (або перевіряє переданий шлях).
     Повертає шлях до кореня диска, де лежить `vault/master.key`, або None.
     """
     candidates: List[str] = []
     if explicit_path:
-        candidates.append(os.path.abspath(explicit_path))
+        candidates.append(_normalize_disc_path(explicit_path))
 
     env_disc = os.environ.get("GVK_DISC_PATH")
     if env_disc:
-        candidates.append(os.path.abspath(env_disc))
+        candidates.append(_normalize_disc_path(env_disc))
 
     sys_name = platform.system().lower()
     if sys_name == "darwin":
@@ -165,8 +222,9 @@ def acquire_master_key(
 class CryptoVault:
     """
     Керує життєвим циклом зашифрованої сесії:
-      - Монтування ізольованого RAM-диска (macOS / Linux / Windows)
-      - Потокове дешифрування базової моделі, LoRA-адаптерів та `payload.tar.enc` у RAM
+      - Монтування ізольованого RAM-диска (512–1024 МБ, macOS / Linux / Windows)
+      - Пошук публічної базової моделі на SSD (`~/.gvk_ai/base/`) для підключення через `--mmap`
+      - Потокове дешифрування секретів (LoRA-адаптерів та `payload.tar.enc`) у RAM
       - Фоновий моніторинг оптичного приводу (Hardware Kill-Switch)
       - Гарантоване затирання ключів і демонтування RAM-диска при виході
     """
@@ -391,6 +449,10 @@ class CryptoVault:
             return False
         return verify_origin_sig(persona_id, self._require_key(), sig_bytes)
 
+    def resolve_base_model_path(self, custom_path: Optional[str] = None) -> Optional[str]:
+        """Повертає шлях до публічної базової 14B GGUF моделі для запуску llama-server з `--mmap`."""
+        return find_base_model_path(custom_path=custom_path)
+
     # -----------------------------------------------------------------
     # HARDWARE KILL-SWITCH (ФОНОВИЙ ДЕМОН МОНІТОРИНГУ НОСІЯ)
     # -----------------------------------------------------------------
@@ -439,7 +501,7 @@ class CryptoVault:
     def _trigger_emergency_purge(self, callback: Optional[Callable[[], None]] = None) -> None:
         """
         АВАРІЙНЕ СКИДАННЯ (Kill-Switch):
-        Викликається миттєво при вийманні Blu-ray диска або клацанні тумблера GVK-DOCK.
+        Викликається миттєво при вийманні DVD-диска або клацанні тумблера GVK-DOCK.
         """
         sys.stderr.write(
             "\n\n====================================================================\n"
@@ -450,11 +512,14 @@ class CryptoVault:
         sys.stderr.flush()
 
         # 1. Миттєвий SIGKILL для всіх зареєстрованих підпроцесів (llama-server)
+        had_pids = bool(self._protected_pids)
         for pid in list(self._protected_pids):
             try:
                 os.kill(pid, getattr(signal, "SIGKILL", signal.SIGTERM))
             except OSError:
                 pass
+        if had_pids:
+            time.sleep(0.25)
 
         # 2. Занулення ключа та демонтування RAM-диска
         self.cleanup()
@@ -478,6 +543,10 @@ class CryptoVault:
         for root, dirs, files in os.walk(directory, topdown=False):
             for fname in files:
                 fpath = os.path.join(root, fname)
+                try:
+                    os.chmod(fpath, 0o600)
+                except OSError:
+                    pass
                 try:
                     size = os.path.getsize(fpath)
                     with open(fpath, "r+b") as f:
@@ -562,13 +631,13 @@ def run_milestone1_self_test() -> None:
     print("====================================================================")
 
     with tempfile.TemporaryDirectory(prefix="gvk_sim_disc_") as sim_disc_dir:
-        # 1. Імітуємо вставлений Blu-ray диск GVK_VAULT у дисководі
+        # 1. Імітуємо вставлений DVD-диск GVK_VAULT у дисководі
         vault_dir = os.path.join(sim_disc_dir, "vault")
         persona_src = os.path.join(sim_disc_dir, "src_friend_1")
         os.makedirs(vault_dir, exist_ok=True)
         os.makedirs(os.path.join(persona_src, "portraits"), exist_ok=True)
 
-        print(" [1/5] Деривація ключа Argon2id та імітація Blu-ray диска GVK_VAULT...")
+        print(" [1/5] Деривація ключа Argon2id та імітація DVD-диска GVK_VAULT...")
         key = derive_master_key("GVK_Milestone_1_Verification_Phrase_2026!")
         key_file_path = os.path.join(vault_dir, "master.key")
         with open(key_file_path, "wb") as f:
@@ -618,7 +687,7 @@ def run_milestone1_self_test() -> None:
         print(f"       [OK] Адаптер та 4 ASCII-спрайти емоцій успішно розпаковано в ОЗП: {unpacked['persona_dir']}")
 
         # 4. Тестуємо спрацювання Kill-Switch при вийманні диска (або клацанні тумблера)
-        print(" [5/5] Тестування демона Kill-Switch (імітація виймання Blu-ray диска)...")
+        print(" [5/5] Тестування демона Kill-Switch (імітація виймання DVD-диска)...")
         triggered_event = threading.Event()
         vault._kill_switch_stop.set()  # Зупиняємо стандартний 3-секундний потік, щоб запустити швидкий 0.2с тест
         vault._kill_switch_thread = None

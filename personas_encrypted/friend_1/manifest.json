@@ -1,0 +1,13 @@
+{
+  "persona_id": "friend_1",
+  "version": "1.0.0",
+  "min_core_version": "1.0.0",
+  "files": {
+    "adapter": "adapter.gguf.enc",
+    "payload": "payload.tar.enc"
+  },
+  "sha256": {
+    "adapter": "735fe7bfddf97442c28c7f7b958ad65b1c92396e40ad5c58ee95a2323d0720bc",
+    "payload": "20935a6533e91c9cba5748cd3a24f22366ae1f9745d1c4e11914053b088e5992"
+  }
+}

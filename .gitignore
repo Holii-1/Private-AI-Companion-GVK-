@@ -8,6 +8,13 @@
 # ---------------------------------------------------------------------
 *.key
 *.pem
+*.p12
+*.pfx
+*.crt
+*.cer
+*.asc
+*.gpg
+*.kdbx
 *.bin
 *.sig
 master.key
@@ -17,33 +24,107 @@ vault/
 .env.*
 
 # ---------------------------------------------------------------------
-# 2. СИРІ ДАНІ ЧАТІВ ТА ПРИВАТНІ ЛОГИ (Zero-Leak)
+# 2. СИРІ ДАНІ ЧАТІВ, АРХІВИ, МЕДІА ТА ПРИВАТНІ ЛОГИ (Zero-Leak)
 # ---------------------------------------------------------------------
-# Експорти Telegram та датасети для тренування
+# Експорти Telegram, бази даних та датасети для тренування
 result.json
-chats/
-raw_chats/
+raw_chats_and_prompts/
 data/
 datasets/
 *.jsonl
+*.ndjson
+*.csv
+*.tsv
+*.db
+*.sqlite
+*.sqlite3
+*.dump
 # Метадані та приватні промпти у відкритому вигляді
 prompt.txt
+memory.txt
+memories.txt
+memories.json
 persona_config.json
+roster.json
+builder_config*.json
 tools.py
 !core/
 !tools/
+portraits/
+personas/
+# Логи та дебаг-вивід
+logs/
+*.log
+*.log.*
+*.out
+*.err
+nohup.out
+crash*.txt
+debug*.txt
+# Бекапи та тимчасові файли
+backup/
+backups/
+*.bak
+*.tmp
+*.temp
+*.orig
+*.rej
+# Приватні фото, скріни, відео, аудіо, документи
+*.png
+*.jpg
+*.jpeg
+*.webp
+*.gif
+*.bmp
+*.tiff
+*.heic
+*.heif
+*.psd
+*.xcf
+*.mp4
+*.mov
+*.avi
+*.mkv
+*.mp3
+*.wav
+*.ogg
+*.m4a
+*.pdf
+# Будь-які архіви та образи дисків (ризик витоку + ліміт GitHub 100 MB)
+*.zip
+*.7z
+*.rar
+*.tar
+*.tar.gz
+*.tgz
+*.tar.bz2
+*.tbz2
+*.tar.xz
+*.txz
+*.zst
+*.gz
+*.bz2
+*.xz
+*.dmg
+*.img
+*.cdr
 
 # ---------------------------------------------------------------------
 # 3. НЕЗАШИФРОВАНІ ВАГИ ШІ ТА ВЕКТОРНІ БАЗИ
 # ---------------------------------------------------------------------
 adapters/
+lora_final/
+lora_stage1/
+outputs_stage1/
+outputs_stage2/
+checkpoints/
 *.gguf
 *.safetensors
 *.pt
-*.bin
 *.onnx
 *.faiss
 *.index
+*.part
 
 # ---------------------------------------------------------------------
 # 4. ВАЖКІ БАЗОВІ МОДЕЛІ (Навіть зашифровані > 100 МБ блокуються GitHub)
@@ -63,6 +144,8 @@ llama-cli.exe
 *.dylib
 *.so
 *.dll
+*.metal
+*.metallib
 
 # ---------------------------------------------------------------------
 # 6. КЕШІ ТА СЕРЕДОВИЩЕ PYTHON
@@ -70,7 +153,6 @@ llama-cli.exe
 __pycache__/
 *.py[cod]
 *$py.class
-*.so
 .Python
 build/
 develop-eggs/
@@ -88,8 +170,14 @@ wheels/
 .installed.cfg
 *.egg
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.cache/
+.ipynb_checkpoints/
+.gvk_ai/
 .coverage
 htmlcov/
+graphify-out/
 
 # Віртуальні оточення
 venv/

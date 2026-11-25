@@ -16,7 +16,8 @@ GVK Private AI — Генератор ключів, Шифратор конте�
      - HMAC-SHA256(persona_id, master_key) -> 32 байти.
   4. Пакування приватного архіву особистості `payload.tar.enc` напряму в пам'яті (io.BytesIO)
      та автоматична генерація публічного паспорта `manifest.json` із SHA-256 гешами.
-  5. Збірка повної структури Blu-ray диска `GVK_VAULT` (включно з лаунчерами `run.sh` / `run.bat`).
+  5. Збірка повної структури DVD-диска `GVK_VAULT` (DVD-R 4.7 ГБ, ~150–160 МБ,
+     включно з лаунчерами `run.sh` / `run.bat`).
 
 Приклади використання:
   # 1. Швидка самоперевірка всіх криптографічних функцій в ОЗП:
@@ -25,19 +26,20 @@ GVK Private AI — Генератор ключів, Шифратор конте�
   # 2. Генерація master.key із секретної фрази:
   python3 tools/disc_packer.py keygen -o vault/master.key
 
-  # 3. Шифрування великого файлу (наприклад, базової моделі):
-  python3 tools/disc_packer.py encrypt -k vault/master.key -i base_model.gguf -o base_model.gguf.enc
+  # 3. Шифрування файлу (наприклад, адаптера):
+  python3 tools/disc_packer.py encrypt -k vault/master.key -i adapter.gguf -o adapter.gguf.enc
 
   # 4. Повна збірка папки персонажа (adapter.gguf.enc + payload.tar.enc + manifest.json + origin.sig):
   python3 tools/disc_packer.py pack-persona -k vault/master.key --id friend_1 \
       --adapter raw/friend_1.gguf --payload-dir raw/friend_1_payload/ -o build/friend_1/
 
-  # 5. Збірка готового образу Blu-ray диска GVK_VAULT:
+  # 5. Збірка готового образу DVD-диска GVK_VAULT (публічна база докачується updater.py з хмари):
   python3 tools/disc_packer.py build-disc -k vault/master.key --id friend_1 \
-      --base-enc base_model.gguf.enc --persona-dir build/friend_1/ -o dist/GVK_VAULT_DISC_1/
+      --persona-dir build/friend_1/ -o dist/GVK_VAULT_DISC_1/
 """
 
 import argparse
+import datetime
 import getpass
 import hashlib
 import hmac
@@ -47,11 +49,12 @@ import os
 import shutil
 import stat
 import struct
+import subprocess
 import sys
 import tarfile
 import tempfile
 import time
-from typing import BinaryIO, Optional
+from typing import Any, BinaryIO, Dict, List, Optional, Tuple
 
 # =====================================================================
 # КОНСТАНТИ КРИПТОГРАФІЧНОГО ПРОТОКОЛУ GVK
@@ -380,13 +383,22 @@ def pack_payload_encrypted(source_dir: str, output_enc_path: str, master_key: by
     if not os.path.isdir(source_dir):
         raise FileNotFoundError(f"Папку корисного навантаження не знайдено: {source_dir}")
 
+    def _tar_filter(tarinfo: tarfile.TarInfo) -> Optional[tarfile.TarInfo]:
+        parts = [p for p in tarinfo.name.replace("\\", "/").split("/") if p and p != "."]
+        if any(p.startswith(".") or p in ("__pycache__", "raw") for p in parts):
+            return None
+        base = parts[-1].lower() if parts else ""
+        if base.endswith((".psd", ".xcf", ".pyc", ".pyo")):
+            return None
+        return tarinfo
+
     tar_buffer = io.BytesIO()
     with tarfile.open(fileobj=tar_buffer, mode="w:gz") as tar:
         for entry in sorted(os.listdir(source_dir)):
-            if entry.startswith(".") or entry == "__pycache__":
+            if entry.startswith(".") or entry in ("__pycache__", "raw"):
                 continue
             full_path = os.path.join(source_dir, entry)
-            tar.add(full_path, arcname=entry)
+            tar.add(full_path, arcname=entry, filter=_tar_filter)
 
     tar_bytes = tar_buffer.getvalue()
     tar_stream = io.BytesIO(tar_bytes)
@@ -421,7 +433,10 @@ def unpack_payload_decrypted(input_enc_path: str, target_ram_dir: str, master_ke
             member_path = os.path.abspath(os.path.join(target_ram_dir, member.name))
             if not member_path.startswith(os.path.abspath(target_ram_dir)):
                 raise ValueError(f"Небезпечний шлях в архіві: {member.name}")
-        tar.extractall(path=target_ram_dir)
+        if "filter" in tar.extractall.__code__.co_varnames:
+            tar.extractall(path=target_ram_dir, filter="data")
+        else:
+            tar.extractall(path=target_ram_dir)
 
 
 def write_public_manifest(
@@ -456,76 +471,613 @@ def write_public_manifest(
 
 
 # =====================================================================
-# 5. ЗБІРКА СТРУКТУРИ BLU-RAY ДИСКА (GVK_VAULT)
+# 5. ЗБІРКА СТРУКТУРИ DVD-ДИСКА (GVK_VAULT)
 # =====================================================================
-RUN_SH_TEMPLATE = """#!/usr/bin/env bash
+RUN_SH_TEMPLATE = r"""#!/usr/bin/env bash
 # =====================================================================
-# GVK Private AI — Автономний лаунчер Blu-ray диска (macOS / Linux)
+# GVK Private AI — Універсальний Zero-Install лаунчер (macOS / Linux)
+# Працює з локального репо або з DVD GVK_VAULT (навіть без Git та Python).
 # =====================================================================
 set -e
 
-DISC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-GVK_HOME="${HOME}/.gvk_ai"
-REPO_DIR="${GVK_HOME}/repo"
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
+export MKL_NUM_THREADS="${MKL_NUM_THREADS:-1}"
+export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
+export KMP_DUPLICATE_LIB_OK="${KMP_DUPLICATE_LIB_OK:-TRUE}"
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+GVK_HOME="${GVK_HOME:-${HOME}/.gvk_ai}"
 REPO_URL="https://github.com/Holii-1/Private-AI-Companion-GVK-.git"
+REPO_TARBALL_URL="https://github.com/Holii-1/Private-AI-Companion-GVK-/archive/refs/heads/main.tar.gz"
+PORTABLE_PY_TAG="20250317"
+PORTABLE_PY_VER="3.12.9"
 
-echo "===================================================================="
-echo " [*] GVK_VAULT Виявлено: ${DISC_DIR}"
-echo "===================================================================="
+CMD_NAME="${1:-}"
+DISC_ARGS=()
 
-mkdir -p "${GVK_HOME}"
+has_real_git() {
+    if [ "$(uname -s)" = "Darwin" ]; then
+        # На чистій macOS /usr/bin/git — заглушка, що відкриває вікно Xcode CLT
+        xcode-select -p >/dev/null 2>&1 || return 1
+    fi
+    command -v git >/dev/null 2>&1
+}
 
-if [ ! -d "${REPO_DIR}/.git" ]; then
-    echo " [*] Перший запуск: клонування ядра GVK Private AI..."
-    git clone "${REPO_URL}" "${REPO_DIR}"
+export_portable_tk_env() {
+    local py_root="${GVK_HOME}/python"
+    if [ -d "${py_root}/lib/tcl8.6" ] && [ -z "${TCL_LIBRARY:-}" ]; then
+        export TCL_LIBRARY="${py_root}/lib/tcl8.6"
+    fi
+    if [ -d "${py_root}/lib/tk8.6" ] && [ -z "${TK_LIBRARY:-}" ]; then
+        export TK_LIBRARY="${py_root}/lib/tk8.6"
+    fi
+}
+
+seed_repo_from_disc_bundle() {
+    local target_dir="$1"
+    if [ -f "${SCRIPT_DIR}/core_bundle/core/main.py" ] && [ -f "${SCRIPT_DIR}/core_bundle/updater.py" ]; then
+        mkdir -p "${target_dir}"
+        cp -R "${SCRIPT_DIR}/core_bundle/." "${target_dir}/"
+        chmod -R u+w "${target_dir}" 2>/dev/null || true
+        echo " [OK] Локальне ядро з DVD (core_bundle) розгорнуто у: ${target_dir}"
+        return 0
+    fi
+    return 1
+}
+
+sync_repo_via_tarball() {
+    local target_dir="$1"
+    local tmp_dir archive extracted
+    if ! command -v curl >/dev/null 2>&1 || ! command -v tar >/dev/null 2>&1; then
+        if [ -f "${target_dir}/core/main.py" ]; then
+            echo " [!] curl/tar недоступні — використовуємо локальну копію ядра."
+            return 0
+        fi
+        echo " [X] Помилка: не знайдено git або curl+tar для завантаження ядра." >&2
+        return 1
+    fi
+
+    tmp_dir="$(mktemp -d "${GVK_HOME}/repo_dl_XXXXXX")"
+    archive="${tmp_dir}/repo.tar.gz"
+    echo " [*] Завантаження ядра GVK Private AI (без git)..."
+    if ! curl -fSL --retry 2 --connect-timeout 15 -o "${archive}" "${REPO_TARBALL_URL}"; then
+        rm -rf "${tmp_dir}"
+        if [ -f "${target_dir}/core/main.py" ]; then
+            echo " [!] Немає мережі — використовуємо кешовану копію ядра."
+            return 0
+        fi
+        echo " [X] Не вдалося завантажити ядро з GitHub. Перевірте інтернет на 1-й запуск." >&2
+        return 1
+    fi
+
+    if ! tar -xzf "${archive}" -C "${tmp_dir}"; then
+        rm -rf "${tmp_dir}"
+        echo " [X] Помилка розпакування архіву репозиторію." >&2
+        return 1
+    fi
+
+    extracted="$(find "${tmp_dir}" -mindepth 1 -maxdepth 1 -type d | head -n 1)"
+    if [ -z "${extracted}" ] || [ ! -f "${extracted}/updater.py" ]; then
+        rm -rf "${tmp_dir}"
+        echo " [X] Некоректний архів репозиторію (відсутній updater.py)." >&2
+        return 1
+    fi
+
+    mkdir -p "${target_dir}"
+    cp -R "${extracted}/." "${target_dir}/"
+    rm -rf "${tmp_dir}"
+    echo " [✓] Ядро GVK Private AI оновлено у: ${target_dir}"
+    return 0
+}
+
+is_good_python() {
+    local py_bin="$1"
+    [ -n "${py_bin}" ] && [ -x "${py_bin}" ] || return 1
+    if [[ "${py_bin}" == "${GVK_HOME}/python/"* ]]; then
+        export_portable_tk_env
+    fi
+    "${py_bin}" -c "import sys, tkinter as tk; raise SystemExit(0 if sys.version_info >= (3, 10) and float(tk.TkVersion) >= 8.6 else 1)" >/dev/null 2>&1
+}
+
+bootstrap_portable_python() {
+    local os_name arch_name triple py_url tmp_dir archive
+    os_name="$(uname -s)"
+    arch_name="$(uname -m)"
+    triple=""
+
+    if [ "${os_name}" = "Darwin" ]; then
+        case "${arch_name}" in
+            arm64|aarch64) triple="aarch64-apple-darwin" ;;
+            x86_64)        triple="x86_64-apple-darwin" ;;
+        esac
+    elif [ "${os_name}" = "Linux" ]; then
+        case "${arch_name}" in
+            x86_64|amd64)  triple="x86_64-unknown-linux-gnu" ;;
+            aarch64|arm64) triple="aarch64-unknown-linux-gnu" ;;
+        esac
+    fi
+
+    if [ -z "${triple}" ]; then
+        echo " [X] Непідтримувана архітектура (${os_name}/${arch_name}) для автозавантаження Python. Встановіть Python 3.12 вручну." >&2
+        return 1
+    fi
+    if ! command -v curl >/dev/null 2>&1 || ! command -v tar >/dev/null 2>&1; then
+        echo " [X] Потрібен curl + tar для автозавантаження портативного Python 3.12." >&2
+        return 1
+    fi
+
+    mkdir -p "${GVK_HOME}"
+    py_url="https://github.com/astral-sh/python-build-standalone/releases/download/${PORTABLE_PY_TAG}/cpython-${PORTABLE_PY_VER}%2B${PORTABLE_PY_TAG}-${triple}-install_only_stripped.tar.gz"
+    tmp_dir="$(mktemp -d "${GVK_HOME}/py_dl_XXXXXX")"
+    archive="${tmp_dir}/python.tar.gz"
+
+    echo " [*] Python 3.10+ (з Tk >= 8.6) не знайдено — завантажуємо портативний Python ${PORTABLE_PY_VER} (~35 МБ)..." >&2
+    if ! curl -fSL --retry 2 --connect-timeout 15 -o "${archive}" "${py_url}"; then
+        rm -rf "${tmp_dir}"
+        echo " [X] Не вдалося завантажити портативний Python. Перевірте інтернет або встановіть Python 3.12 вручну." >&2
+        return 1
+    fi
+
+    if ! tar -xzf "${archive}" -C "${tmp_dir}" || [ ! -x "${tmp_dir}/python/bin/python3" ]; then
+        rm -rf "${tmp_dir}"
+        echo " [X] Помилка розпакування портативного Python." >&2
+        return 1
+    fi
+
+    rm -rf "${GVK_HOME}/python"
+    mv "${tmp_dir}/python" "${GVK_HOME}/python"
+    rm -rf "${tmp_dir}"
+    export_portable_tk_env
+    echo " [✓] Портативний Python ${PORTABLE_PY_VER} встановлено у: ${GVK_HOME}/python" >&2
+    printf '%s\n' "${GVK_HOME}/python/bin/python3"
+    return 0
+}
+
+resolve_any_python() {
+    local cand
+    for cand in \
+        "${GVK_HOME}/python/bin/python3" \
+        "/opt/homebrew/bin/python3.12" \
+        "/opt/homebrew/bin/python3.11" \
+        "/opt/homebrew/bin/python3.13" \
+        "/opt/homebrew/bin/python3" \
+        "/usr/local/bin/python3.12" \
+        "/usr/local/bin/python3" \
+        "$(command -v python3 2>/dev/null || true)" \
+        "${REPO_DIR}/.venv/bin/python3" \
+        "${GVK_HOME}/.venv/bin/python3"; do
+        if [ -n "${cand}" ] && [ -x "${cand}" ]; then
+            printf '%s\n' "${cand}"
+            return 0
+        fi
+    done
+    return 1
+}
+
+resolve_system_python() {
+    local cand
+    for cand in \
+        "${GVK_HOME}/python/bin/python3" \
+        "/opt/homebrew/bin/python3.12" \
+        "/opt/homebrew/bin/python3.11" \
+        "/opt/homebrew/bin/python3.13" \
+        "/opt/homebrew/bin/python3" \
+        "/usr/local/bin/python3.12" \
+        "/usr/local/bin/python3.11" \
+        "/usr/local/bin/python3" \
+        "/Library/Frameworks/Python.framework/Versions/3.12/bin/python3" \
+        "/Library/Frameworks/Python.framework/Versions/Current/bin/python3" \
+        "$(command -v python3.12 2>/dev/null || true)" \
+        "$(command -v python3.11 2>/dev/null || true)" \
+        "$(command -v python3 2>/dev/null || true)" \
+        "${REPO_DIR}/.venv/bin/python3" \
+        "${GVK_HOME}/.venv/bin/python3"; do
+        if is_good_python "${cand}"; then
+            printf '%s\n' "${cand}"
+            return 0
+        fi
+    done
+    bootstrap_portable_python
+}
+
+resolve_venv_python() {
+    local cand
+    for cand in \
+        "${REPO_DIR}/.venv/bin/python3" \
+        "${GVK_HOME}/.venv/bin/python3"; do
+        if [ -x "${cand}" ]; then
+            printf '%s\n' "${cand}"
+            return 0
+        fi
+    done
+    resolve_system_python
+}
+
+if [ -f "${SCRIPT_DIR}/core/main.py" ] && [ -f "${SCRIPT_DIR}/updater.py" ]; then
+    REPO_DIR="${SCRIPT_DIR}"
+    echo "===================================================================="
+    echo " [*] GVK Private AI — Локальний запуск: ${REPO_DIR}"
+    echo "===================================================================="
+    if [ -f "${SCRIPT_DIR}/persona/manifest.json" ]; then
+        DISC_ARGS=(--disc-path "${SCRIPT_DIR}")
+    fi
+    if [ "${CMD_NAME}" != "self-test" ] && [ "${CMD_NAME}" != "--self-test" ] && [ "${CMD_NAME}" != "status" ]; then
+        if [ -d "${REPO_DIR}/.git" ] && has_real_git; then
+            if [ -z "$(git -C "${REPO_DIR}" status --porcelain 2>/dev/null || true)" ]; then
+                echo " [*] Перевірка оновлень коду..."
+                git -C "${REPO_DIR}" pull --ff-only || echo " [!] Не вдалося виконати git pull (офлайн), продовжуємо..."
+            fi
+        fi
+    fi
+else
+    REPO_DIR="${GVK_HOME}/repo"
+    DISC_ARGS=(--disc-path "${SCRIPT_DIR}")
+    echo "===================================================================="
+    echo " [*] GVK_VAULT Виявлено: ${SCRIPT_DIR}"
+    echo "===================================================================="
+    mkdir -p "${GVK_HOME}"
+    if [ ! -f "${REPO_DIR}/core/main.py" ]; then
+        seed_repo_from_disc_bundle "${REPO_DIR}" || true
+    fi
+    if has_real_git && { [ -d "${REPO_DIR}/.git" ] || [ ! -f "${REPO_DIR}/core/main.py" ]; }; then
+        if [ ! -d "${REPO_DIR}/.git" ]; then
+            echo " [*] Перший запуск: клонування ядра GVK Private AI..."
+            git clone "${REPO_URL}" "${REPO_DIR}" || sync_repo_via_tarball "${REPO_DIR}"
+        else
+            echo " [*] Перевірка оновлень ядра та personas_encrypted/..."
+            git -C "${REPO_DIR}" pull --ff-only || echo " [!] Не вдалося виконати git pull (офлайн або локальні зміни), продовжуємо..."
+        fi
+    else
+        sync_repo_via_tarball "${REPO_DIR}"
+    fi
+    # Якщо на DVD core_bundle свіжіший за завантажене з GitHub репо — поверх накладаємо файли з DVD
+    if [ -f "${SCRIPT_DIR}/core_bundle/core/main.py" ] && { [ ! -f "${REPO_DIR}/core/main.py" ] || [ "${SCRIPT_DIR}/core_bundle/core/main.py" -nt "${REPO_DIR}/core/main.py" ]; }; then
+        seed_repo_from_disc_bundle "${REPO_DIR}" || true
+    fi
 fi
 
-exec python3 "${REPO_DIR}/core/main.py" --disc-path "${DISC_DIR}" "$@"
+if [ "${CMD_NAME}" = "status" ]; then
+    shift
+    STAT_PY="$(resolve_any_python)" || {
+        echo " [!] Python ще не встановлено (буде завантажено автоматично при першому запуску ./run.sh)." >&2
+        exit 1
+    }
+    exec "${STAT_PY}" "${REPO_DIR}/updater.py" status --repo-root "${REPO_DIR}" "$@"
+fi
+
+SYS_PY="$(resolve_system_python)" || {
+    echo " [X] Помилка: не вдалося знайти або завантажити Python 3.10+ (Tk >= 8.6)." >&2
+    exit 1
+}
+export_portable_tk_env
+
+if [ "${CMD_NAME}" = "self-test" ] || [ "${CMD_NAME}" = "--self-test" ]; then
+    shift
+    VENV_PY="$(resolve_venv_python)"
+    exec "${VENV_PY}" "${REPO_DIR}/core/main.py" self-test "$@"
+fi
+
+if [ ${#DISC_ARGS[@]} -gt 0 ]; then
+    "${SYS_PY}" "${REPO_DIR}/updater.py" sync --repo-root "${REPO_DIR}" "${DISC_ARGS[@]}"
+else
+    "${SYS_PY}" "${REPO_DIR}/updater.py" sync --repo-root "${REPO_DIR}"
+fi
+
+VENV_PY="$(resolve_venv_python)"
+
+if [ -f "${REPO_DIR}/core/main.py" ]; then
+    if [ ${#DISC_ARGS[@]} -gt 0 ]; then
+        exec "${VENV_PY}" "${REPO_DIR}/core/main.py" "${DISC_ARGS[@]}" "$@"
+    else
+        exec "${VENV_PY}" "${REPO_DIR}/core/main.py" "$@"
+    fi
+else
+    echo " [!] Модуль core/main.py ще не створено. Статус кешу:"
+    exec "${SYS_PY}" "${REPO_DIR}/updater.py" status --repo-root "${REPO_DIR}"
+fi
 """
 
-RUN_BAT_TEMPLATE = """@echo off
-REM =====================================================================
-REM GVK Private AI — Автономний лаунчер Blu-ray диска (Windows)
-REM =====================================================================
-setlocal
+RUN_COMMAND_TEMPLATE = r"""#!/usr/bin/env bash
+cd "$(dirname "$0")"
+exec bash ./run.sh "$@"
+"""
 
-set "DISC_DIR=%~dp0"
-set "GVK_HOME=%USERPROFILE%\\.gvk_ai"
-set "REPO_DIR=%GVK_HOME%\\repo"
+RUN_BAT_TEMPLATE = r"""@echo off
+REM =====================================================================
+REM GVK Private AI — Універсальний Zero-Install лаунчер (Windows)
+REM Працює з локального репо або з DVD GVK_VAULT (навіть без Git та Python).
+REM =====================================================================
+chcp 65001 >nul 2>&1
+setlocal EnableExtensions
+
+if not defined OMP_NUM_THREADS set "OMP_NUM_THREADS=1"
+if not defined MKL_NUM_THREADS set "MKL_NUM_THREADS=1"
+if not defined TOKENIZERS_PARALLELISM set "TOKENIZERS_PARALLELISM=false"
+if not defined KMP_DUPLICATE_LIB_OK set "KMP_DUPLICATE_LIB_OK=TRUE"
+
+set "SCRIPT_DIR=%~dp0"
+if "%SCRIPT_DIR:~-1%"=="\" set "SCRIPT_DIR=%SCRIPT_DIR:~0,-1%"
+
+if not defined GVK_HOME set "GVK_HOME=%USERPROFILE%\.gvk_ai"
 set "REPO_URL=https://github.com/Holii-1/Private-AI-Companion-GVK-.git"
+set "REPO_TARBALL_URL=https://github.com/Holii-1/Private-AI-Companion-GVK-/archive/refs/heads/main.tar.gz"
+set "PORTABLE_PY_URL=https://github.com/astral-sh/python-build-standalone/releases/download/20250317/cpython-3.12.9%%2B20250317-x86_64-pc-windows-msvc-install_only_stripped.tar.gz"
+set "DISC_PATH="
+set "CMD_NAME=%~1"
 
-echo ====================================================================
-echo  [*] GVK_VAULT Disc Detected: %DISC_DIR%
-echo ====================================================================
+if not exist "%SCRIPT_DIR%\core\main.py" goto :dvd_mode
+if not exist "%SCRIPT_DIR%\updater.py" goto :dvd_mode
 
+set "REPO_DIR=%SCRIPT_DIR%"
+echo ====================================================================
+echo  [*] GVK Private AI — Local Launch: %REPO_DIR%
+echo ====================================================================
+if exist "%SCRIPT_DIR%\persona\manifest.json" set "DISC_PATH=%SCRIPT_DIR%"
+if /I "%CMD_NAME%"=="self-test" goto :resolve_py
+if /I "%CMD_NAME%"=="--self-test" goto :resolve_py
+if /I "%CMD_NAME%"=="status" goto :resolve_py
+if not exist "%REPO_DIR%\.git" goto :resolve_py
+
+where git >nul 2>&1
+if errorlevel 1 goto :resolve_py
+
+set "DIRTY_FILES="
+for /f "delims=" %%i in ('git -C "%REPO_DIR%" status --porcelain 2^>nul') do set "DIRTY_FILES=1"
+if not defined DIRTY_FILES (
+    echo  [*] Checking repository updates via git pull...
+    git -C "%REPO_DIR%" pull --ff-only || echo  [!] git pull skipped ^(offline^).
+)
+goto :resolve_py
+
+:dvd_mode
+set "REPO_DIR=%GVK_HOME%\repo"
+set "DISC_PATH=%SCRIPT_DIR%"
+echo ====================================================================
+echo  [*] GVK_VAULT Disc Detected: %SCRIPT_DIR%
+echo ====================================================================
 if not exist "%GVK_HOME%" mkdir "%GVK_HOME%"
 
-if not exist "%REPO_DIR%\\.git" (
-    echo  [*] First launch: cloning GVK Private AI core...
-    git clone "%REPO_URL%" "%REPO_DIR%"
+if exist "%SCRIPT_DIR%\core_bundle\core\main.py" (
+    if not exist "%REPO_DIR%" mkdir "%REPO_DIR%"
+    xcopy "%SCRIPT_DIR%\core_bundle\*" "%REPO_DIR%\" /E /I /H /Y /Q >nul
+    attrib -R "%REPO_DIR%\*.*" /S /D >nul 2>&1
+    echo  [OK] Seeded local GVK core from DVD ^(core_bundle^).
 )
 
-python "%REPO_DIR%\\core\\main.py" --disc-path "%DISC_DIR%" %*
-"""
+where git >nul 2>&1
+if errorlevel 1 goto :download_repo_tarball
 
+if exist "%REPO_DIR%\.git" (
+    echo  [*] Checking repository updates via git pull...
+    git -C "%REPO_DIR%" pull --ff-only || echo  [!] git pull skipped ^(offline or local changes^).
+    goto :resolve_py
+)
+if exist "%REPO_DIR%\core\main.py" goto :download_repo_tarball
+
+echo  [*] First launch: cloning GVK Private AI core...
+git clone "%REPO_URL%" "%REPO_DIR%"
+if not errorlevel 1 goto :resolve_py
+echo  [!] git clone failed, trying direct archive download...
+
+:download_repo_tarball
+where curl.exe >nul 2>&1
+if errorlevel 1 goto :repo_no_tools
+where tar.exe >nul 2>&1
+if errorlevel 1 goto :repo_no_tools
+
+set "REPO_TMP=%GVK_HOME%\repo_dl_tmp"
+set "REPO_ARCHIVE=%GVK_HOME%\repo_dl.tar.gz"
+if exist "%REPO_TMP%" rmdir /S /Q "%REPO_TMP%"
+if exist "%REPO_ARCHIVE%" del /F /Q "%REPO_ARCHIVE%"
+mkdir "%REPO_TMP%"
+
+echo  [*] Downloading GVK Private AI core archive ^(no Git required^)...
+curl.exe -fSL --retry 2 --connect-timeout 15 -o "%REPO_ARCHIVE%" "%REPO_TARBALL_URL%"
+if errorlevel 1 goto :repo_dl_failed
+
+tar.exe -xzf "%REPO_ARCHIVE%" -C "%REPO_TMP%"
+if errorlevel 1 goto :repo_dl_failed
+
+set "EXTRACTED_DIR="
+for /d %%D in ("%REPO_TMP%\*") do set "EXTRACTED_DIR=%%~fD"
+if not defined EXTRACTED_DIR goto :repo_dl_failed
+if not exist "%EXTRACTED_DIR%\updater.py" goto :repo_dl_failed
+
+if not exist "%REPO_DIR%" mkdir "%REPO_DIR%"
+xcopy "%EXTRACTED_DIR%\*" "%REPO_DIR%\" /E /I /H /Y /Q >nul
+rmdir /S /Q "%REPO_TMP%" >nul 2>&1
+del /F /Q "%REPO_ARCHIVE%" >nul 2>&1
+echo  [OK] GVK Private AI core synced to: %REPO_DIR%
+goto :resolve_py
+
+:repo_dl_failed
+if exist "%REPO_TMP%" rmdir /S /Q "%REPO_TMP%" >nul 2>&1
+if exist "%REPO_ARCHIVE%" del /F /Q "%REPO_ARCHIVE%" >nul 2>&1
+if exist "%REPO_DIR%\core\main.py" (
+    echo  [!] Offline — using cached GVK core: %REPO_DIR%
+    goto :resolve_py
+)
+echo  [X] Error: failed to download GVK core from GitHub. Internet is required on first launch.
+call :fail 1
+exit /b 1
+
+:repo_no_tools
+if exist "%REPO_DIR%\core\main.py" (
+    echo  [!] Offline / no git or curl — using cached GVK core.
+    goto :resolve_py
+)
+echo  [X] Error: neither git nor curl.exe/tar.exe found. Install Git for Windows and retry.
+call :fail 1
+exit /b 1
+
+:resolve_py
+set "SYS_PY="
+set "SYS_FLAG="
+if exist "%GVK_HOME%\python\tcl\tcl8.6" if not defined TCL_LIBRARY set "TCL_LIBRARY=%GVK_HOME%\python\tcl\tcl8.6"
+if exist "%GVK_HOME%\python\tcl\tk8.6" if not defined TK_LIBRARY set "TK_LIBRARY=%GVK_HOME%\python\tcl\tk8.6"
+if exist "%GVK_HOME%\python\lib\tcl8.6" if not defined TCL_LIBRARY set "TCL_LIBRARY=%GVK_HOME%\python\lib\tcl8.6"
+if exist "%GVK_HOME%\python\lib\tk8.6" if not defined TK_LIBRARY set "TK_LIBRARY=%GVK_HOME%\python\lib\tk8.6"
+
+if not exist "%GVK_HOME%\python\python.exe" goto :try_py_launcher
+"%GVK_HOME%\python\python.exe" -c "import sys, tkinter as tk; raise SystemExit(0 if sys.version_info >= (3, 10) and float(tk.TkVersion) >= 8.6 else 1)" >nul 2>&1
+if not errorlevel 1 (
+    set "SYS_PY=%GVK_HOME%\python\python.exe"
+    goto :sys_ready
+)
+
+:try_py_launcher
+py -3 -c "import sys, tkinter as tk; raise SystemExit(0 if sys.version_info >= (3, 10) and float(tk.TkVersion) >= 8.6 else 1)" >nul 2>&1
+if not errorlevel 1 (
+    set "SYS_PY=py"
+    set "SYS_FLAG=-3"
+    goto :sys_ready
+)
+
+python -c "import sys, tkinter as tk; raise SystemExit(0 if sys.version_info >= (3, 10) and float(tk.TkVersion) >= 8.6 else 1)" >nul 2>&1
+if not errorlevel 1 (
+    set "SYS_PY=python"
+    goto :sys_ready
+)
+
+if exist "%REPO_DIR%\.venv\Scripts\python.exe" (
+    set "SYS_PY=%REPO_DIR%\.venv\Scripts\python.exe"
+    goto :sys_ready
+)
+if exist "%GVK_HOME%\.venv\Scripts\python.exe" (
+    set "SYS_PY=%GVK_HOME%\.venv\Scripts\python.exe"
+    goto :sys_ready
+)
+
+:bootstrap_py
+if /I "%CMD_NAME%"=="status" goto :py_missing
+where curl.exe >nul 2>&1
+if errorlevel 1 goto :py_missing
+where tar.exe >nul 2>&1
+if errorlevel 1 goto :py_missing
+
+if not exist "%GVK_HOME%" mkdir "%GVK_HOME%"
+set "PY_TMP=%GVK_HOME%\py_dl_tmp"
+set "PY_ARCHIVE=%GVK_HOME%\py_portable.tar.gz"
+if exist "%PY_TMP%" rmdir /S /Q "%PY_TMP%"
+if exist "%PY_ARCHIVE%" del /F /Q "%PY_ARCHIVE%"
+mkdir "%PY_TMP%"
+
+echo  [*] Python 3.10+ ^(with Tkinter^) not found — downloading portable Python 3.12 ^(~35 MB^)...
+curl.exe -fSL --retry 2 --connect-timeout 15 -o "%PY_ARCHIVE%" "%PORTABLE_PY_URL%"
+if errorlevel 1 goto :py_dl_failed
+
+tar.exe -xzf "%PY_ARCHIVE%" -C "%PY_TMP%"
+if errorlevel 1 goto :py_dl_failed
+if not exist "%PY_TMP%\python\python.exe" goto :py_dl_failed
+
+if exist "%GVK_HOME%\python" rmdir /S /Q "%GVK_HOME%\python"
+move "%PY_TMP%\python" "%GVK_HOME%\python" >nul
+rmdir /S /Q "%PY_TMP%" >nul 2>&1
+del /F /Q "%PY_ARCHIVE%" >nul 2>&1
+
+if exist "%GVK_HOME%\python\tcl\tcl8.6" set "TCL_LIBRARY=%GVK_HOME%\python\tcl\tcl8.6"
+if exist "%GVK_HOME%\python\tcl\tk8.6" set "TK_LIBRARY=%GVK_HOME%\python\tcl\tk8.6"
+if exist "%GVK_HOME%\python\lib\tcl8.6" if not defined TCL_LIBRARY set "TCL_LIBRARY=%GVK_HOME%\python\lib\tcl8.6"
+if exist "%GVK_HOME%\python\lib\tk8.6" if not defined TK_LIBRARY set "TK_LIBRARY=%GVK_HOME%\python\lib\tk8.6"
+
+set "SYS_PY=%GVK_HOME%\python\python.exe"
+echo  [OK] Portable Python 3.12 installed to: %GVK_HOME%\python
+goto :sys_ready
+
+:py_dl_failed
+if exist "%PY_TMP%" rmdir /S /Q "%PY_TMP%" >nul 2>&1
+if exist "%PY_ARCHIVE%" del /F /Q "%PY_ARCHIVE%" >nul 2>&1
+
+:py_missing
+echo  [X] Error: Python 3.10+ not found and portable download failed. Check internet or install Python 3.12 from python.org.
+call :fail 1
+exit /b 1
+
+:sys_ready
+if /I "%CMD_NAME%"=="status" (
+    "%SYS_PY%" %SYS_FLAG% "%REPO_DIR%\updater.py" status --repo-root "%REPO_DIR%"
+    exit /b %errorlevel%
+)
+
+set "VENV_PY=%SYS_PY%"
+set "VENV_FLAG=%SYS_FLAG%"
+if exist "%REPO_DIR%\.venv\Scripts\python.exe" (
+    set "VENV_PY=%REPO_DIR%\.venv\Scripts\python.exe"
+    set "VENV_FLAG="
+) else if exist "%GVK_HOME%\.venv\Scripts\python.exe" (
+    set "VENV_PY=%GVK_HOME%\.venv\Scripts\python.exe"
+    set "VENV_FLAG="
+)
+
+if /I "%CMD_NAME%"=="self-test" (
+    "%VENV_PY%" %VENV_FLAG% "%REPO_DIR%\core\main.py" self-test
+    exit /b %errorlevel%
+)
+if /I "%CMD_NAME%"=="--self-test" (
+    "%VENV_PY%" %VENV_FLAG% "%REPO_DIR%\core\main.py" self-test
+    exit /b %errorlevel%
+)
+
+if defined DISC_PATH (
+    "%SYS_PY%" %SYS_FLAG% "%REPO_DIR%\updater.py" sync --repo-root "%REPO_DIR%" --disc-path "%DISC_PATH%"
+) else (
+    "%SYS_PY%" %SYS_FLAG% "%REPO_DIR%\updater.py" sync --repo-root "%REPO_DIR%"
+)
+if errorlevel 1 (
+    call :fail %errorlevel%
+    exit /b %errorlevel%
+)
+
+set "VENV_PY=%SYS_PY%"
+set "VENV_FLAG=%SYS_FLAG%"
+if exist "%REPO_DIR%\.venv\Scripts\python.exe" (
+    set "VENV_PY=%REPO_DIR%\.venv\Scripts\python.exe"
+    set "VENV_FLAG="
+) else if exist "%GVK_HOME%\.venv\Scripts\python.exe" (
+    set "VENV_PY=%GVK_HOME%\.venv\Scripts\python.exe"
+    set "VENV_FLAG="
+)
+
+if exist "%REPO_DIR%\core\main.py" (
+    if defined DISC_PATH (
+        "%VENV_PY%" %VENV_FLAG% "%REPO_DIR%\core\main.py" --disc-path "%DISC_PATH%" %*
+    ) else (
+        "%VENV_PY%" %VENV_FLAG% "%REPO_DIR%\core\main.py" %*
+    )
+    if errorlevel 1 (
+        call :fail %errorlevel%
+        exit /b %errorlevel%
+    )
+    exit /b 0
+)
+
+echo  [!] core\main.py not found yet. Cache status:
+"%SYS_PY%" %SYS_FLAG% "%REPO_DIR%\updater.py" status --repo-root "%REPO_DIR%"
+exit /b %errorlevel%
+
+:fail
+echo.
+if not defined GVK_NO_PAUSE pause
+exit /b %~1
+"""
 
 def build_disc_tree(
     output_disc_dir: str,
     master_key: bytes,
     persona_id: str,
-    base_model_enc_path: str,
     persona_build_dir: str,
+    base_model_enc_path: Optional[str] = None,
 ) -> None:
     """
-    Формує повну структуру оптичного диска [Blu-ray Disc: GVK_VAULT],
-    готову до запису на BD-R 25GB.
+    Формує повну структуру оптичного DVD-диска [DVD Disc: GVK_VAULT],
+    готову до запису на DVD-R 4.7 ГБ (~150–160 МБ).
+    За замовчуванням базова модель на диск не копіюється (вона докачується з хмари),
+    але якщо передано `base_model_enc_path`, підтримується опційне додавання `base/`.
     """
     vault_dir = os.path.join(output_disc_dir, "vault")
-    base_dir = os.path.join(output_disc_dir, "base")
     persona_dir = os.path.join(output_disc_dir, "persona")
 
     os.makedirs(vault_dir, exist_ok=True)
-    os.makedirs(base_dir, exist_ok=True)
     os.makedirs(persona_dir, exist_ok=True)
 
     # 1. Запис 32-байтного ключа master.key
@@ -545,10 +1097,32 @@ def build_disc_tree(
             raise FileNotFoundError(f"Відсутній обов'язковий файл персонажа: {src}")
         shutil.copy2(src, os.path.join(persona_dir, fname))
 
-    # 4. Копіювання base_model.gguf.enc
-    if not os.path.isfile(base_model_enc_path):
-        raise FileNotFoundError(f"Зашифровану базову модель не знайдено: {base_model_enc_path}")
-    shutil.copy2(base_model_enc_path, os.path.join(base_dir, "base_model.gguf.enc"))
+    # 4. Опційне копіювання base_model.gguf.enc (лише якщо явно передано --base-enc)
+    if base_model_enc_path:
+        if not os.path.isfile(base_model_enc_path):
+            raise FileNotFoundError(f"Зашифровану базову модель не знайдено: {base_model_enc_path}")
+        base_dir = os.path.join(output_disc_dir, "base")
+        os.makedirs(base_dir, exist_ok=True)
+        shutil.copy2(base_model_enc_path, os.path.join(base_dir, "base_model.gguf.enc"))
+
+    # 4b. Вбудовування автономної копії ядра (core_bundle/, ~350 КБ) на DVD,
+    # щоб запуск із диска працював навіть без доступу до GitHub або до git push
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    bundle_dir = os.path.join(output_disc_dir, "core_bundle")
+    os.makedirs(os.path.join(bundle_dir, "core"), exist_ok=True)
+    os.makedirs(os.path.join(bundle_dir, "tools"), exist_ok=True)
+    for top_fname in ("updater.py", "requirements.txt"):
+        top_src = os.path.join(repo_root, top_fname)
+        if os.path.isfile(top_src):
+            shutil.copy2(top_src, os.path.join(bundle_dir, top_fname))
+    core_src_dir = os.path.join(repo_root, "core")
+    if os.path.isdir(core_src_dir):
+        for fname in sorted(os.listdir(core_src_dir)):
+            if fname.endswith(".py"):
+                shutil.copy2(os.path.join(core_src_dir, fname), os.path.join(bundle_dir, "core", fname))
+    packer_src = os.path.join(repo_root, "tools", "disc_packer.py")
+    if os.path.isfile(packer_src):
+        shutil.copy2(packer_src, os.path.join(bundle_dir, "tools", "disc_packer.py"))
 
     # 5. Створення стартових скриптів run.sh та run.bat
     run_sh_path = os.path.join(output_disc_dir, "run.sh")
@@ -556,11 +1130,404 @@ def build_disc_tree(
         f.write(RUN_SH_TEMPLATE)
     os.chmod(run_sh_path, os.stat(run_sh_path).st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 
+    run_cmd_path = os.path.join(output_disc_dir, "run.command")
+    with open(run_cmd_path, "w", encoding="utf-8", newline="\n") as f:
+        f.write(RUN_COMMAND_TEMPLATE)
+    os.chmod(run_cmd_path, os.stat(run_cmd_path).st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+
     run_bat_path = os.path.join(output_disc_dir, "run.bat")
     with open(run_bat_path, "w", encoding="utf-8", newline="\r\n") as f:
         f.write(RUN_BAT_TEMPLATE)
 
-    print(f"[✓] Образ Blu-ray диска GVK_VAULT для '{persona_id}' успішно зібрано у: {output_disc_dir}")
+    print(f"[✓] Образ DVD-диска GVK_VAULT для '{persona_id}' успішно зібрано у: {output_disc_dir}")
+
+
+# =====================================================================
+# 5b. ГЕНЕРАЦІЯ ISO-9660 / JOLIET ОБРАЗУ (.ISO)
+# =====================================================================
+ISO_SECTOR_SIZE = 2048
+
+
+def _both16(val: int) -> bytes:
+    return struct.pack("<H", val & 0xFFFF) + struct.pack(">H", val & 0xFFFF)
+
+
+def _both32(val: int) -> bytes:
+    return struct.pack("<I", val & 0xFFFFFFFF) + struct.pack(">I", val & 0xFFFFFFFF)
+
+
+def _sanitize_iso_name(name: str, is_dir: bool, used: set) -> bytes:
+    """Формує валідне ECMA-119 ім'я файлу/каталогу без колізій."""
+    if is_dir:
+        base = "".join(ch if (ch.isascii() and (ch.isalnum() or ch == "_")) else "_" for ch in name.upper())
+        stem = (base or "DIR")[:28]
+        cand = stem
+        n = 1
+        while cand in used:
+            suffix = f"_{n}"
+            cand = stem[: max(1, 28 - len(suffix))] + suffix
+            n += 1
+        used.add(cand)
+        return cand.encode("ascii")
+
+    if "." in name:
+        raw_base, raw_ext = name.rsplit(".", 1)
+    else:
+        raw_base, raw_ext = name, ""
+    base = "".join(ch if (ch.isascii() and (ch.isalnum() or ch == "_")) else "_" for ch in raw_base.upper()) or "FILE"
+    ext = "".join(ch if (ch.isascii() and (ch.isalnum() or ch == "_")) else "_" for ch in raw_ext.upper())
+    ext = ext[:8]
+    max_base = max(1, 28 - (len(ext) + 1 if ext else 0))
+    base = base[:max_base]
+    cand = f"{base}.{ext}" if ext else base
+    n = 1
+    while cand in used:
+        suffix = f"_{n}"
+        b = base[: max(1, max_base - len(suffix))] + suffix
+        cand = f"{b}.{ext}" if ext else b
+        n += 1
+    used.add(cand)
+    return f"{cand};1".encode("ascii")
+
+
+def _encode_joliet_name(name: str, is_dir: bool) -> bytes:
+    """Кодує ім'я в UCS-2 / UTF-16BE для Joliet SVD (макс. 64 символи)."""
+    trimmed = name[:64]
+    return trimmed.encode("utf-16-be")
+
+
+def _iso_dir_record(
+    file_id: bytes,
+    extent_lba: int,
+    data_len: int,
+    is_dir: bool,
+    rec_date_7: bytes,
+) -> bytes:
+    pad = b"\x00" if (len(file_id) % 2 == 0) else b""
+    rec_len = 33 + len(file_id) + len(pad)
+    flags = 0x02 if is_dir else 0x00
+    return (
+        bytes([rec_len, 0])
+        + _both32(extent_lba)
+        + _both32(data_len)
+        + rec_date_7
+        + bytes([flags, 0, 0])
+        + _both16(1)
+        + bytes([len(file_id)])
+        + file_id
+        + pad
+    )
+
+
+def _pack_dir_records_into_sectors(records: List[bytes]) -> bytes:
+    out = bytearray()
+    for rec in records:
+        pos = len(out) % ISO_SECTOR_SIZE
+        if pos != 0 and pos + len(rec) > ISO_SECTOR_SIZE:
+            out.extend(b"\x00" * (ISO_SECTOR_SIZE - pos))
+        out.extend(rec)
+    if len(out) == 0:
+        out.extend(b"\x00" * ISO_SECTOR_SIZE)
+    else:
+        rem = len(out) % ISO_SECTOR_SIZE
+        if rem:
+            out.extend(b"\x00" * (ISO_SECTOR_SIZE - rem))
+    return bytes(out)
+
+
+def _build_path_tables(
+    dirs_info: List[Dict[str, Any]],
+    lba_key: str,
+    name_key: str,
+) -> Tuple[bytes, bytes]:
+    tbl_l = bytearray()
+    tbl_m = bytearray()
+    for idx, d in enumerate(dirs_info):
+        name_bytes: bytes = d[name_key] if idx > 0 else b"\x00"
+        pad = b"\x00" if (len(name_bytes) % 2 == 1) else b""
+        parent_num = 1 if idx == 0 else (d["parent_idx"] + 1)
+        lba = int(d[lba_key])
+        tbl_l.extend(struct.pack("<BBIH", len(name_bytes), 0, lba, parent_num))
+        tbl_l.extend(name_bytes + pad)
+        tbl_m.extend(struct.pack(">BBIH", len(name_bytes), 0, lba, parent_num))
+        tbl_m.extend(name_bytes + pad)
+    return bytes(tbl_l), bytes(tbl_m)
+
+
+def _pad_to_sector(data: bytes) -> bytes:
+    rem = len(data) % ISO_SECTOR_SIZE
+    if rem == 0:
+        return data if data else (b"\x00" * ISO_SECTOR_SIZE)
+    return data + b"\x00" * (ISO_SECTOR_SIZE - rem)
+
+
+def _build_volume_descriptor(
+    vd_type: int,
+    volume_name: str,
+    total_sectors: int,
+    path_table_size: int,
+    path_l_lba: int,
+    path_m_lba: int,
+    root_record: bytes,
+    dec_time_17: bytes,
+    is_joliet: bool = False,
+) -> bytes:
+    vd = bytearray(ISO_SECTOR_SIZE)
+    vd[0] = vd_type
+    vd[1:6] = b"CD001"
+    vd[6] = 1
+    if is_joliet:
+        sys_id = "GVK PRIVATE AI".encode("utf-16-be")[:32].ljust(32, b"\x00")
+        vol_id = volume_name.encode("utf-16-be")[:32].ljust(32, b"\x00")
+        vd[88:91] = b"%/@"
+    else:
+        ascii_vol = "".join(ch if (ch.isascii() and (ch.isalnum() or ch == "_")) else "_" for ch in volume_name.upper())
+        sys_id = b"GVK PRIVATE AI".ljust(32, b" ")
+        vol_id = ascii_vol.encode("ascii")[:32].ljust(32, b" ")
+
+    vd[8:40] = sys_id
+    vd[40:72] = vol_id
+    vd[80:88] = _both32(total_sectors)
+    vd[120:124] = _both16(1)
+    vd[124:128] = _both16(1)
+    vd[128:132] = _both16(ISO_SECTOR_SIZE)
+    vd[132:140] = _both32(path_table_size)
+    struct.pack_into("<I", vd, 140, path_l_lba)
+    struct.pack_into(">I", vd, 148, path_m_lba)
+    vd[156 : 156 + len(root_record)] = root_record
+    vd[813:830] = dec_time_17
+    vd[830:847] = dec_time_17
+    vd[881] = 1
+    return bytes(vd)
+
+
+def _write_iso9660_image(disc_dir: str, output_iso_path: str, volume_name: str = "GVK_VAULT") -> str:
+    """Кросплатформний pure-Python збирач ISO-9660 + Joliet образу (.iso)."""
+    now = datetime.datetime.now(datetime.timezone.utc)
+    dec_time_17 = now.strftime("%Y%m%d%H%M%S00").encode("ascii") + b"\x00"
+    rec_date_7 = bytes(
+        [max(0, min(255, now.year - 1900)), now.month, now.day, now.hour, now.minute, now.second, 0]
+    )
+
+    dirs_info: List[Dict[str, Any]] = [
+        {
+            "abs_dir": os.path.abspath(disc_dir),
+            "parent_idx": 0,
+            "iso_name": b"\x00",
+            "jol_name": b"\x00",
+            "subdirs": [],
+            "files": [],
+        }
+    ]
+
+    idx = 0
+    while idx < len(dirs_info):
+        d = dirs_info[idx]
+        abs_dir = d["abs_dir"]
+        used_iso_names = set()
+        entries = sorted(os.listdir(abs_dir))
+        for name in entries:
+            full = os.path.join(abs_dir, name)
+            if os.path.isdir(full):
+                iso_n = _sanitize_iso_name(name, is_dir=True, used=used_iso_names)
+                jol_n = _encode_joliet_name(name, is_dir=True)
+                child_idx = len(dirs_info)
+                dirs_info.append(
+                    {
+                        "abs_dir": full,
+                        "parent_idx": idx,
+                        "iso_name": iso_n,
+                        "jol_name": jol_n,
+                        "subdirs": [],
+                        "files": [],
+                    }
+                )
+                d["subdirs"].append(child_idx)
+            elif os.path.isfile(full):
+                iso_n = _sanitize_iso_name(name, is_dir=False, used=used_iso_names)
+                jol_n = _encode_joliet_name(name, is_dir=False)
+                d["files"].append(
+                    {
+                        "abs_path": full,
+                        "size": os.path.getsize(full),
+                        "iso_name": iso_n,
+                        "jol_name": jol_n,
+                        "lba": 0,
+                    }
+                )
+        idx += 1
+
+    # Перший прохід: рахуємо точні розміри кожного каталогу у секторах (LBA у записах не впливає на розмір)
+    for d in dirs_info:
+        dummy_iso = [_iso_dir_record(b"\x00", 0, 0, True, rec_date_7), _iso_dir_record(b"\x01", 0, 0, True, rec_date_7)]
+        dummy_jol = [_iso_dir_record(b"\x00", 0, 0, True, rec_date_7), _iso_dir_record(b"\x01", 0, 0, True, rec_date_7)]
+        for c_idx in d["subdirs"]:
+            child = dirs_info[c_idx]
+            dummy_iso.append(_iso_dir_record(child["iso_name"], 0, 0, True, rec_date_7))
+            dummy_jol.append(_iso_dir_record(child["jol_name"], 0, 0, True, rec_date_7))
+        for f_info in d["files"]:
+            dummy_iso.append(_iso_dir_record(f_info["iso_name"], 0, f_info["size"], False, rec_date_7))
+            dummy_jol.append(_iso_dir_record(f_info["jol_name"], 0, f_info["size"], False, rec_date_7))
+        d["iso_size"] = len(_pack_dir_records_into_sectors(dummy_iso))
+        d["jol_size"] = len(_pack_dir_records_into_sectors(dummy_jol))
+        d["iso_lba"] = 0
+        d["jol_lba"] = 0
+
+    pt_l_dummy, _ = _build_path_tables(dirs_info, "iso_lba", "iso_name")
+    jpt_l_dummy, _ = _build_path_tables(dirs_info, "jol_lba", "jol_name")
+    iso_pt_sectors = len(_pad_to_sector(pt_l_dummy)) // ISO_SECTOR_SIZE
+    jol_pt_sectors = len(_pad_to_sector(jpt_l_dummy)) // ISO_SECTOR_SIZE
+
+    cursor = 19  # 0..15 System, 16 PVD, 17 SVD, 18 Terminator
+    iso_pt_l_lba = cursor
+    cursor += iso_pt_sectors
+    iso_pt_m_lba = cursor
+    cursor += iso_pt_sectors
+    jol_pt_l_lba = cursor
+    cursor += jol_pt_sectors
+    jol_pt_m_lba = cursor
+    cursor += jol_pt_sectors
+
+    for d in dirs_info:
+        d["iso_lba"] = cursor
+        cursor += d["iso_size"] // ISO_SECTOR_SIZE
+    for d in dirs_info:
+        d["jol_lba"] = cursor
+        cursor += d["jol_size"] // ISO_SECTOR_SIZE
+
+    ordered_files: List[Dict[str, Any]] = []
+    for d in dirs_info:
+        for f_info in d["files"]:
+            f_info["lba"] = cursor
+            sectors = max(1, (f_info["size"] + ISO_SECTOR_SIZE - 1) // ISO_SECTOR_SIZE) if f_info["size"] > 0 else 0
+            cursor += sectors
+            ordered_files.append(f_info)
+
+    total_sectors = cursor
+
+    # Другий прохід: формуємо фінальні таблиці шляхів та сектори каталогів із реальними LBA
+    iso_pt_l_raw, iso_pt_m_raw = _build_path_tables(dirs_info, "iso_lba", "iso_name")
+    jol_pt_l_raw, jol_pt_m_raw = _build_path_tables(dirs_info, "jol_lba", "jol_name")
+
+    iso_dir_blocks: List[bytes] = []
+    jol_dir_blocks: List[bytes] = []
+    for d in dirs_info:
+        parent = dirs_info[d["parent_idx"]]
+        iso_recs = [
+            _iso_dir_record(b"\x00", d["iso_lba"], d["iso_size"], True, rec_date_7),
+            _iso_dir_record(b"\x01", parent["iso_lba"], parent["iso_size"], True, rec_date_7),
+        ]
+        jol_recs = [
+            _iso_dir_record(b"\x00", d["jol_lba"], d["jol_size"], True, rec_date_7),
+            _iso_dir_record(b"\x01", parent["jol_lba"], parent["jol_size"], True, rec_date_7),
+        ]
+        for c_idx in d["subdirs"]:
+            child = dirs_info[c_idx]
+            iso_recs.append(_iso_dir_record(child["iso_name"], child["iso_lba"], child["iso_size"], True, rec_date_7))
+            jol_recs.append(_iso_dir_record(child["jol_name"], child["jol_lba"], child["jol_size"], True, rec_date_7))
+        for f_info in d["files"]:
+            iso_recs.append(_iso_dir_record(f_info["iso_name"], f_info["lba"], f_info["size"], False, rec_date_7))
+            jol_recs.append(_iso_dir_record(f_info["jol_name"], f_info["lba"], f_info["size"], False, rec_date_7))
+        iso_dir_blocks.append(_pack_dir_records_into_sectors(iso_recs))
+        jol_dir_blocks.append(_pack_dir_records_into_sectors(jol_recs))
+
+    root_iso_rec = _iso_dir_record(b"\x00", dirs_info[0]["iso_lba"], dirs_info[0]["iso_size"], True, rec_date_7)
+    root_jol_rec = _iso_dir_record(b"\x00", dirs_info[0]["jol_lba"], dirs_info[0]["jol_size"], True, rec_date_7)
+
+    pvd = _build_volume_descriptor(
+        1, volume_name, total_sectors, len(iso_pt_l_raw), iso_pt_l_lba, iso_pt_m_lba, root_iso_rec, dec_time_17, False
+    )
+    svd = _build_volume_descriptor(
+        2, volume_name, total_sectors, len(jol_pt_l_raw), jol_pt_l_lba, jol_pt_m_lba, root_jol_rec, dec_time_17, True
+    )
+    term = bytearray(ISO_SECTOR_SIZE)
+    term[0] = 255
+    term[1:6] = b"CD001"
+    term[6] = 1
+
+    out_abs = os.path.abspath(output_iso_path)
+    os.makedirs(os.path.dirname(out_abs), exist_ok=True)
+    with open(out_abs, "wb") as iso_f:
+        iso_f.write(b"\x00" * (16 * ISO_SECTOR_SIZE))
+        iso_f.write(pvd)
+        iso_f.write(svd)
+        iso_f.write(term)
+        iso_f.write(_pad_to_sector(iso_pt_l_raw))
+        iso_f.write(_pad_to_sector(iso_pt_m_raw))
+        iso_f.write(_pad_to_sector(jol_pt_l_raw))
+        iso_f.write(_pad_to_sector(jol_pt_m_raw))
+        for blk in iso_dir_blocks:
+            iso_f.write(blk)
+        for blk in jol_dir_blocks:
+            iso_f.write(blk)
+        for f_info in ordered_files:
+            written = 0
+            with open(f_info["abs_path"], "rb") as src_f:
+                while True:
+                    chunk = src_f.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    iso_f.write(chunk)
+                    written += len(chunk)
+            if written > 0:
+                rem = written % ISO_SECTOR_SIZE
+                if rem:
+                    iso_f.write(b"\x00" * (ISO_SECTOR_SIZE - rem))
+
+    return out_abs
+
+
+def build_disc_iso(disc_dir: str, output_iso_path: str, volume_name: str = "GVK_VAULT") -> str:
+    """Створює готовий ISO-образ DVD-диска з каталогу `disc_dir`."""
+    disc_abs = os.path.abspath(disc_dir)
+    if not os.path.isdir(disc_abs):
+        raise FileNotFoundError(f"Папку диска не знайдено: {disc_dir}")
+
+    out_abs = os.path.abspath(output_iso_path)
+    os.makedirs(os.path.dirname(out_abs), exist_ok=True)
+
+    if sys.platform == "darwin" and shutil.which("hdiutil"):
+        try:
+            subprocess.run(
+                [
+                    "hdiutil",
+                    "makehybrid",
+                    "-iso",
+                    "-joliet",
+                    "-default-volume-name",
+                    volume_name,
+                    "-o",
+                    out_abs,
+                    disc_abs,
+                ],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+            )
+            if os.path.isfile(out_abs):
+                print(f"[✓] ISO-образ (hdiutil) створено: {out_abs}")
+                return out_abs
+        except Exception:
+            pass
+
+    for tool in ("xorrisofs", "genisoimage", "mkisofs"):
+        if shutil.which(tool):
+            try:
+                subprocess.run(
+                    [tool, "-J", "-R", "-V", volume_name, "-o", out_abs, disc_abs],
+                    check=True,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
+                )
+                if os.path.isfile(out_abs):
+                    print(f"[✓] ISO-образ ({tool}) створено: {out_abs}")
+                    return out_abs
+            except Exception:
+                pass
+
+    _write_iso9660_image(disc_abs, out_abs, volume_name=volume_name)
+    print(f"[✓] ISO-образ (ISO-9660/Joliet) створено: {out_abs}")
+    return out_abs
 
 
 # =====================================================================
@@ -572,14 +1539,14 @@ def run_self_test() -> None:
     print("====================================================================")
 
     test_phrase = "GVK_Secret_Lore_Passphrase_2026_Test!"
-    print(f" [1/4] Деривація майстер-ключа Argon2id (256 МБ RAM, time_cost=4)...")
+    print(f" [1/5] Деривація майстер-ключа Argon2id (256 МБ RAM, time_cost=4)...")
     t0 = time.time()
     master_key = derive_master_key(test_phrase)
     dt = time.time() - t0
     assert len(master_key) == 32
     print(f"       [OK] Отримано 32-байтний master.key за {dt:.2f} с: {master_key.hex()[:24]}...")
 
-    print(" [2/4] Перевірка генерації та верифікації HMAC підпису origin.sig...")
+    print(" [2/5] Перевірка генерації та верифікації HMAC підпису origin.sig...")
     sig_f1 = generate_origin_sig("friend_1", master_key)
     sig_f2 = generate_origin_sig("friend_2", master_key)
     assert len(sig_f1) == 32
@@ -588,7 +1555,7 @@ def run_self_test() -> None:
     assert verify_origin_sig("friend_2", master_key, sig_f1) is False
     print(f"       [OK] origin.sig (friend_1): {sig_f1.hex()[:24]}...")
 
-    print(" [3/4] Перевірка потокового шифрування та дешифрування AES-256-GCM...")
+    print(" [3/5] Перевірка потокового шифрування та дешифрування AES-256-GCM...")
     sample_data = os.urandom(3 * 1024 * 1024)  # 3 МБ випадкових даних
     src_buf = io.BytesIO(sample_data)
     enc_buf = io.BytesIO()
@@ -611,14 +1578,18 @@ def run_self_test() -> None:
     except ValueError:
         print("       [OK] Захист цілісності GCM спрацював: зміну 1 біта миттєво виявлено.")
 
-    print(" [4/4] Перевірка пакування та розпакування payload.tar.enc у пам'яті...")
+    print(" [4/5] Перевірка пакування та розпакування payload.tar.enc у пам'яті...")
     with tempfile.TemporaryDirectory() as tmpdir:
         src_payload = os.path.join(tmpdir, "src_payload")
-        os.makedirs(os.path.join(src_payload, "portraits"), exist_ok=True)
+        os.makedirs(os.path.join(src_payload, "portraits", "raw"), exist_ok=True)
         with open(os.path.join(src_payload, "prompt.txt"), "w", encoding="utf-8") as f:
             f.write("Ти — friend_1. Починай репліку з [MOOD: СПОКІЙ].")
         with open(os.path.join(src_payload, "portraits", "мовчить.txt"), "w", encoding="utf-8") as f:
             f.write("(o_o)")
+        with open(os.path.join(src_payload, "portraits", ".DS_Store"), "wb") as f:
+            f.write(b"JUNK")
+        with open(os.path.join(src_payload, "portraits", "raw", "photo.psd"), "wb") as f:
+            f.write(b"8BPS" + b"\x00" * 64)
 
         enc_payload_path = os.path.join(tmpdir, "payload.tar.enc")
         sha = pack_payload_encrypted(src_payload, enc_payload_path, master_key)
@@ -627,7 +1598,51 @@ def run_self_test() -> None:
         unpack_payload_decrypted(enc_payload_path, ram_extract_dir, master_key)
         assert os.path.isfile(os.path.join(ram_extract_dir, "prompt.txt"))
         assert os.path.isfile(os.path.join(ram_extract_dir, "portraits", "мовчить.txt"))
+        assert not os.path.exists(os.path.join(ram_extract_dir, "portraits", ".DS_Store")), ".DS_Store не має пакуватися!"
+        assert not os.path.exists(os.path.join(ram_extract_dir, "portraits", "raw")), "portraits/raw/ не має пакуватися!"
         print(f"       [OK] payload.tar.enc (SHA-256: {sha[:16]}...) розпаковано в ОЗП!")
+
+        print(" [5/5] Перевірка збірки образу DVD-диска GVK_VAULT (без base_model.gguf.enc)...")
+        persona_build = os.path.join(tmpdir, "persona_build")
+        os.makedirs(persona_build, exist_ok=True)
+        raw_adapter = os.path.join(tmpdir, "adapter.gguf")
+        with open(raw_adapter, "wb") as f:
+            f.write(b"GGUF" + os.urandom(64 * 1024))
+        adapter_enc = os.path.join(persona_build, "adapter.gguf.enc")
+        adapter_sha = encrypt_file(raw_adapter, adapter_enc, master_key)
+        shutil.copy2(enc_payload_path, os.path.join(persona_build, "payload.tar.enc"))
+        write_public_manifest(
+            persona_build,
+            persona_id="friend_1",
+            adapter_sha256=adapter_sha,
+            payload_sha256=sha,
+        )
+
+        disc_out = os.path.join(tmpdir, "GVK_VAULT_DVD")
+        build_disc_tree(
+            output_disc_dir=disc_out,
+            master_key=master_key,
+            persona_id="friend_1",
+            persona_build_dir=persona_build,
+        )
+        for rel in (
+            "vault/master.key",
+            "persona/origin.sig",
+            "persona/manifest.json",
+            "persona/adapter.gguf.enc",
+            "persona/payload.tar.enc",
+            "run.sh",
+            "run.bat",
+        ):
+            assert os.path.isfile(os.path.join(disc_out, rel)), f"Відсутній файл DVD: {rel}"
+        assert not os.path.exists(os.path.join(disc_out, "base")), "Папка base/ не має створюватися на DVD за замовчуванням"
+        iso_out = os.path.join(tmpdir, "GVK_VAULT_DISC_1.iso")
+        built_iso = build_disc_iso(disc_out, iso_out, volume_name="GVK_VAULT")
+        assert os.path.isfile(built_iso) and os.path.getsize(built_iso) >= 20 * ISO_SECTOR_SIZE
+        with open(built_iso, "rb") as iso_f:
+            iso_f.seek(0x8001)
+            assert iso_f.read(5) == b"CD001", "Не знайдено сигнатуру CD001 у Primary Volume Descriptor!"
+        print("       [OK] Образ DVD GVK_VAULT + ISO-9660 (.iso) зібрано коректно!")
 
     print("====================================================================")
     print(" [✓] УСІ ТЕСТИ ПРОЙДЕНО УСПІШНО!")
@@ -696,12 +1711,24 @@ def main() -> None:
     p_pack.add_argument("--version", default="1.0.0", help="Версія пакета (за замовч. 1.0.0)")
 
     # 7. build-disc
-    p_disc = sub.add_parser("build-disc", help="Зібрати повну структуру Blu-ray диска GVK_VAULT")
+    p_disc = sub.add_parser("build-disc", help="Зібрати повну структуру DVD-диска GVK_VAULT (DVD-R 4.7 ГБ)")
     p_disc.add_argument("-k", "--key-file", required=True, help="Шлях до файлу master.key")
     p_disc.add_argument("--id", required=True, help="ID персонажа на цьому диску (напр. friend_1)")
-    p_disc.add_argument("--base-enc", required=True, help="Шлях до зашифрованої бази base_model.gguf.enc")
+    p_disc.add_argument(
+        "--base-enc",
+        required=False,
+        default=None,
+        help="Опційно: шлях до base_model.gguf.enc (для DVD не потрібно — базова модель качається з хмари)",
+    )
     p_disc.add_argument("--persona-dir", required=True, help="Папка зібраного персонажа (з pack-persona)")
     p_disc.add_argument("-o", "--output-dir", required=True, help="Вихідна папка образу диска GVK_VAULT")
+    p_disc.add_argument("--iso", default=None, help="Опційно: шлях вихідного .iso файлу (напр. dist/GVK_DISC_1.iso)")
+
+    # 8. build-iso
+    p_iso = sub.add_parser("build-iso", help="Зібрати ISO-9660/Joliet файл (.iso) із готової папки диска")
+    p_iso.add_argument("-i", "--input-dir", required=True, help="Папка зібраного диска GVK_VAULT")
+    p_iso.add_argument("-o", "--output", required=True, help="Вихідний шлях до файлу .iso")
+    p_iso.add_argument("--volume-name", default="GVK_VAULT", help="Мітка тому DVD (за замовч. GVK_VAULT)")
 
     args = parser.parse_args()
 
@@ -759,7 +1786,7 @@ def main() -> None:
         print(f"     - adapter.gguf.enc (SHA-256: {adapter_sha[:16]}...)")
         print(f"     - payload.tar.enc  (SHA-256: {payload_sha[:16]}...)")
         print(f"     - manifest.json    ({manifest_path})")
-        print(f"     - origin.sig       (УВАГА: тільки для Blu-ray диска, не комітити в GitHub!)")
+        print(f"     - origin.sig       (УВАГА: тільки для DVD-диска, не комітити в GitHub!)")
 
     elif args.cmd == "build-disc":
         key = _load_or_prompt_key(args.key_file)
@@ -767,9 +1794,14 @@ def main() -> None:
             output_disc_dir=args.output_dir,
             master_key=key,
             persona_id=args.id,
-            base_model_enc_path=args.base_enc,
             persona_build_dir=args.persona_dir,
+            base_model_enc_path=args.base_enc,
         )
+        if args.iso:
+            build_disc_iso(args.output_dir, args.iso, volume_name="GVK_VAULT")
+
+    elif args.cmd == "build-iso":
+        build_disc_iso(args.input_dir, args.output, volume_name=args.volume_name)
 
 
 if __name__ == "__main__":

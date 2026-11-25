@@ -34,6 +34,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+from typing import Dict, List, Optional
 
 # Палітри символів від найтемнішого до найсвітлішого (для темного фону терміналу)
 PALETTES = {
@@ -286,11 +287,131 @@ def _grid_to_braille(grid, invert: bool = False) -> str:
     return "\n".join(lines)
 
 
+REQUIRED_SPRITE_EMOTIONS = ("idle", "sleeping", "smiling", "talking", "talking2")
+_SPRITE_ALIASES: Dict[str, tuple] = {
+    "idle": ("idle", "мовчить", "спок", "neutral"),
+    "sleeping": ("sleep", "спит", "спить", "afk"),
+    "smiling": ("smil", "сміх", "смех", "посміш", "улыб", "laugh"),
+    "talking2": ("talking2", "talk2", "говор2", "say2"),
+    "talking": ("talk", "говор", "speak", "подив"),
+}
+_IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".heic", ".bmp")
+
+
+def _resolve_pack_sources(input_path: str) -> Dict[str, str]:
+    """Зіставляє кожній із 5 емоцій вхідне фото з папки або єдине зображення."""
+    if os.path.isfile(input_path):
+        return {emo: input_path for emo in REQUIRED_SPRITE_EMOTIONS}
+
+    if not os.path.isdir(input_path):
+        raise FileNotFoundError(f"Шлях --init-pack не знайдено: {input_path}")
+
+    candidates = sorted(
+        os.path.join(input_path, fname)
+        for fname in os.listdir(input_path)
+        if os.path.isfile(os.path.join(input_path, fname)) and fname.lower().endswith(_IMAGE_EXTS)
+    )
+    if not candidates:
+        raise FileNotFoundError(f"У папці --init-pack не знайдено жодного зображення: {input_path}")
+
+    resolved: Dict[str, str] = {}
+    for emo in REQUIRED_SPRITE_EMOTIONS:
+        aliases = _SPRITE_ALIASES[emo]
+        matched = next(
+            (p for p in candidates if any(al in os.path.splitext(os.path.basename(p))[0].lower() for al in aliases)),
+            None,
+        )
+        if matched is None and emo == "talking2" and "talking" in resolved:
+            matched = resolved["talking"]
+        resolved[emo] = matched or candidates[0]
+    return resolved
+
+
+def generate_init_pack(
+    input_path: str,
+    out_dir: str,
+    width: int = 38,
+    style: str = "braille",
+    contrast: float = 1.35,
+    invert: bool = False,
+) -> List[str]:
+    """Генерує 5 спрайтів емоцій (idle, sleeping, smiling, talking, talking2) у цільову папку."""
+    sources = _resolve_pack_sources(input_path)
+    os.makedirs(out_dir, exist_ok=True)
+    generated_files: List[str] = []
+    for emo in REQUIRED_SPRITE_EMOTIONS:
+        src_img = sources[emo]
+        art = render_ascii(
+            src_img,
+            width=width,
+            style=style,
+            invert=invert,
+            contrast=contrast,
+        )
+        dst_path = os.path.join(out_dir, f"{emo}.txt")
+        with open(dst_path, "w", encoding="utf-8") as f:
+            f.write(art + "\n")
+        generated_files.append(dst_path)
+    return generated_files
+
+
+def _write_synthetic_bmp(path: str, width: int = 40, height: int = 48) -> None:
+    """Створює синтетичний 24-bit BMP портрет для автономного self-test без зовнішніх картинок."""
+    row_stride = (width * 3 + 3) & ~3
+    pixel_size = row_stride * height
+    file_size = 54 + pixel_size
+    header = struct.pack("<2sIHHI", b"BM", file_size, 0, 0, 54)
+    dib = struct.pack("<IIIHHIIIIII", 40, width, height, 1, 24, 0, pixel_size, 2835, 2835, 0, 0)
+    rows = bytearray()
+    for y in range(height):
+        row = bytearray(row_stride)
+        for x in range(width):
+            dx = (x - width / 2.0) / (width * 0.35)
+            dy = (y - height / 2.0) / (height * 0.38)
+            val = 230 if (dx * dx + dy * dy) < 1.0 else 30
+            if 0.36 * height <= y <= 0.44 * height and (abs(x - 0.36 * width) < 2 or abs(x - 0.64 * width) < 2):
+                val = 20
+            row[x * 3 : x * 3 + 3] = bytes((val, val, val))
+        rows.extend(row)
+    with open(path, "wb") as f:
+        f.write(header + dib + rows)
+
+
+def run_self_test() -> None:
+    print("====================================================================")
+    print(" [*] GVK Private AI — Self-Test (tools/ascii_portrait.py)")
+    print("====================================================================")
+
+    with tempfile.TemporaryDirectory(prefix="gvk_portrait_test_") as tmp_dir:
+        sample_bmp = os.path.join(tmp_dir, "idle_face.bmp")
+        _write_synthetic_bmp(sample_bmp)
+
+        single = render_ascii(sample_bmp, width=32, style="braille")
+        lines = single.splitlines()
+        assert lines and len(lines[0]) == 32, f"Очікувалась ширина 32 символи, отримано: {len(lines[0]) if lines else 0}"
+
+        out_pack_dir = os.path.join(tmp_dir, "portraits")
+        written = generate_init_pack(tmp_dir, out_pack_dir, width=32, style="braille")
+        assert len(written) == 5, f"Очікувалось 5 файлів спрайтів, отримано {len(written)}"
+        for emo in REQUIRED_SPRITE_EMOTIONS:
+            fp = os.path.join(out_pack_dir, f"{emo}.txt")
+            assert os.path.isfile(fp) and os.path.getsize(fp) > 10, f"Некоректний спрайт: {fp}"
+        print(" [✓] Одиночний рендер + --init-pack (5 емоцій: idle, sleeping, smiling, talking, talking2) OK!")
+
+    print("====================================================================")
+    print(" [✓] SELF-TEST ASCII_PORTRAIT ПРОЙДЕНО УСПІШНО!")
+    print("====================================================================")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="GVK Private AI — Перетворення фотографії на ASCII-портрет для TUI"
     )
-    parser.add_argument("image", nargs="?", help="Шлях до фотографії (.jpg, .png, .heic)")
+    parser.add_argument(
+        "image",
+        nargs="?",
+        help="Шлях до фотографії (.jpg, .png, .heic) або команда 'self-test'",
+    )
     parser.add_argument(
         "-w", "--width", type=int, default=38, help="Ширина портрета в символах (за замовчуванням: 38)"
     )
@@ -301,7 +422,17 @@ def main():
         default="clean",
         help="Стиль символів: clean (контрастний ASCII), cyber (детальний), blocks (блоки ░▒▓█), braille (точки Брайля)",
     )
-    parser.add_argument("-o", "--output", help="Зберегти результат у .txt файл (напр. portraits/мовчить.txt)")
+    parser.add_argument("-o", "--output", help="Зберегти результат у .txt файл (напр. portraits/idle.txt)")
+    parser.add_argument(
+        "--init-pack",
+        default=None,
+        help="Папка з фото емоцій або єдине фото для пакетної генерації 5 спрайтів",
+    )
+    parser.add_argument(
+        "--out-dir",
+        default="./portraits/friend_1",
+        help="Цільова папка збереження спрайтів при --init-pack (за замовч. ./portraits/friend_1)",
+    )
     parser.add_argument(
         "-c",
         "--color",
@@ -313,6 +444,25 @@ def main():
     parser.add_argument("--invert", action="store_true", help="Інвертувати світло/тінь (для світлого фону)")
 
     args = parser.parse_args()
+
+    if args.image == "self-test":
+        run_self_test()
+        return
+
+    if args.init_pack:
+        pack_style = "braille" if args.style == "clean" and "--style" not in sys.argv and "-s" not in sys.argv else args.style
+        generated = generate_init_pack(
+            input_path=args.init_pack,
+            out_dir=args.out_dir,
+            width=args.width,
+            style=pack_style,
+            contrast=args.contrast,
+            invert=args.invert,
+        )
+        print(f"[✓] Згенеровано {len(generated)} спрайтів у {os.path.abspath(args.out_dir)}:")
+        for p in generated:
+            print(f"    - {os.path.basename(p)}")
+        return
 
     if not args.image:
         parser.print_help()
