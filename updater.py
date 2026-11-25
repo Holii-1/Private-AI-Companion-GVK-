@@ -1,27 +1,27 @@
 #!/usr/bin/env python3
 """
-GVK Private AI — Клієнт перевірки носія, реєстрації origin.sig та оновлень (updater.py)
+GVK Private AI - Media Verification, Signature Registry & Update Client (updater.py)
 
-Працює виключно на стандартній бібліотеці Python, щоб запускатися з DVD-диска `GVK_VAULT`
-навіть на «чистому» комп'ютері до створення `.venv` і встановлення `requirements.txt`.
+Manages local environment setup, cryptographic verification of GVK_VAULT media
+(DVD or offline USB), incremental persona updates, and runtime asset caching.
+Uses only the Python standard library so it can run directly from GVK_VAULT media
+on a clean machine before `.venv` is created or `requirements.txt` is installed.
 
-Основні задачі модуля:
-  1. Ініціалізація локального кешу `~/.gvk_ai/{base,bin,personas,registry,logs}`.
-  2. Перевірка та автоматичне розгортання `.venv` + встановлення/оновлення пакетів
-     із `requirements.txt` (через звірку SHA-256 маркера).
-  3. Імпорт та криптографічна верифікація DVD-диска `GVK_VAULT`:
-     - перевірка 32-байтного `vault/master.key`;
-     - верифікація апаратного HMAC-підпису `persona/origin.sig`;
-     - перевірка SHA-256 гешів у `manifest.json` та заголовків `GVK1` контейнерів `.enc`;
-     - копіювання `adapter.gguf.enc`, `payload.tar.enc` і `origin.sig` у `~/.gvk_ai/`.
-  4. Накопичувальна активація (Incremental Unlock) із `personas_encrypted/`:
-     - оновлює контейнери лише тих учасників, чий `origin.sig` вже зареєстрований локально.
-  5. Одноразове завантаження (або лінкування локальної копії) публічної базової моделі
-     `Qwen2.5-14B-Instruct-Q4_K_M.gguf` (~9.0 ГБ) з Hugging Face у `~/.gvk_ai/base/`
-     із підтримкою HTTP Range (докачування після обриву зв'язку).
-  6. Пошук або автоматичне завантаження бінарника `llama-server` із GitHub Releases `llama.cpp`.
+Key Responsibilities:
+  - Initialize the local cache structure under `~/.gvk_ai/{base,bin,embeddings,personas,registry,logs}`.
+  - Provision `.venv` (Python >= 3.10 with Tk >= 8.6) and keep `requirements.txt`
+    dependencies synchronized via a SHA-256 marker file.
+  - Verify and import `GVK_VAULT` media: validate the 32-byte `vault/master.key`,
+    HMAC-SHA256 `persona/origin.sig`, manifest SHA-256 hashes, and `GVK1` container
+    headers before copying encrypted containers to `~/.gvk_ai/`.
+  - Perform Incremental Unlock from `personas_encrypted/`, updating only personas
+    whose `origin.sig` is already registered locally.
+  - Resolve, copy (from USB), symlink (from local repo), or resumable-download the
+    public base model `Qwen2.5-14B-Instruct-Q4_K_M.gguf` (~9.0 GB) into `~/.gvk_ai/base/`.
+  - Locate, unpack (from USB), or download the `llama-server` binary from GitHub
+    Releases (`ggml-org/llama.cpp`) and pre-cache the RAG embedding model.
 
-Приклади використання:
+Usage:
   python3 updater.py --disc-path /Volumes/GVK_VAULT
   python3 updater.py sync --no-download
   python3 updater.py status
@@ -51,7 +51,7 @@ from typing import Dict, List, Optional, Tuple
 
 
 # =====================================================================
-# КОНСТАНТИ ПРОТОКОЛУ ТА ДЖЕРЕЛ
+# PROTOCOL CONSTANTS & SOURCES
 # =====================================================================
 DEFAULT_REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_GVK_HOME = os.environ.get("GVK_HOME") or os.path.expanduser("~/.gvk_ai")
@@ -78,10 +78,17 @@ GGUF_MAGIC = b"GGUF"
 
 
 # =====================================================================
-# ДОПОМІЖНІ УТИЛІТИ (STDLIB ONLY)
+# HELPER UTILITIES (STDLIB ONLY)
 # =====================================================================
 def compute_sha256(file_path: str) -> str:
-    """Обчислює SHA-256 геш файлу потоково (блоками по 4 МБ)."""
+    """Compute the SHA-256 hex digest of a file using 4 MB streaming chunks.
+
+    Args:
+        file_path: Path to the file to hash.
+
+    Returns:
+        Lowercase hexadecimal SHA-256 digest string.
+    """
     h = hashlib.sha256()
     with open(file_path, "rb") as f:
         while True:
@@ -93,7 +100,16 @@ def compute_sha256(file_path: str) -> str:
 
 
 def verify_origin_sig_bytes(persona_id: str, master_key: bytes, sig_bytes: bytes) -> bool:
-    """Перевіряє 32-байтний HMAC-SHA256 підпис `origin.sig`."""
+    """Verify a 32-byte HMAC-SHA256 `origin.sig` signature.
+
+    Args:
+        persona_id: Canonical persona identifier signed by the media key.
+        master_key: 32-byte master key read from `vault/master.key`.
+        sig_bytes: 32-byte signature read from `origin.sig`.
+
+    Returns:
+        True if the signature matches `HMAC-SHA256(master_key, persona_id)`, False otherwise.
+    """
     if len(master_key) != KEY_SIZE or len(sig_bytes) != SIG_SIZE:
         return False
     expected = hmac.new(master_key, persona_id.strip().encode("utf-8"), hashlib.sha256).digest()
@@ -101,22 +117,33 @@ def verify_origin_sig_bytes(persona_id: str, master_key: bytes, sig_bytes: bytes
 
 
 def verify_gvk1_header(enc_file_path: str, master_key: Optional[bytes] = None) -> None:
-    """
-    Перевіряє 36-байтний бінарний заголовок `.enc` контейнера:
-      [Magic "GVK1" (4B) | Base Nonce (12B) | Header Auth Tag (16B) | Chunk Size (4B)]
-    Якщо передано `master_key`, додатково перевіряє криптографічний тег заголовка.
+    """Validate the 36-byte binary header of a `.enc` container.
+
+    Header layout:
+      `[Magic "GVK1" (4B) | Base Nonce (12B) | Header Auth Tag (16B) | Chunk Size (4B)]`
+
+    Args:
+        enc_file_path: Path to the encrypted `.enc` container file.
+        master_key: Optional 32-byte master key; when provided, also verifies the
+            cryptographic HMAC header authentication tag.
+
+    Raises:
+        ValueError: If the header is truncated, has invalid magic or chunk size,
+            or fails `master_key` authentication.
     """
     with open(enc_file_path, "rb") as f:
         header = f.read(HEADER_SIZE)
 
     if len(header) != HEADER_SIZE:
-        raise ValueError(f"Пошкоджений контейнер {os.path.basename(enc_file_path)}: заголовок < 36 Б.")
+        raise ValueError(
+            f"Corrupted container {os.path.basename(enc_file_path)}: header is smaller than 36 bytes."
+        )
 
     magic = header[:4]
     if magic != MAGIC_BYTES:
         raise ValueError(
-            f"Невірна сигнатура {os.path.basename(enc_file_path)}: "
-            f"очікується {MAGIC_BYTES!r}, отримано {magic!r}."
+            f"Invalid magic signature in {os.path.basename(enc_file_path)}: "
+            f"expected {MAGIC_BYTES!r}, got {magic!r}."
         )
 
     base_nonce = header[4:16]
@@ -124,19 +151,19 @@ def verify_gvk1_header(enc_file_path: str, master_key: Optional[bytes] = None) -
     chunk_size_bytes = header[32:36]
     chunk_size = struct.unpack("<I", chunk_size_bytes)[0]
     if chunk_size == 0:
-        raise ValueError(f"Некоректний розмір чанка (0) у {os.path.basename(enc_file_path)}.")
+        raise ValueError(f"Invalid chunk size (0) in {os.path.basename(enc_file_path)}.")
 
     if master_key is not None:
         msg = MAGIC_BYTES + base_nonce + chunk_size_bytes
         expected_tag = hmac.new(master_key, msg, hashlib.sha256).digest()[:GCM_TAG_SIZE]
         if not hmac.compare_digest(header_tag, expected_tag):
             raise ValueError(
-                f"Контейнер {os.path.basename(enc_file_path)} не пройшов автентифікацію master.key!"
+                f"Container {os.path.basename(enc_file_path)} failed master.key authentication!"
             )
 
 
 def _normalize_disc_path(raw_path: str) -> str:
-    """Нормалізує шлях до диска (зокрема Windows 'D:' -> 'D:\\' перед abspath)."""
+    """Normalize a media path (including Windows drive letters like `'D:'` -> `'D:\\'`)."""
     p = os.path.expanduser(raw_path.strip())
     if len(p) == 2 and p[1] == ":" and p[0].isalpha():
         p = p + "\\"
@@ -144,9 +171,14 @@ def _normalize_disc_path(raw_path: str) -> str:
 
 
 def _copy_writable(src: str, dst: str) -> None:
-    """
-    Копіює файл без перенесення атрибуту Read-Only із DVD-носія та знімає
-    Read-Only з цільового файлу перед перезаписом (критично для Windows).
+    """Copy a file without preserving DVD read-only attributes.
+
+    Clears read-only permissions on an existing destination before overwriting
+    (critical on Windows when copying from optical media).
+
+    Args:
+        src: Source file path.
+        dst: Destination file path.
     """
     os.makedirs(os.path.dirname(os.path.abspath(dst)), exist_ok=True)
     if os.path.exists(dst):
@@ -162,7 +194,7 @@ def _copy_writable(src: str, dst: str) -> None:
 
 
 def _build_ssl_context() -> ssl.SSLContext:
-    """Формує SSL-контекст із фолбеком на системний cert.pem / certifi (для macOS python.org)."""
+    """Build an SSL context with fallback to system `cert.pem` or `certifi` (for macOS python.org)."""
     ctx = ssl.create_default_context()
     try:
         stats = ctx.cert_store_stats()
@@ -188,7 +220,14 @@ def _build_ssl_context() -> ssl.SSLContext:
 
 
 def find_gvk_disc_path(explicit_path: Optional[str] = None) -> Optional[str]:
-    """Шукає вставлений DVD `GVK_VAULT` із `vault/master.key`."""
+    """Locate a mounted `GVK_VAULT` medium containing a valid 32-byte `vault/master.key`.
+
+    Args:
+        explicit_path: Optional user-supplied path to check first.
+
+    Returns:
+        Absolute path to the detected `GVK_VAULT` root directory, or None if not found.
+    """
     candidates: List[str] = []
     if explicit_path:
         candidates.append(_normalize_disc_path(explicit_path))
@@ -226,11 +265,20 @@ def find_gvk_disc_path(explicit_path: Optional[str] = None) -> Optional[str]:
 
 
 def detect_media_mode(disc_path: Optional[str]) -> Dict[str, object]:
-    """
-    Визначає режим носія GVK_VAULT:
-      - 'USB' (якщо є vault/media_mode.json з mode=USB, або на носії присутні base/*.gguf, bin/, embeddings/, python_portable/)
-      - 'DVD' (класичний легкий DVD-R ~150 МБ із хмарним докачуванням)
-      - 'NONE' (якщо фізичний носій не підключено)
+    """Detect the `GVK_VAULT` media mode and bundled offline assets.
+
+    Determines one of three modes:
+      - `'USB'`: `vault/media_mode.json` sets `mode=USB`, or offline assets
+        (`base/*.gguf`, `bin/`, `embeddings/`, or `python_portable/`) are present.
+      - `'DVD'`: Lightweight DVD-R (~150 MB) relying on cloud downloads for base assets.
+      - `'NONE'`: No physical medium is mounted.
+
+    Args:
+        disc_path: Root path to the mounted `GVK_VAULT` directory, or None.
+
+    Returns:
+        Dictionary describing `mode`, `disc_path`, `has_base_model`, `has_llama_bins`,
+        `has_embeddings`, and `has_portable_python`.
     """
     if not disc_path or not os.path.isdir(disc_path):
         return {
@@ -294,16 +342,24 @@ def detect_media_mode(disc_path: Optional[str]) -> Dict[str, object]:
     }
 
 
-def _copy_file_with_progress(src: str, dst: str, label: str = "Копіювання") -> str:
-    """
-    Потоково копіює великий файл (наприклад 9 ГБ GGUF із USB на SSD ~/.gvk_ai/base/)
-    блоками по 8 МБ із прогрес-баром та атомарним перейменуванням .part -> dst.
+def _copy_file_with_progress(src: str, dst: str, label: str = "Copying") -> str:
+    """Stream-copy a large file in 8 MB chunks with terminal progress and atomic rename.
+
+    Writes to `<dst>.part` first and atomically replaces `dst` on completion.
+
+    Args:
+        src: Source file path (e.g., a 9 GB GGUF model on USB media).
+        dst: Destination file path (e.g., inside `~/.gvk_ai/base/`).
+        label: Short label shown in the progress line.
+
+    Returns:
+        Destination file path `dst`.
     """
     os.makedirs(os.path.dirname(os.path.abspath(dst)), exist_ok=True)
     part_path = dst + ".part"
     total_size = os.path.getsize(src)
     copied = 0
-    chunk_size = 8 * 1024 * 1024  # 8 МБ
+    chunk_size = 8 * 1024 * 1024  # 8 MB
     t0 = time.time()
 
     if os.path.exists(dst):
@@ -325,12 +381,12 @@ def _copy_file_with_progress(src: str, dst: str, label: str = "Копіюван�
                 pct = min(100.0, (copied / total_size) * 100.0)
                 print(
                     f"\r [*] {label}: {pct:5.1f}% "
-                    f"({_format_size(copied)} / {_format_size(total_size)}) [{speed_mb:.1f} МБ/с]",
+                    f"({_format_size(copied)} / {_format_size(total_size)}) [{speed_mb:.1f} MB/s]",
                     end="",
                     flush=True,
                 )
             else:
-                print(f"\r [*] {label}: {_format_size(copied)} [{speed_mb:.1f} МБ/с]", end="", flush=True)
+                print(f"\r [*] {label}: {_format_size(copied)} [{speed_mb:.1f} MB/s]", end="", flush=True)
 
     print()
     try:
@@ -342,6 +398,7 @@ def _copy_file_with_progress(src: str, dst: str, label: str = "Копіюван�
 
 
 def _is_valid_gguf_file(file_path: str) -> bool:
+    """Return True if `file_path` exists and begins with the 4-byte `GGUF` magic header."""
     try:
         if not os.path.isfile(file_path) or os.path.getsize(file_path) < 4:
             return False
@@ -352,24 +409,38 @@ def _is_valid_gguf_file(file_path: str) -> bool:
 
 
 def _format_size(num_bytes: int) -> str:
+    """Format a byte count into a human-readable string (B, KB, MB, or GB)."""
     value = float(num_bytes)
-    for unit in ("Б", "КБ", "МБ", "ГБ"):
-        if value < 1024.0 or unit == "ГБ":
-            return f"{value:.1f} {unit}" if unit != "Б" else f"{int(value)} Б"
+    for unit in ("B", "KB", "MB", "GB"):
+        if value < 1024.0 or unit == "GB":
+            return f"{value:.1f} {unit}" if unit != "B" else f"{int(value)} B"
         value /= 1024.0
-    return f"{value:.1f} ГБ"
+    return f"{value:.1f} GB"
 
 
 def _download_with_resume(
     url: str,
     dst_path: str,
-    label: str = "Завантаження",
+    label: str = "Downloading",
     max_retries: int = 5,
 ) -> str:
-    """
-    Потоково завантажує великий файл у `<dst_path>.part` із підтримкою HTTP Range
-    (автоматичне докачування з місця обриву до `max_retries` спроб) та перевіркою
-    повноти `Content-Length` перед перейменуванням у `dst_path`.
+    """Stream-download a file to `<dst_path>.part` with HTTP Range resume support.
+
+    Automatically retries interrupted transfers up to `max_retries` times and
+    verifies `Content-Length` completeness before atomically renaming to `dst_path`.
+
+    Args:
+        url: Source HTTP/HTTPS URL.
+        dst_path: Destination file path.
+        label: Short label shown in the progress line.
+        max_retries: Maximum number of download attempts.
+
+    Returns:
+        Destination file path `dst_path`.
+
+    Raises:
+        IOError: If the downloaded byte count is smaller than `Content-Length`.
+        Exception: Re-raises the last transport error if all retries fail.
     """
     os.makedirs(os.path.dirname(os.path.abspath(dst_path)), exist_ok=True)
     part_path = dst_path + ".part"
@@ -387,7 +458,7 @@ def _download_with_resume(
             try:
                 resp = urllib.request.urlopen(req, timeout=30, context=ssl_ctx)
             except urllib.error.HTTPError as exc:
-                # 416 Range Not Satisfiable — файл міг бути вже докачаний або сервер не підтримує Range
+                # 416 Range Not Satisfiable: file may already be complete or server rejects Range
                 if exc.code == 416 and existing_size > 0:
                     req = urllib.request.Request(url, headers={"User-Agent": "GVK-Private-AI-Updater/1.0"})
                     existing_size = 0
@@ -408,7 +479,7 @@ def _download_with_resume(
 
             t0 = time.time()
             session_bytes = 0
-            chunk_size = 4 * 1024 * 1024  # 4 МБ
+            chunk_size = 4 * 1024 * 1024  # 4 MB
 
             with resp, open(part_path, mode) as f_out:
                 while True:
@@ -425,13 +496,13 @@ def _download_with_resume(
                         pct = min(100.0, (downloaded / total_size) * 100.0)
                         print(
                             f"\r [*] {label}: {pct:5.1f}% "
-                            f"({_format_size(downloaded)} / {_format_size(total_size)}) [{speed_mb:.1f} МБ/с]",
+                            f"({_format_size(downloaded)} / {_format_size(total_size)}) [{speed_mb:.1f} MB/s]",
                             end="",
                             flush=True,
                         )
                     else:
                         print(
-                            f"\r [*] {label}: {_format_size(downloaded)} [{speed_mb:.1f} МБ/с]",
+                            f"\r [*] {label}: {_format_size(downloaded)} [{speed_mb:.1f} MB/s]",
                             end="",
                             flush=True,
                         )
@@ -439,7 +510,7 @@ def _download_with_resume(
             print()
             if total_size is not None and downloaded < total_size:
                 raise IOError(
-                    f"Неповне завантаження {label}: отримано {downloaded} із {total_size} Б."
+                    f"Incomplete download for {label}: received {downloaded} of {total_size} bytes."
                 )
 
             os.replace(part_path, dst_path)
@@ -448,7 +519,10 @@ def _download_with_resume(
         except Exception as exc:
             last_exc = exc
             if attempt < max_retries:
-                print(f"\n [!] Обрив завантаження {label} (спроба {attempt}/{max_retries}: {exc}). Докачування через 2 с...")
+                print(
+                    f"\n [!] Download interrupted for {label} "
+                    f"(attempt {attempt}/{max_retries}: {exc}). Resuming in 2s..."
+                )
                 time.sleep(2.0)
             else:
                 raise
@@ -459,10 +533,18 @@ def _download_with_resume(
 
 
 # =====================================================================
-# 1. ІНІЦІАЛІЗАЦІЯ КЕШУ ~/.gvk_ai
+# 1. INITIALIZE ~/.gvk_ai CACHE
 # =====================================================================
 def get_gvk_paths(gvk_home: str = DEFAULT_GVK_HOME) -> Dict[str, str]:
-    """Повертає словник стандартних піддиректорій кешу `~/.gvk_ai` без запису на диск."""
+    """Return a dictionary of standard `~/.gvk_ai` cache subdirectories without writing to disk.
+
+    Args:
+        gvk_home: Base path for the GVK local cache directory.
+
+    Returns:
+        Mapping of logical keys (`home`, `base`, `bin`, `embeddings`, `personas`,
+        `registry`, `logs`) to absolute directory paths.
+    """
     gvk_home = os.path.abspath(os.path.expanduser(gvk_home))
     return {
         "home": gvk_home,
@@ -476,7 +558,14 @@ def get_gvk_paths(gvk_home: str = DEFAULT_GVK_HOME) -> Dict[str, str]:
 
 
 def init_gvk_home(gvk_home: str = DEFAULT_GVK_HOME) -> Dict[str, str]:
-    """Створює структуру робочої директорії `~/.gvk_ai`."""
+    """Create the `~/.gvk_ai` directory structure if it does not exist.
+
+    Args:
+        gvk_home: Base path for the GVK local cache directory.
+
+    Returns:
+        Mapping of standard GVK cache directory paths.
+    """
     paths = get_gvk_paths(gvk_home)
     for p in paths.values():
         os.makedirs(p, exist_ok=True)
@@ -484,9 +573,10 @@ def init_gvk_home(gvk_home: str = DEFAULT_GVK_HOME) -> Dict[str, str]:
 
 
 # =====================================================================
-# 2. ПЕРЕВІРКА .VENV ТА REQUIREMENTS.TXT
+# 2. PYTHON .VENV & REQUIREMENTS.TXT
 # =====================================================================
 def _venv_python_path(venv_dir: str) -> str:
+    """Return the path to the Python interpreter inside `venv_dir`."""
     if platform.system().lower() == "windows":
         return os.path.join(venv_dir, "Scripts", "python.exe")
     for name in ("python3", "python"):
@@ -497,6 +587,7 @@ def _venv_python_path(venv_dir: str) -> str:
 
 
 def _portable_python_path(gvk_home: str = DEFAULT_GVK_HOME) -> str:
+    """Return the expected path to the bundled portable Python binary under `gvk_home`."""
     home_abs = os.path.abspath(os.path.expanduser(gvk_home))
     if platform.system().lower() == "windows":
         return os.path.join(home_abs, "python", "python.exe")
@@ -504,7 +595,7 @@ def _portable_python_path(gvk_home: str = DEFAULT_GVK_HOME) -> str:
 
 
 def _tcl_tk_env_for_python(py_bin: str) -> Dict[str, str]:
-    """Підтягує TCL_LIBRARY / TK_LIBRARY для портативного python-build-standalone, якщо вони поруч."""
+    """Build an environment dict with `TCL_LIBRARY`/`TK_LIBRARY` for portable Python builds."""
     env = dict(os.environ)
     if "TCL_LIBRARY" in env and "TK_LIBRARY" in env:
         return env
@@ -524,10 +615,16 @@ def _tcl_tk_env_for_python(py_bin: str) -> Dict[str, str]:
 
 
 def _probe_python_tk(py_bin: str) -> Tuple[bool, float, Tuple[int, int]]:
-    """
-    Перевіряє версію Python та наявність сучасного Tkinter (`Tk >= 8.6`).
-    Повертає `(has_tk, tk_version, (major, minor))`.
-    На macOS системний Tk 8.5 не відмальовує Cocoa-віджети, тому вимагається Tk >= 8.6.
+    """Probe a Python executable for its version and modern Tkinter (`Tk >= 8.6`) support.
+
+    On macOS, the legacy system Tk 8.5 cannot render Cocoa widgets properly, so
+    Tk >= 8.6 is required.
+
+    Args:
+        py_bin: Path to the Python interpreter to inspect.
+
+    Returns:
+        Tuple `(has_tk, tk_version, (major, minor))`.
     """
     if not py_bin or not os.path.isfile(py_bin):
         return False, 0.0, (0, 0)
@@ -567,10 +664,16 @@ def _probe_python_tk(py_bin: str) -> Tuple[bool, float, Tuple[int, int]]:
 
 
 def _select_best_python(gvk_home: str = DEFAULT_GVK_HOME) -> str:
-    """
-    Обирає найкращий інтерпретатор Python для `.venv`:
-      - Пріоритет: портативний `~/.gvk_ai/python` або системний Python >= 3.10 із `TkVersion >= 8.6`.
-      - На macOS за потреби автоматично доінстальовує `python-tk@<major.minor>` через Homebrew.
+    """Select the best available Python interpreter for creating `.venv`.
+
+    Prefers portable `~/.gvk_ai/python` or a system Python >= 3.10 with `TkVersion >= 8.6`.
+    On macOS, attempts to install `python-tk@<major.minor>` via Homebrew if needed.
+
+    Args:
+        gvk_home: Base path for the GVK local cache directory.
+
+    Returns:
+        Path to the selected Python executable.
     """
     candidates: List[str] = []
     portable_py = _portable_python_path(gvk_home)
@@ -597,7 +700,7 @@ def _select_best_python(gvk_home: str = DEFAULT_GVK_HOME) -> str:
             return cand
         probed.append((cand, has_tk, tk_ver, py_ver))
 
-    # На macOS: якщо знайшли Homebrew Python >= 3.10 без python-tk — спробуємо поставити python-tk@X.Y
+    # On macOS, if Homebrew Python >= 3.10 lacks Tkinter, attempt to install python-tk@X.Y
     if platform.system().lower() == "darwin":
         brew_bin = shutil.which("brew") or (
             "/opt/homebrew/bin/brew" if os.path.isfile("/opt/homebrew/bin/brew") else None
@@ -608,7 +711,7 @@ def _select_best_python(gvk_home: str = DEFAULT_GVK_HOME) -> str:
                     "/opt/homebrew/" in os.path.realpath(cand) or "/usr/local/" in os.path.realpath(cand)
                 ):
                     pkg = f"python-tk@{py_ver[0]}.{py_ver[1]}"
-                    print(f" [*] Виявлено Python {py_ver[0]}.{py_ver[1]} без Tkinter — встановлюємо {pkg}...")
+                    print(f" [*] Detected Python {py_ver[0]}.{py_ver[1]} without Tkinter; installing {pkg}...")
                     try:
                         env = dict(os.environ, HOMEBREW_NO_AUTO_UPDATE="1")
                         subprocess.run([brew_bin, "install", pkg], check=True, env=env, input="y\n", text=True)
@@ -616,7 +719,7 @@ def _select_best_python(gvk_home: str = DEFAULT_GVK_HOME) -> str:
                         if ok2 and tk2 >= MIN_TK_VERSION:
                             return cand
                     except Exception as exc:
-                        print(f" [!] Не вдалося встановити {pkg} автоматично: {exc}")
+                        print(f" [!] Failed to install {pkg} automatically: {exc}")
 
     for cand, has_tk, tk_ver, _py_ver in probed:
         if has_tk and tk_ver >= MIN_TK_VERSION:
@@ -625,7 +728,7 @@ def _select_best_python(gvk_home: str = DEFAULT_GVK_HOME) -> str:
 
 
 def resolve_venv_dir(gvk_home: str = DEFAULT_GVK_HOME, repo_root: str = DEFAULT_REPO_ROOT) -> str:
-    """Повертає шлях до активної або цільової директорії `.venv`."""
+    """Return the path to the active or target `.venv` directory."""
     repo_venv = os.path.join(repo_root, ".venv")
     home_venv = os.path.join(gvk_home, ".venv")
     if os.path.isfile(_venv_python_path(repo_venv)):
@@ -634,14 +737,19 @@ def resolve_venv_dir(gvk_home: str = DEFAULT_GVK_HOME, repo_root: str = DEFAULT_
 
 
 def check_requirements_status(venv_dir: str, req_path: str) -> Tuple[str, Optional[str], Optional[str]]:
-    """
-    Перевіряє стан залежностей за SHA-256 маркером `<venv>/.gvk_requirements.sha256`.
-    Повертає (status, current_sha256, saved_sha256), де status:
-      - 'missing_req': файл requirements.txt відсутній
-      - 'missing_venv': директорія .venv або інтерпретатор відсутні
-      - 'needs_install': маркер відсутній
-      - 'outdated': хеш requirements.txt змінився
-      - 'up_to_date': маркер збігається
+    """Check virtual environment dependency status via `<venv>/.gvk_requirements.sha256`.
+
+    Args:
+        venv_dir: Path to the target `.venv` directory.
+        req_path: Path to `requirements.txt`.
+
+    Returns:
+        Tuple `(status, current_sha256, saved_sha256)`, where `status` is one of:
+          - `'missing_req'`: `requirements.txt` does not exist.
+          - `'missing_venv'`: `.venv` or its Python binary does not exist.
+          - `'needs_install'`: SHA-256 marker file is missing or unreadable.
+          - `'outdated'`: `requirements.txt` hash differs from the saved marker.
+          - `'up_to_date'`: Saved marker matches `requirements.txt`.
     """
     if not os.path.isfile(req_path):
         return "missing_req", None, None
@@ -671,9 +779,21 @@ def ensure_venv_and_requirements(
     repo_root: str = DEFAULT_REPO_ROOT,
     skip_pip: bool = False,
 ) -> Dict[str, Optional[str]]:
-    """
-    Перевіряє наявність `.venv` (із Python >= 3.10 та Tk >= 8.6) і відповідність
-    встановлених пакетів до `requirements.txt`. За потреби створює або оновлює `.venv`.
+    """Ensure `.venv` (Python >= 3.10, Tk >= 8.6) exists and matches `requirements.txt`.
+
+    Creates or recreates `.venv` when required and installs missing or updated
+    Python packages unless `skip_pip` is enabled.
+
+    Args:
+        gvk_home: Base path for the GVK local cache directory.
+        repo_root: Repository root directory containing `requirements.txt`.
+        skip_pip: If True, skip venv creation/recreation and pip installation.
+
+    Returns:
+        Dictionary with keys `venv_dir`, `python`, and `status`.
+
+    Raises:
+        RuntimeError: If no Python >= 3.10 interpreter is available.
     """
     venv_dir = resolve_venv_dir(gvk_home, repo_root)
     req_path = os.path.join(repo_root, "requirements.txt")
@@ -684,25 +804,31 @@ def ensure_venv_and_requirements(
         has_tk, tk_ver, py_ver = _probe_python_tk(py_path)
         if not skip_pip and (py_ver < MIN_PYTHON_VERSION or not has_tk or tk_ver < MIN_TK_VERSION):
             print(
-                f" [!] Виявлено застарілий Python або Tk у .venv (Python={py_ver[0]}.{py_ver[1]}, "
+                f" [!] Outdated Python or Tk detected in .venv (Python={py_ver[0]}.{py_ver[1]}, "
                 f"Tk={tk_ver})."
             )
             best_py = _select_best_python(gvk_home)
             best_has_tk, best_tk, best_py_ver = _probe_python_tk(best_py)
             if best_py_ver >= MIN_PYTHON_VERSION and best_has_tk and best_tk >= MIN_TK_VERSION:
-                print(f" [*] Перестворення {venv_dir} на базі {best_py} (Python {best_py_ver[0]}.{best_py_ver[1]}, Tk {best_tk})...")
+                print(
+                    f" [*] Recreating {venv_dir} with {best_py} "
+                    f"(Python {best_py_ver[0]}.{best_py_ver[1]}, Tk {best_tk})..."
+                )
                 subprocess.run([best_py, "-m", "venv", "--clear", venv_dir], check=True)
                 if os.path.isfile(marker_path):
                     os.remove(marker_path)
                 py_path = _venv_python_path(venv_dir)
             elif py_ver < MIN_PYTHON_VERSION:
                 raise RuntimeError(
-                    "Потрібен Python >= 3.10 (поточний < 3.10). "
+                    "Python >= 3.10 is required (current < 3.10). "
                     "macOS: brew install python@3.12 python-tk@3.12 | "
                     "Windows: python.org (Python 3.12) | Linux: sudo apt install python3.12 python3.12-venv python3-tk"
                 )
             else:
-                print(" [!] УВАГА: Не знайдено Python із Tk >= 8.6. Для macOS: brew install python@3.12 python-tk@3.12")
+                print(
+                    " [!] WARNING: No Python interpreter with Tk >= 8.6 found. "
+                    "On macOS run: brew install python@3.12 python-tk@3.12"
+                )
 
     if not os.path.isfile(py_path):
         if skip_pip:
@@ -715,12 +841,12 @@ def ensure_venv_and_requirements(
         _best_tk_ok, _best_tk_ver, best_py_ver = _probe_python_tk(best_py)
         if best_py_ver < MIN_PYTHON_VERSION:
             raise RuntimeError(
-                f"Знайдено лише Python {best_py_ver[0]}.{best_py_ver[1]} ({best_py}), але потрібен Python >= 3.10. "
+                f"Found only Python {best_py_ver[0]}.{best_py_ver[1]} ({best_py}), but Python >= 3.10 is required. "
                 "macOS: brew install python@3.12 python-tk@3.12 | "
-                "Windows: встановіть Python 3.12 з python.org (Add to PATH) | "
+                "Windows: install Python 3.12 from python.org (Add to PATH) | "
                 "Linux: sudo apt install python3.12 python3.12-venv python3-tk"
             )
-        print(f" [*] Створення віртуального середовища Python у {venv_dir} ({best_py})...")
+        print(f" [*] Creating Python virtual environment at {venv_dir} ({best_py})...")
         subprocess.run([best_py, "-m", "venv", venv_dir], check=True)
         py_path = _venv_python_path(venv_dir)
 
@@ -736,30 +862,31 @@ def ensure_venv_and_requirements(
         if imp_res.returncode != 0:
             status = "needs_install"
     if status == "up_to_date":
-        print(f" [OK] Залежності requirements.txt актуальні ({venv_dir}).")
+        print(f" [OK] requirements.txt dependencies are up to date ({venv_dir}).")
         return {"venv_dir": venv_dir, "python": py_path, "status": "up_to_date"}
 
     if skip_pip:
-        print(f" [!] Перевірку pip пропущено (--skip-pip), статус: {status}.")
+        print(f" [!] Skipping pip check (--skip-pip), status: {status}.")
         return {"venv_dir": venv_dir, "python": py_path, "status": f"{status}_skipped"}
 
     pip_check = subprocess.run([py_path, "-m", "pip", "--version"], capture_output=True, text=True)
     if pip_check.returncode != 0:
         subprocess.run([py_path, "-m", "ensurepip", "--upgrade"], check=False)
 
-    print(f" [*] Оновлення залежностей Python ({status}) із {req_path}...")
+    print(f" [*] Updating Python dependencies ({status}) from {req_path}...")
     subprocess.run([py_path, "-m", "pip", "install", "--disable-pip-version-check", "-r", req_path], check=True)
     if current_hash:
         with open(marker_path, "w", encoding="utf-8") as f:
             f.write(current_hash + "\n")
-    print(" [✓] Залежності requirements.txt успішно встановлено.")
+    print(" [OK] requirements.txt dependencies installed successfully.")
     return {"venv_dir": venv_dir, "python": py_path, "status": "installed"}
 
 
 # =====================================================================
-# 3. ВЕРИФІКАЦІЯ ТА ІМПОРТ DVD-ДИСКА GVK_VAULT
+# 3. GVK_VAULT MEDIA VERIFICATION & IMPORT
 # =====================================================================
 def _load_activated_registry(registry_dir: str) -> Dict[str, dict]:
+    """Load the local activated-personas registry JSON (`activated.json`)."""
     reg_file = os.path.join(registry_dir, "activated.json")
     if not os.path.isfile(reg_file):
         return {}
@@ -772,6 +899,7 @@ def _load_activated_registry(registry_dir: str) -> Dict[str, dict]:
 
 
 def _save_activated_registry(registry_dir: str, registry_data: Dict[str, dict]) -> None:
+    """Persist the local activated-personas registry JSON (`activated.json`)."""
     reg_file = os.path.join(registry_dir, "activated.json")
     with open(reg_file, "w", encoding="utf-8") as f:
         json.dump(registry_data, f, indent=2, ensure_ascii=False)
@@ -782,10 +910,22 @@ def _validate_manifest_and_files(
     source_dir: str,
     master_key: Optional[bytes] = None,
 ) -> dict:
-    """Читає `manifest.json`, перевіряє SHA-256 геші `.enc` файлів та заголовок `GVK1`."""
+    """Read `manifest.json`, verify SHA-256 digests of `.enc` containers, and check `GVK1` headers.
+
+    Args:
+        source_dir: Directory containing `manifest.json` and encrypted container files.
+        master_key: Optional 32-byte master key for `GVK1` header authentication.
+
+    Returns:
+        Parsed manifest dictionary.
+
+    Raises:
+        FileNotFoundError: If `manifest.json` or a referenced container is missing.
+        ValueError: If manifest fields are incomplete or integrity checks fail.
+    """
     manifest_path = os.path.join(source_dir, "manifest.json")
     if not os.path.isfile(manifest_path):
-        raise FileNotFoundError(f"Відсутній manifest.json у {source_dir}")
+        raise FileNotFoundError(f"Missing manifest.json in {source_dir}")
 
     with open(manifest_path, "r", encoding="utf-8") as f:
         manifest = json.load(f)
@@ -794,22 +934,22 @@ def _validate_manifest_and_files(
     files_map = manifest.get("files") or {}
     sha_map = manifest.get("sha256") or {}
     if not persona_id or "adapter" not in files_map or "payload" not in files_map:
-        raise ValueError(f"Неповний manifest.json у {source_dir}")
+        raise ValueError(f"Incomplete manifest.json in {source_dir}")
 
     for key_name in ("adapter", "payload"):
         rel_name = files_map[key_name]
         fpath = os.path.join(source_dir, rel_name)
         if not os.path.isfile(fpath):
-            raise FileNotFoundError(f"Відсутній контейнер {rel_name} у {source_dir}")
+            raise FileNotFoundError(f"Missing container {rel_name} in {source_dir}")
 
         expected_sha = sha_map.get(key_name)
         if not expected_sha:
-            raise ValueError(f"У manifest.json відсутній SHA-256 для '{key_name}'")
+            raise ValueError(f"Missing SHA-256 entry for '{key_name}' in manifest.json")
         actual_sha = compute_sha256(fpath)
         if not hmac.compare_digest(actual_sha.lower(), str(expected_sha).lower()):
             raise ValueError(
-                f"Порушено цілісність SHA-256 для {rel_name}: "
-                f"очікується {expected_sha[:16]}..., отримано {actual_sha[:16]}..."
+                f"SHA-256 integrity mismatch for {rel_name}: "
+                f"expected {expected_sha[:16]}..., got {actual_sha[:16]}..."
             )
         verify_gvk1_header(fpath, master_key=master_key)
 
@@ -820,9 +960,23 @@ def verify_and_import_disc(
     disc_path: Optional[str] = None,
     gvk_home: str = DEFAULT_GVK_HOME,
 ) -> Dict[str, Optional[object]]:
-    """
-    Виявляє носій `GVK_VAULT` (DVD або USB), перевіряє `vault/master.key`, `origin.sig`, SHA-256
-    та заголовки `GVK1`, реєструє підпис у `~/.gvk_ai/registry/` і копіює `.enc` на SSD.
+    """Detect `GVK_VAULT` media (DVD or USB), verify signatures/containers, and import into cache.
+
+    Validates `vault/master.key`, `persona/origin.sig`, manifest SHA-256 hashes,
+    and `GVK1` headers, registers the signature in `~/.gvk_ai/registry/`, and
+    copies `.enc` containers onto local storage if not already cached.
+
+    Args:
+        disc_path: Optional explicit path to mounted `GVK_VAULT` media.
+        gvk_home: Base path for the GVK local cache directory.
+
+    Returns:
+        Dictionary containing `found`, `imported`, `persona_id`, `disc_path`,
+        `master_key`, `media_mode`, and `media_info`.
+
+    Raises:
+        FileNotFoundError: If required persona files or `origin.sig` are missing.
+        ValueError: If `master.key`, `origin.sig`, SHA-256, or `GVK1` verification fails.
     """
     paths = init_gvk_home(gvk_home)
     detected_disc = find_gvk_disc_path(disc_path)
@@ -840,20 +994,20 @@ def verify_and_import_disc(
     media_info = detect_media_mode(detected_disc)
     media_mode = str(media_info.get("mode") or "DVD")
     print(
-        f" [✓] Виявлено носій GVK_VAULT: {detected_disc} "
-        f"[Режим: {media_mode} | Модель на носії: {'ТАК' if media_info.get('has_base_model') else 'НІ'} | "
-        f"Бінарники: {'ТАК' if media_info.get('has_llama_bins') else 'НІ'}]"
+        f" [OK] Detected GVK_VAULT media: {detected_disc} "
+        f"[Mode: {media_mode} | Base model on media: {'YES' if media_info.get('has_base_model') else 'NO'} | "
+        f"Binaries: {'YES' if media_info.get('has_llama_bins') else 'NO'}]"
     )
 
     key_path = os.path.join(detected_disc, "vault", "master.key")
     with open(key_path, "rb") as f:
         master_key = f.read()
     if len(master_key) != KEY_SIZE:
-        raise ValueError(f"Невірний розмір vault/master.key: {len(master_key)} Б (очікується {KEY_SIZE} Б).")
+        raise ValueError(f"Invalid vault/master.key size: {len(master_key)} bytes (expected {KEY_SIZE} bytes).")
 
     disc_persona_dir = os.path.join(detected_disc, "persona")
     if not os.path.isdir(disc_persona_dir):
-        print(f" [OK] Носій GVK_VAULT ({media_mode}) виявлено ({detected_disc}), папка persona/ відсутня — лише ключ.")
+        print(f" [OK] GVK_VAULT ({media_mode}) detected ({detected_disc}), no persona/ directory - key-only mode.")
         return {
             "found": True,
             "imported": False,
@@ -869,17 +1023,17 @@ def verify_and_import_disc(
 
     sig_path = os.path.join(disc_persona_dir, "origin.sig")
     if not os.path.isfile(sig_path):
-        raise FileNotFoundError(f"На носії {detected_disc} відсутній підпис persona/origin.sig!")
+        raise FileNotFoundError(f"Missing persona/origin.sig signature on media {detected_disc}!")
     with open(sig_path, "rb") as f:
         sig_bytes = f.read()
 
     if not verify_origin_sig_bytes(persona_id, master_key, sig_bytes):
         raise ValueError(
-            f"Криптографічна помилка: origin.sig на диску {detected_disc} "
-            f"не відповідає persona_id='{persona_id}' або master.key!"
+            f"Cryptographic error: origin.sig on media {detected_disc} "
+            f"does not match persona_id='{persona_id}' or master.key!"
         )
 
-    # Зберігаємо origin.sig у локальний реєстр
+    # Save origin.sig to the local signature registry
     reg_sig_path = os.path.join(paths["registry"], f"{persona_id}.sig")
     if os.path.exists(reg_sig_path):
         try:
@@ -889,7 +1043,8 @@ def verify_and_import_disc(
     with open(reg_sig_path, "wb") as f:
         f.write(sig_bytes)
 
-    # Перевіряємо, чи персонаж уже активований та валідний у кеші SSD (щоб не перекопійовувати 100+ МБ із DVD і не відкочувати оновлення з GitHub)
+    # Skip re-copying 100+ MB from media if this persona is already valid in local SSD cache
+    # (also prevents downgrading newer containers previously synced from GitHub).
     target_persona_dir = os.path.join(paths["personas"], persona_id)
     local_manifest_path = os.path.join(target_persona_dir, "manifest.json")
     already_cached = False
@@ -914,8 +1069,8 @@ def verify_and_import_disc(
 
     if already_cached:
         print(
-            f" [OK] Персонаж '{persona_id}' вже активований у кеші (v{cached_ver}) — "
-            f"повторне копіювання з {media_mode} пропущено."
+            f" [OK] Persona '{persona_id}' is already activated in cache (v{cached_ver}) - "
+            f"skipping re-copy from {media_mode}."
         )
         return {
             "found": True,
@@ -927,7 +1082,7 @@ def verify_and_import_disc(
             "media_info": media_info,
         }
 
-    # Копіюємо .enc контейнери та manifest.json у кеш SSD (без origin.sig, master.key і без Read-Only біта DVD)
+    # Copy .enc containers and manifest.json to SSD cache (without origin.sig, master.key, or DVD read-only flags)
     os.makedirs(target_persona_dir, exist_ok=True)
     files_map = manifest["files"]
     for fname in ("manifest.json", files_map["adapter"], files_map["payload"]):
@@ -946,8 +1101,8 @@ def verify_and_import_disc(
     _save_activated_registry(paths["registry"], registry_data)
 
     print(
-        f" [✓] Активовано та імпортовано з {media_mode} '{persona_id}' (v{manifest.get('version', '1.0.0')}) "
-        f"-> {target_persona_dir}"
+        f" [OK] Activated and imported '{persona_id}' (v{manifest.get('version', '1.0.0')}) "
+        f"from {media_mode} -> {target_persona_dir}"
     )
     return {
         "found": True,
@@ -961,16 +1116,26 @@ def verify_and_import_disc(
 
 
 # =====================================================================
-# 4. НАКОПИЧУВАЛЬНА АКТИВАЦІЯ ТА ОНОВЛЕННЯ ІЗ GITHUB (INCREMENTAL UNLOCK)
+# 4. INCREMENTAL UNLOCK & GITHUB PERSONA SYNC
 # =====================================================================
 def sync_activated_personas(
     gvk_home: str = DEFAULT_GVK_HOME,
     repo_root: str = DEFAULT_REPO_ROOT,
     master_key: Optional[bytes] = None,
 ) -> Dict[str, List[str]]:
-    """
-    Перевіряє оновлення в `personas_encrypted/<persona_id>/` і синхронізує ТІЛЬКИ
-    тих персонажів, для яких у `~/.gvk_ai/registry/<persona_id>.sig` є валідний `origin.sig`.
+    """Sync updated containers from `personas_encrypted/` only for already-activated personas.
+
+    A persona is eligible for synchronization only when a valid `origin.sig` exists in
+    `~/.gvk_ai/registry/<persona_id>.sig`.
+
+    Args:
+        gvk_home: Base path for the GVK local cache directory.
+        repo_root: Repository root containing `personas_encrypted/`.
+        master_key: Optional 32-byte master key used to authenticate signatures and `GVK1` headers.
+
+    Returns:
+        Dictionary with lists of persona IDs under `updated`, `up_to_date`,
+        and `skipped_unactivated`.
     """
     paths = init_gvk_home(gvk_home)
     enc_root = os.path.join(repo_root, "personas_encrypted")
@@ -997,7 +1162,7 @@ def sync_activated_personas(
 
         reg_sig_path = os.path.join(paths["registry"], f"{persona_id}.sig")
         if not os.path.isfile(reg_sig_path) or os.path.getsize(reg_sig_path) != SIG_SIZE:
-            print(f" [-] Пропущено '{persona_id}': фізичний DVD із origin.sig ще не активовано.")
+            print(f" [-] Skipped '{persona_id}': physical GVK_VAULT media with origin.sig has not been activated.")
             result["skipped_unactivated"].append(persona_id)
             continue
 
@@ -1006,8 +1171,8 @@ def sync_activated_personas(
                 sig_bytes = f.read()
             if not verify_origin_sig_bytes(persona_id, master_key, sig_bytes):
                 print(
-                    f" [!] Попередження: локальний origin.sig для '{persona_id}' "
-                    f"не пройшов перевірку поточним master.key — оновлення заблоковано."
+                    f" [!] Warning: local origin.sig for '{persona_id}' failed verification "
+                    f"against current master.key - update blocked."
                 )
                 result["skipped_unactivated"].append(persona_id)
                 continue
@@ -1056,7 +1221,7 @@ def sync_activated_personas(
         registry_data[persona_id] = entry_meta
         registry_changed = True
         result["updated"].append(persona_id)
-        print(f" [✓] Оновлено '{persona_id}' -> v{verified_manifest.get('version', '1.0.0')}")
+        print(f" [OK] Updated '{persona_id}' -> v{verified_manifest.get('version', '1.0.0')}")
 
     if registry_changed:
         _save_activated_registry(paths["registry"], registry_data)
@@ -1064,14 +1229,23 @@ def sync_activated_personas(
 
 
 # =====================================================================
-# 5. БАЗОВА МОДЕЛЬ 14B (З ЛОКАЛЬНОГО КЕШУ, USB-НОСІЯ АБО HUGGING FACE)
+# 5. BASE 14B MODEL (LOCAL CACHE, USB MEDIA, OR HUGGING FACE)
 # =====================================================================
 def _collect_base_model_candidates(
     gvk_home: str,
     repo_root: str,
     disc_path: Optional[str] = None,
 ) -> Tuple[List[str], List[str], List[str]]:
-    """Повертає (кандидати в кеші gvk_home/base, кандидати на USB-носії disc_path/base, локальні кандидати в env/репо)."""
+    """Return candidate paths for the base GGUF model across cache, USB media, and repo/env.
+
+    Args:
+        gvk_home: Base path for the GVK local cache directory.
+        repo_root: Repository root directory.
+        disc_path: Optional mounted `GVK_VAULT` media path.
+
+    Returns:
+        Three-tuple `(cache_candidates, disc_candidates, local_candidates)`.
+    """
     paths = get_gvk_paths(gvk_home)
     cache_candidates = [os.path.join(paths["base"], DEFAULT_BASE_MODEL_FILENAME)]
     if os.path.isdir(paths["base"]):
@@ -1101,7 +1275,16 @@ def find_base_model_path(
     repo_root: str = DEFAULT_REPO_ROOT,
     disc_path: Optional[str] = None,
 ) -> Optional[str]:
-    """Read-only пошук валідної базової GGUF-моделі без створення файлів чи симлінків."""
+    """Perform a read-only search for a valid base GGUF model without creating files or symlinks.
+
+    Args:
+        gvk_home: Base path for the GVK local cache directory.
+        repo_root: Repository root directory.
+        disc_path: Optional mounted `GVK_VAULT` media path.
+
+    Returns:
+        Resolved path to the first valid GGUF file found, or None.
+    """
     cache_candidates, disc_candidates, local_candidates = _collect_base_model_candidates(
         gvk_home, repo_root, disc_path=disc_path
     )
@@ -1118,14 +1301,27 @@ def ensure_base_model(
     model_url: str = DEFAULT_BASE_MODEL_URL,
     disc_path: Optional[str] = None,
 ) -> Optional[str]:
-    """
-    Забезпечує наявність публічної базової моделі `Qwen2.5-14B-Instruct-Q4_K_M.gguf`
-    у `~/.gvk_ai/base/`:
-      1. Якщо модель уже в `~/.gvk_ai/base/` -> використовує її.
-      2. Якщо модель є на USB-носії (`<disc_path>/base/*.gguf`) -> копіює її у `~/.gvk_ai/base/`
-         із прогрес-баром (щоб `llama-server` читав модель зі швидкого SSD і не залежав від швидкості USB).
-      3. Якщо модель є в локальному репозиторії (`repo_root/base/`) -> створює symlink або повертає локальний шлях.
-      4. Інакше завантажує з Hugging Face із підтримкою докачування (HTTP Range).
+    """Ensure the public base model (`Qwen2.5-14B-Instruct-Q4_K_M.gguf`) is available locally.
+
+    Resolution order:
+      1. Reuse an existing valid GGUF already cached in `~/.gvk_ai/base/`.
+      2. Copy from USB media (`<disc_path>/base/*.gguf`) into `~/.gvk_ai/base/`
+         with progress output so `llama-server` reads from fast local storage.
+      3. Symlink (or return) a local copy found via `GVK_BASE_MODEL` or `<repo_root>/base/`.
+      4. Download from Hugging Face with HTTP Range resume support (when `download=True`).
+
+    Args:
+        gvk_home: Base path for the GVK local cache directory.
+        repo_root: Repository root directory.
+        download: Allow downloading from `model_url` if not found locally or on media.
+        model_url: Download URL for the base GGUF model.
+        disc_path: Optional mounted `GVK_VAULT` media path.
+
+    Returns:
+        Path to the ready base GGUF model, or None if unavailable and `download=False`.
+
+    Raises:
+        ValueError: If a copied or downloaded file fails `GGUF` header validation.
     """
     paths = init_gvk_home(gvk_home)
     target_path = os.path.join(paths["base"], DEFAULT_BASE_MODEL_FILENAME)
@@ -1135,25 +1331,25 @@ def ensure_base_model(
 
     for existing in cache_candidates:
         if existing and _is_valid_gguf_file(existing):
-            print(f" [OK] Базова модель готова в кеші: {existing} ({_format_size(os.path.getsize(existing))})")
+            print(f" [OK] Base model ready in cache: {existing} ({_format_size(os.path.getsize(existing))})")
             return existing
 
-    # USB-режим: копіюємо модель із флешки в ~/.gvk_ai/base/
+    # USB mode: copy the base model from removable media into ~/.gvk_ai/base/
     for usb_cand in disc_candidates:
         if usb_cand and _is_valid_gguf_file(usb_cand):
             src_size = os.path.getsize(usb_cand)
             print(
-                f" [*] [USB-РЕЖИМ] Знайдено базову модель на носії: {usb_cand} ({_format_size(src_size)}).\n"
-                f"     Копіювання у локальний кеш SSD ({target_path})..."
+                f" [*] [USB-MODE] Found base model on media: {usb_cand} ({_format_size(src_size)}).\n"
+                f"     Copying to local SSD cache ({target_path})..."
             )
             _copy_file_with_progress(
                 usb_cand,
                 target_path,
-                label=f"Копіювання {os.path.basename(usb_cand)} з USB",
+                label=f"Copying {os.path.basename(usb_cand)} from USB",
             )
             if not _is_valid_gguf_file(target_path):
-                raise ValueError(f"Помилка копіювання GGUF із USB у {target_path}!")
-            print(f" [✓] Базову модель скопійовано з USB у кеш: {target_path}")
+                raise ValueError(f"Failed to copy valid GGUF from USB to {target_path}!")
+            print(f" [OK] Base model copied from USB to cache: {target_path}")
             return target_path
 
     for cand in local_candidates:
@@ -1163,30 +1359,31 @@ def ensure_base_model(
                 if os.path.lexists(target_path):
                     os.remove(target_path)
                 os.symlink(real_src, target_path)
-                print(f" [✓] Прив'язано локальну базову модель: {target_path} -> {real_src}")
+                print(f" [OK] Linked local base model: {target_path} -> {real_src}")
                 return target_path
             except OSError:
-                print(f" [OK] Знайдено локальну базову модель: {real_src}")
+                print(f" [OK] Found local base model: {real_src}")
                 return real_src
 
     if not download:
-        print(" [!] Базову модель не знайдено локально або на носії (завантаження вимкнено через --no-download).")
+        print(" [!] Base model not found locally or on media (download disabled via --no-download).")
         return None
 
-    print(f" [*] [DVD/CLOUD-РЕЖИМ] Завантаження базової моделі 14B (~9.0 ГБ) із Hugging Face...")
+    print(f" [*] [DVD/CLOUD-MODE] Downloading 14B base model (~9.0 GB) from Hugging Face...")
     print(f"     URL: {model_url}")
     _download_with_resume(model_url, target_path, label=DEFAULT_BASE_MODEL_FILENAME)
     if not _is_valid_gguf_file(target_path):
         os.remove(target_path)
-        raise ValueError("Завантажений файл базової моделі не є валідним GGUF (відсутній заголовок GGUF)!")
-    print(f" [✓] Базову модель збережено у: {target_path}")
+        raise ValueError("Downloaded base model is not a valid GGUF file (missing GGUF magic header)!")
+    print(f" [OK] Base model saved to: {target_path}")
     return target_path
 
 
 # =====================================================================
-# 6. БІНАРНИК LLAMA-SERVER (З USB-НОСІЯ, КЕШУ АБО GITHUB RELEASES)
+# 6. LLAMA-SERVER BINARY & EMBEDDING MODEL
 # =====================================================================
 def _llama_server_names() -> Tuple[str, ...]:
+    """Return platform-specific executable filenames for `llama-server`."""
     if platform.system().lower() == "windows":
         return ("llama-server.exe",)
     return ("llama-server",)
@@ -1197,7 +1394,16 @@ def find_llama_server(
     repo_root: str = DEFAULT_REPO_ROOT,
     disc_path: Optional[str] = None,
 ) -> Optional[str]:
-    """Шукає виконуваний файл `llama-server` у `~/.gvk_ai/bin/`, репозиторії, на носії та в PATH."""
+    """Search for an existing `llama-server` executable in cache, repo, media, or `PATH`.
+
+    Args:
+        gvk_home: Base path for the GVK local cache directory.
+        repo_root: Repository root directory.
+        disc_path: Optional mounted `GVK_VAULT` media path.
+
+    Returns:
+        Path to the `llama-server` binary if found, otherwise None.
+    """
     names = _llama_server_names()
     bin_dir = os.path.join(os.path.abspath(os.path.expanduser(gvk_home)), "bin")
     for name in names:
@@ -1227,7 +1433,7 @@ def find_llama_server(
 
 
 def _has_windows_vulkan() -> bool:
-    """На реальній Windows перевіряє наявність vulkan-1.dll перед вибором win-vulkan збірки."""
+    """Check whether `vulkan-1.dll` is present on Windows before selecting a Vulkan build."""
     if os.name != "nt":
         return True
     sys_root = os.environ.get("SystemRoot", r"C:\Windows")
@@ -1235,7 +1441,7 @@ def _has_windows_vulkan() -> bool:
 
 
 def _has_nvidia_gpu() -> bool:
-    """Перевіряє наявність драйвера NVIDIA CUDA (`nvcuda.dll` у Windows або `nvidia-smi`)."""
+    """Check for an NVIDIA CUDA driver (`nvcuda.dll` on Windows or `nvidia-smi` in `PATH`)."""
     if os.name == "nt":
         sys_root = os.environ.get("SystemRoot", r"C:\Windows")
         if os.path.isfile(os.path.join(sys_root, "System32", "nvcuda.dll")):
@@ -1244,6 +1450,15 @@ def _has_nvidia_gpu() -> bool:
 
 
 def _select_llama_release_asset(assets: List[dict], prefer_cuda: bool = False) -> Optional[dict]:
+    """Select the highest-scoring `llama.cpp` release archive for the current OS and CPU/GPU.
+
+    Args:
+        assets: List of GitHub release asset dicts (each containing at least `name`).
+        prefer_cuda: If True on Windows with an NVIDIA GPU, prefer CUDA 12 builds over Vulkan/CPU.
+
+    Returns:
+        Best matching asset dictionary, or None if no compatible archive was found.
+    """
     sys_name = platform.system().lower()
     arch = platform.machine().lower()
     is_arm = arch in ("arm64", "aarch64")
@@ -1283,7 +1498,7 @@ def _select_llama_release_asset(assets: List[dict], prefer_cuda: bool = False) -
                 return -1
             if "arm64" in n:
                 return -1
-            # Для офлайн-папки з CUDA або якщо prefer_cuda=True і є NVIDIA GPU
+            # Prefer CUDA 12 when explicitly requested for offline bundles on NVIDIA machines
             if prefer_cuda and has_nv and "cuda-12" in n and "x64" in n:
                 return 105
             if "vulkan" in n and "x64" in n:
@@ -1310,7 +1525,7 @@ def _select_llama_release_asset(assets: List[dict], prefer_cuda: bool = False) -
 
 
 def _select_cudart_asset(assets: List[dict], chosen_llama_name: str = "") -> Optional[dict]:
-    """Знаходить супутній архів `cudart-llama-bin-win-cuda-12.*.zip` для Windows CUDA збірки."""
+    """Find the companion `cudart-llama-bin-win-cuda-12.*.zip` archive for Windows CUDA builds."""
     want_12 = "cuda-12" in chosen_llama_name.lower() or not chosen_llama_name
     for asset in assets:
         n = asset.get("name", "").lower()
@@ -1325,7 +1540,15 @@ def _select_cudart_asset(assets: List[dict], chosen_llama_name: str = "") -> Opt
 
 
 def _extract_llama_archive(archive_path: str, bin_dir: str) -> Optional[str]:
-    """Розпаковує `llama-server` та супутні динамічні бібліотеки / шейдери у `bin_dir`."""
+    """Extract `llama-server` and companion shared libraries/shaders into `bin_dir`.
+
+    Args:
+        archive_path: Path to a `.zip`, `.tar.gz`, or `.tgz` release archive.
+        bin_dir: Target directory for extracted executables and runtime libraries.
+
+    Returns:
+        Path to the extracted `llama-server` binary, or None if not found in the archive.
+    """
     os.makedirs(bin_dir, exist_ok=True)
     wanted_bins = set(_llama_server_names())
     lib_exts = (".dylib", ".so", ".dll", ".metal", ".metallib")
@@ -1357,7 +1580,7 @@ def _extract_llama_archive(archive_path: str, bin_dir: str) -> Optional[str]:
 
 
 def _install_llama_from_directory(src_dir: str, dst_bin_dir: str) -> Optional[str]:
-    """Копіює розпакований рантайм (наприклад `llama-pascal-runtime` із CUDA DLL) у `~/.gvk_ai/bin/`."""
+    """Copy an unpacked `llama-server` runtime (e.g., `llama-pascal-runtime`) into `~/.gvk_ai/bin/`."""
     wanted_bins = set(_llama_server_names())
     lib_exts = (".dylib", ".so", ".dll", ".metal", ".metallib")
     found_server = None
@@ -1375,12 +1598,18 @@ def _install_llama_from_directory(src_dir: str, dst_bin_dir: str) -> Optional[st
 
 
 def _try_install_llama_from_usb(disc_path: Optional[str], repo_root: str, dst_bin_dir: str) -> Optional[str]:
-    """
-    Перевіряє офлайн-бандли `llama-server` на USB-носії (`<disc_path>/bin/`) або в `<repo_root>/base/llama_bins/`:
-      1. Якщо на Windows виявлено NVIDIA GPU і на носії є папка `bin/win-cuda-pascal/` (або `base/llama-pascal-runtime`),
-         або архів `llama-*-bin-win-cuda-*.zip` (+ `cudart-llama-*.zip`) -> встановлює її у `~/.gvk_ai/bin/`.
-      2. Інакше підбирає найкращий архів із `<disc_path>/bin/` через `_select_llama_release_asset`
-         (win-vulkan-x64, win-cpu-x64, macos-arm64, macos-x64) і розпаковує в `~/.gvk_ai/bin/`.
+    """Attempt to install `llama-server` from offline bundles on USB media or `<repo_root>/base/llama_bins/`.
+
+    Checks archives first (picking the best OS/GPU match and unpacking companion CUDA
+    DLLs if present), then falls back to unpacked Windows runtime directories.
+
+    Args:
+        disc_path: Optional mounted `GVK_VAULT` media path.
+        repo_root: Repository root directory.
+        dst_bin_dir: Destination `~/.gvk_ai/bin/` directory.
+
+    Returns:
+        Path to the installed `llama-server` binary, or None if no offline bundle matched.
     """
     search_dirs: List[str] = []
     if disc_path and os.path.isdir(disc_path):
@@ -1395,7 +1624,7 @@ def _try_install_llama_from_usb(disc_path: Optional[str], repo_root: str, dst_bi
         if not os.path.isdir(bdir):
             continue
 
-        # 1. Спочатку перевіряємо архіви (.zip / .tar.gz) у папці bin/
+        # 1. Check archive bundles (.zip / .tar.gz / .tgz) inside the bin directory
         local_assets: List[dict] = []
         for fname in sorted(os.listdir(bdir)):
             fpath = os.path.join(bdir, fname)
@@ -1406,46 +1635,52 @@ def _try_install_llama_from_usb(disc_path: Optional[str], repo_root: str, dst_bi
             picked = _select_llama_release_asset(local_assets, prefer_cuda=has_nv)
             if picked and picked.get("local_path"):
                 archive_path = str(picked["local_path"])
-                print(f" [*] [USB-РЕЖИМ] Встановлення llama-server з офлайн-архіву: {os.path.basename(archive_path)}...")
-                # Якщо обрано CUDA-збірку і поруч є cudart-llama-*.zip — розпаковуємо CUDA DLLs також
+                print(
+                    f" [*] [USB-MODE] Installing llama-server from offline archive: "
+                    f"{os.path.basename(archive_path)}..."
+                )
+                # If a CUDA build was chosen and a matching cudart-llama-*.zip is present, unpack CUDA DLLs too
                 if "cuda" in picked["name"].lower():
                     cudart = _select_cudart_asset(local_assets, picked["name"])
                     if cudart and cudart.get("local_path"):
-                        print(f" [*] [USB-РЕЖИМ] Розпакування CUDA DLLs: {cudart['name']}...")
+                        print(f" [*] [USB-MODE] Extracting CUDA runtime DLLs: {cudart['name']}...")
                         _extract_llama_archive(str(cudart["local_path"]), dst_bin_dir)
                 srv = _extract_llama_archive(archive_path, dst_bin_dir)
                 if srv:
-                    print(f" [✓] llama-server встановлено з USB у: {srv}")
+                    print(f" [OK] Installed llama-server from USB to: {srv}")
                     return srv
 
-        # 2. Якщо на Windows + NVIDIA і є готова папка win-cuda-pascal або llama-pascal-runtime на USB
+        # 2. On Windows, check for pre-extracted runtime directories (e.g., win-cuda-pascal or llama-pascal-runtime)
         if sys_name == "windows":
             for sub_name in ("win-cuda-pascal", "llama-pascal-runtime", "win-x64"):
                 sub_dir = os.path.join(bdir, sub_name)
                 if os.path.isdir(sub_dir) and os.path.isfile(os.path.join(sub_dir, "llama-server.exe")):
-                    print(f" [*] [USB-РЕЖИМ] Копіювання готового рантайму llama-server із {sub_dir}...")
+                    print(f" [*] [USB-MODE] Copying unpacked llama-server runtime from {sub_dir}...")
                     srv = _install_llama_from_directory(sub_dir, dst_bin_dir)
                     if srv:
-                        print(f" [✓] llama-server встановлено з USB у: {srv}")
+                        print(f" [OK] Installed llama-server from USB to: {srv}")
                         return srv
 
     if sys_name == "windows" and disc_path:
         pascal_usb = os.path.join(disc_path, "base", "llama-pascal-runtime")
         if os.path.isdir(pascal_usb) and os.path.isfile(os.path.join(pascal_usb, "llama-server.exe")):
-            print(f" [*] [USB-РЕЖИМ] Копіювання llama-pascal-runtime із {pascal_usb}...")
+            print(f" [*] [USB-MODE] Copying llama-pascal-runtime from {pascal_usb}...")
             srv = _install_llama_from_directory(pascal_usb, dst_bin_dir)
             if srv:
-                print(f" [✓] llama-server встановлено з USB у: {srv}")
+                print(f" [OK] Installed llama-server from USB to: {srv}")
                 return srv
 
     return None
 
 
 def _fetch_latest_llama_release_with_assets() -> dict:
-    """
-    Отримує останній реліз `ggml-org/llama.cpp` із бінарними асетами.
-    Якщо `/releases/latest` вказує на тег без бінарників (наприклад `v1.0.0` із `nightly-tag.txt`),
-    автоматично перевіряє список `/releases?per_page=10` і знаходить перший `b*` реліз із бінарними архівами.
+    """Fetch the latest `ggml-org/llama.cpp` GitHub release containing compatible binary assets.
+
+    If `/releases/latest` points to a tag without prebuilt binaries (e.g., a marker tag),
+    scans `/releases?per_page=10` to find the newest release containing matching archives.
+
+    Returns:
+        GitHub release JSON dictionary.
     """
     headers = {"User-Agent": "GVK-Private-AI-Updater/1.0", "Accept": "application/vnd.github+json"}
     ssl_ctx = _build_ssl_context()
@@ -1478,34 +1713,47 @@ def ensure_llama_server(
     download: bool = True,
     disc_path: Optional[str] = None,
 ) -> Optional[str]:
-    """Знаходить `llama-server` у кеші, встановлює з USB-носія (`bin/`) або скачує з GitHub Releases `ggml-org/llama.cpp`."""
+    """Ensure `llama-server` is available via cache, USB media (`bin/`), or GitHub Releases.
+
+    Args:
+        gvk_home: Base path for the GVK local cache directory.
+        repo_root: Repository root directory.
+        download: Allow downloading from `ggml-org/llama.cpp` Releases if not found locally.
+        disc_path: Optional mounted `GVK_VAULT` media path.
+
+    Returns:
+        Path to the `llama-server` executable, or None if unavailable and `download=False`.
+
+    Raises:
+        RuntimeError: If no compatible release asset is found or the archive lacks `llama-server`.
+    """
     paths = init_gvk_home(gvk_home)
     cached_bin = os.path.join(paths["bin"], _llama_server_names()[0])
     if os.path.isfile(cached_bin):
-        print(f" [OK] llama-server готовий у кеші: {cached_bin}")
+        print(f" [OK] llama-server ready in cache: {cached_bin}")
         return cached_bin
 
-    # Спроба встановити з USB-носія (або base/llama_bins) у ~/.gvk_ai/bin/
+    # Attempt offline installation from USB media (or repo base/llama_bins) into ~/.gvk_ai/bin/
     usb_installed = _try_install_llama_from_usb(disc_path, repo_root, paths["bin"])
     if usb_installed:
         return usb_installed
 
     existing = find_llama_server(paths["home"], repo_root, disc_path=disc_path)
     if existing:
-        print(f" [OK] llama-server готовий: {existing}")
+        print(f" [OK] llama-server ready: {existing}")
         return existing
 
     if not download:
-        print(" [!] llama-server не знайдено локально (завантаження вимкнено через --no-download).")
+        print(" [!] llama-server not found locally (download disabled via --no-download).")
         return None
 
-    print(" [*] Запит останнього релізу ggml-org/llama.cpp на GitHub...")
+    print(" [*] Querying latest ggml-org/llama.cpp release on GitHub...")
     release = _fetch_latest_llama_release_with_assets()
 
     asset = _select_llama_release_asset(release.get("assets") or [])
     if not asset:
         raise RuntimeError(
-            f"Не знайдено відповідної збірки llama.cpp для {platform.system()} / {platform.machine()}."
+            f"No compatible llama.cpp release build found for {platform.system()} / {platform.machine()}."
         )
 
     asset_name = asset["name"]
@@ -1515,8 +1763,8 @@ def ensure_llama_server(
         _download_with_resume(asset_url, archive_path, label=asset_name)
         bin_path = _extract_llama_archive(archive_path, paths["bin"])
         if not bin_path:
-            raise RuntimeError(f"У завантаженому архіві {asset_name} не знайдено llama-server!")
-        print(f" [✓] llama-server встановлено у: {bin_path}")
+            raise RuntimeError(f"llama-server executable not found inside downloaded archive {asset_name}!")
+        print(f" [OK] Installed llama-server to: {bin_path}")
         return bin_path
 
 
@@ -1527,29 +1775,40 @@ def ensure_embedding_model(
     gvk_home: str = DEFAULT_GVK_HOME,
     disc_path: Optional[str] = None,
 ) -> bool:
-    """
-    Перевіряє та прекешує ембедінг-модель RAG (`sentence-transformers`) у `.venv` або `~/.gvk_ai/embeddings/`,
-    щоб GUI не підвисав на холодному старті і працював в офлайні.
-    Якщо на USB-носії є `<disc_path>/embeddings/paraphrase-multilingual-MiniLM-L12-v2`, копіює її в кеш.
+    """Ensure the RAG `sentence-transformers` embedding model is cached for offline use.
+
+    Copies `<disc_path>/embeddings/paraphrase-multilingual-MiniLM-L12-v2` from USB
+    media when available, or pre-caches the model via `venv_python` so the GUI does
+    not stall on cold start.
+
+    Args:
+        venv_python: Path to the virtual environment Python interpreter, or None.
+        model_name: Hugging Face model identifier for `SentenceTransformer`.
+        download: Allow downloading the embedding model when not cached locally.
+        gvk_home: Base path for the GVK local cache directory.
+        disc_path: Optional mounted `GVK_VAULT` media path.
+
+    Returns:
+        True if the embedding model is ready in local cache, False otherwise.
     """
     paths = init_gvk_home(gvk_home)
     local_emb_dst = os.path.join(paths["embeddings"], DEFAULT_EMBEDDING_SHORT_NAME)
 
     if os.path.isdir(local_emb_dst) and os.path.isfile(os.path.join(local_emb_dst, "config.json")):
-        print(f" [OK] RAG-модель готова в локальному кеші: {local_emb_dst}")
+        print(f" [OK] RAG embedding model ready in local cache: {local_emb_dst}")
         return True
 
     if disc_path and os.path.isdir(disc_path):
         usb_emb_src = os.path.join(disc_path, "embeddings", DEFAULT_EMBEDDING_SHORT_NAME)
         if os.path.isdir(usb_emb_src) and os.path.isfile(os.path.join(usb_emb_src, "config.json")):
-            print(f" [*] [USB-РЕЖИМ] Копіювання RAG-моделі з носія: {usb_emb_src} -> {local_emb_dst}...")
+            print(f" [*] [USB-MODE] Copying RAG embedding model from media: {usb_emb_src} -> {local_emb_dst}...")
             for root, _, files in os.walk(usb_emb_src):
                 rel_dir = os.path.relpath(root, usb_emb_src)
                 target_sub = local_emb_dst if rel_dir == "." else os.path.join(local_emb_dst, rel_dir)
                 os.makedirs(target_sub, exist_ok=True)
                 for fname in files:
                     _copy_writable(os.path.join(root, fname), os.path.join(target_sub, fname))
-            print(f" [✓] RAG-модель скопійовано з USB у: {local_emb_dst}")
+            print(f" [OK] RAG embedding model copied from USB to: {local_emb_dst}")
             return True
 
     if not venv_python or not os.path.isfile(venv_python):
@@ -1575,17 +1834,17 @@ def ensure_embedding_model(
             timeout=60,
         )
         if res.returncode == 0:
-            print(f" [OK] RAG-модель кешована: {model_name}")
+            print(f" [OK] RAG embedding model cached: {model_name}")
             return True
     except Exception as exc:
-        print(f" [!] Не вдалося перевірити кеш RAG-моделі: {exc}")
+        print(f" [!] Failed to check RAG embedding model cache: {exc}")
         return False
 
     if not download:
-        print(" [!] RAG-модель не знайдено в кеші (завантаження вимкнено через --no-download).")
+        print(" [!] RAG embedding model not found in cache (download disabled via --no-download).")
         return False
 
-    print(f" [*] Прекешування RAG-моделі {model_name} (~470 МБ)...")
+    print(f" [*] Pre-caching RAG embedding model {model_name} (~470 MB)...")
     dl_code = (
         "import sys; "
         "from sentence_transformers import SentenceTransformer; "
@@ -1601,17 +1860,17 @@ def ensure_embedding_model(
             timeout=600,
         )
         if res_dl.returncode == 0:
-            print(f" [✓] RAG-модель успішно кешовано: {local_emb_dst}")
+            print(f" [OK] RAG embedding model cached successfully: {local_emb_dst}")
             return True
         err_tail = (res_dl.stderr or res_dl.stdout or "").strip().splitlines()[-3:]
-        print(f" [!] Не вдалося кешувати RAG-модель (офлайн?): {' | '.join(err_tail)}")
+        print(f" [!] Failed to cache RAG embedding model (offline?): {' | '.join(err_tail)}")
     except Exception as exc:
-        print(f" [!] Помилка кешування RAG-моделі: {exc}")
+        print(f" [!] Error caching RAG embedding model: {exc}")
     return False
 
 
 # =====================================================================
-# 7. ЗВЕДЕНІ КОМАНДИ: SYNC, STATUS, SELF-TEST
+# 7. HIGH-LEVEL COMMANDS: SYNC, STATUS, SELF-TEST
 # =====================================================================
 def run_sync(
     disc_path: Optional[str] = None,
@@ -1621,14 +1880,27 @@ def run_sync(
     skip_pip: bool = False,
     pull: bool = False,
 ) -> dict:
-    """Повний цикл синхронізації GVK Private AI (підтримує як DVD-режим, так і повний офлайн USB-режим)."""
+    """Run the full GVK Private AI sync pipeline (supports DVD and offline USB modes).
+
+    Args:
+        disc_path: Optional explicit path to mounted `GVK_VAULT` media.
+        gvk_home: Base path for the GVK local cache directory.
+        repo_root: Repository root directory.
+        download: Allow network downloads for base model, `llama-server`, and embeddings.
+        skip_pip: If True, skip `.venv` creation/recreation and `pip install`.
+        pull: If True and `<repo_root>/.git` exists, run `git pull --ff-only` first.
+
+    Returns:
+        Summary dictionary with cache paths, `.venv` state, media import results,
+        persona sync summary, and resolved runtime asset paths.
+    """
     print("====================================================================")
-    print(" [*] GVK Private AI — Синхронізація та перевірка оточення (updater)")
+    print(" [*] GVK Private AI - Environment Sync & Verification (updater)")
     print("====================================================================")
     paths = init_gvk_home(gvk_home)
 
     if pull and os.path.isdir(os.path.join(repo_root, ".git")):
-        print(" [*] Оновлення коду репозиторію (git pull --ff-only)...")
+        print(" [*] Updating repository code (git pull --ff-only)...")
         subprocess.run(["git", "-C", repo_root, "pull", "--ff-only"], check=False)
 
     venv_info = ensure_venv_and_requirements(paths["home"], repo_root, skip_pip=skip_pip)
@@ -1659,7 +1931,7 @@ def run_sync(
     )
 
     print("====================================================================")
-    print(f" [✓] Кеш GVK: {paths['home']} [Режим носія: {media_mode}]")
+    print(f" [OK] GVK cache: {paths['home']} [Media mode: {media_mode}]")
     print("====================================================================")
     return {
         "paths": paths,
@@ -1676,7 +1948,12 @@ def run_sync(
 
 
 def run_status(gvk_home: str = DEFAULT_GVK_HOME, repo_root: str = DEFAULT_REPO_ROOT) -> None:
-    """Виводить поточний статус кешу, активованих персонажів, моделі, режиму носія (DVD/USB) та .venv (read-only)."""
+    """Print read-only diagnostics for cache, `.venv`, activated personas, media mode, and models.
+
+    Args:
+        gvk_home: Base path for the GVK local cache directory.
+        repo_root: Repository root directory.
+    """
     paths = get_gvk_paths(gvk_home)
     home_exists = os.path.isdir(paths["home"])
     venv_dir = resolve_venv_dir(paths["home"], repo_root)
@@ -1692,23 +1969,23 @@ def run_status(gvk_home: str = DEFAULT_GVK_HOME, repo_root: str = DEFAULT_REPO_R
     llama_path = find_llama_server(paths["home"], repo_root, disc_path=disc)
 
     print("====================================================================")
-    print(" [*] GVK Private AI — Статус локального вузла")
+    print(" [*] GVK Private AI - Local Node Status")
     print("====================================================================")
-    print(f" Кеш GVK_HOME    : {paths['home']} ({'OK' if home_exists else 'ще не ініціалізовано'})")
-    print(f" Репозиторій     : {repo_root}")
+    print(f" GVK_HOME cache  : {paths['home']} ({'OK' if home_exists else 'not initialized yet'})")
+    print(f" Repository      : {repo_root}")
     print(f" Python .venv    : {venv_dir} ({tk_desc}, requirements: {req_status})")
-    print(f" Базова модель   : {base_path or 'НЕ ЗНАЙДЕНО'}")
-    print(f" llama-server    : {llama_path or 'НЕ ЗНАЙДЕНО'}")
+    print(f" Base model      : {base_path or 'NOT FOUND'}")
+    print(f" llama-server    : {llama_path or 'NOT FOUND'}")
     if disc:
         print(
-            f" Носій GVK_VAULT : {disc} [Режим: {media_info['mode']} | "
+            f" GVK_VAULT media : {disc} [Mode: {media_info['mode']} | "
             f"base_gguf={media_info['has_base_model']} | bins={media_info['has_llama_bins']}]"
         )
     else:
-        print(" Носій GVK_VAULT : Не вставлено")
-    print(f" Активовані ({len(registry)}):")
+        print(" GVK_VAULT media : Not mounted")
+    print(f" Activated ({len(registry)}):")
     if not registry:
-        print("   - (немає жодного активованого origin.sig)")
+        print("   - (no activated origin.sig entries yet)")
     else:
         for pid, meta in sorted(registry.items()):
             sig_ok = os.path.isfile(os.path.join(paths["registry"], f"{pid}.sig"))
@@ -1720,10 +1997,10 @@ def run_status(gvk_home: str = DEFAULT_GVK_HOME, repo_root: str = DEFAULT_REPO_R
 
 
 # =====================================================================
-# 8. АВТОМАТИЧНИЙ SELF-TEST (ПОВНІСТЮ ОФЛАЙН)
+# 8. OFFLINE SELF-TEST SUITE
 # =====================================================================
 def _make_fake_gvk1_container(path: str, payload: bytes, master_key: bytes) -> str:
-    """Формує валідний 36-байтний заголовок GVK1 із правильним HMAC Header Auth Tag."""
+    """Create a valid 36-byte `GVK1` container with an authenticated HMAC header tag."""
     os.makedirs(os.path.dirname(path), exist_ok=True)
     base_nonce = os.urandom(12)
     chunk_size = 64 * 1024 * 1024
@@ -1743,6 +2020,7 @@ def _write_test_persona_dir(
     master_key: bytes,
     seed: bytes,
 ) -> None:
+    """Populate a synthetic encrypted persona directory (`manifest.json` + `.enc` files) for tests."""
     adapter_sha = _make_fake_gvk1_container(
         os.path.join(target_dir, "adapter.gguf.enc"),
         b"ENC_ADAPTER_" + seed,
@@ -1765,8 +2043,9 @@ def _write_test_persona_dir(
 
 
 def run_self_test() -> None:
+    """Execute the standalone offline self-test suite covering all `updater.py` workflows."""
     print("====================================================================")
-    print(" [*] GVK Private AI — Офлайн Self-Test (updater.py)")
+    print(" [*] GVK Private AI - Offline Self-Test (updater.py)")
     print("====================================================================")
 
     with tempfile.TemporaryDirectory(prefix="gvk_updater_test_") as tmpdir:
@@ -1775,15 +2054,15 @@ def run_self_test() -> None:
         disc_dir = os.path.join(tmpdir, "GVK_VAULT_DVD")
         os.makedirs(repo_root, exist_ok=True)
 
-        # 1. Ініціалізація ~/.gvk_ai
-        print(" [1/6] Перевірка ініціалізації структури кешу ~/.gvk_ai...")
+        # 1. Initialize ~/.gvk_ai cache layout
+        print(" [1/6] Testing ~/.gvk_ai cache directory initialization...")
         paths = init_gvk_home(gvk_home)
         for key in ("base", "bin", "personas", "registry", "logs"):
-            assert os.path.isdir(paths[key]), f"Не створено папку {key}"
-        print("       [OK] Усі піддиректорії кешу створено.")
+            assert os.path.isdir(paths[key]), f"Directory not created: {key}"
+        print("       [OK] All cache subdirectories created.")
 
-        # 2. Верифікація та імпорт DVD + перевірка захисту від підробки
-        print(" [2/6] Перевірка імпорту DVD GVK_VAULT та криптографічної верифікації...")
+        # 2. Verify DVD import and anti-tampering protection
+        print(" [2/6] Testing GVK_VAULT DVD import and cryptographic verification...")
         master_key = hashlib.sha256(b"GVK_UPDATER_TEST_KEY_2026").digest()
         os.makedirs(os.path.join(disc_dir, "vault"), exist_ok=True)
         os.makedirs(os.path.join(disc_dir, "persona"), exist_ok=True)
@@ -1800,26 +2079,26 @@ def run_self_test() -> None:
         valid_sig = hmac.new(master_key, b"friend_1", hashlib.sha256).digest()
         bad_sig = bytes([valid_sig[0] ^ 0xFF]) + valid_sig[1:]
 
-        # Спочатку перевіряємо блокування підробленого origin.sig
+        # First confirm a forged origin.sig is rejected
         with open(os.path.join(disc_dir, "persona", "origin.sig"), "wb") as f:
             f.write(bad_sig)
         try:
             verify_and_import_disc(disc_path=disc_dir, gvk_home=gvk_home)
-            raise AssertionError("Підроблений origin.sig не заблоковано!")
+            raise AssertionError("Forged origin.sig was not rejected!")
         except ValueError:
             pass
 
-        # Записуємо валідний origin.sig та імпортуємо
+        # Write valid origin.sig and import
         with open(os.path.join(disc_dir, "persona", "origin.sig"), "wb") as f:
             f.write(valid_sig)
         res_disc = verify_and_import_disc(disc_path=disc_dir, gvk_home=gvk_home)
         assert res_disc["imported"] is True and res_disc["persona_id"] == "friend_1"
         assert os.path.isfile(os.path.join(paths["registry"], "friend_1.sig"))
         assert os.path.isfile(os.path.join(paths["personas"], "friend_1", "adapter.gguf.enc"))
-        print("       [OK] Валідний DVD імпортовано; підроблений origin.sig відхилено.")
+        print("       [OK] Valid DVD imported; forged origin.sig rejected.")
 
-        # 3. Incremental Unlock: оновлення friend_1 до v1.1.0 та блокування friend_2 без DVD
-        print(" [3/6] Перевірка Incremental Unlock (оновлення friend_1, блокування friend_2)...")
+        # 3. Incremental Unlock: update friend_1 to v1.1.0 and block unactivated friend_2
+        print(" [3/6] Testing Incremental Unlock (update friend_1, block friend_2)...")
         _write_test_persona_dir(
             os.path.join(repo_root, "personas_encrypted", "friend_1"),
             persona_id="friend_1",
@@ -1835,15 +2114,15 @@ def run_self_test() -> None:
             seed=b"friend2",
         )
         sync_res = sync_activated_personas(gvk_home=gvk_home, repo_root=repo_root, master_key=master_key)
-        assert sync_res["updated"] == ["friend_1"], f"Очікувалось оновлення friend_1: {sync_res}"
-        assert sync_res["skipped_unactivated"] == ["friend_2"], f"friend_2 мав бути заблокований: {sync_res}"
+        assert sync_res["updated"] == ["friend_1"], f"Expected friend_1 to update: {sync_res}"
+        assert sync_res["skipped_unactivated"] == ["friend_2"], f"Expected friend_2 to be skipped: {sync_res}"
         with open(os.path.join(paths["personas"], "friend_1", "manifest.json"), "r", encoding="utf-8") as f:
             assert json.load(f)["version"] == "1.1.0"
         assert not os.path.exists(os.path.join(paths["personas"], "friend_2"))
-        print("       [OK] friend_1 оновлено до v1.1.0; friend_2 без origin.sig проігноровано.")
+        print("       [OK] friend_1 updated to v1.1.0; unactivated friend_2 ignored.")
 
-        # 4. Локальний лінк та USB-копіювання базової моделі GGUF
-        print(" [4/6] Перевірка підхоплення локальної та USB базової моделі GGUF...")
+        # 4. Base GGUF model detection and USB copy
+        print(" [4/6] Testing local and USB base GGUF model discovery...")
         assert detect_media_mode(disc_dir)["mode"] == "DVD"
         usb_base_dir = os.path.join(disc_dir, "base")
         os.makedirs(usb_base_dir, exist_ok=True)
@@ -1854,10 +2133,10 @@ def run_self_test() -> None:
         base_out = ensure_base_model(gvk_home=gvk_home, repo_root=repo_root, download=False, disc_path=disc_dir)
         assert base_out == os.path.join(paths["base"], DEFAULT_BASE_MODEL_FILENAME)
         assert _is_valid_gguf_file(base_out) and os.path.getsize(base_out) == 2052
-        print(f"       [OK] Базову модель скопійовано з USB у кеш: {base_out}")
+        print(f"       [OK] Base model copied from USB to cache: {base_out}")
 
-        # 5. Пошук бінарника llama-server
-        print(" [5/6] Перевірка виявлення локального бінарника llama-server...")
+        # 5. llama-server binary discovery and release asset selection
+        print(" [5/6] Testing local llama-server binary discovery...")
         srv_name = _llama_server_names()[0]
         fake_srv = os.path.join(repo_root, "base", "llama-pascal-runtime", srv_name)
         os.makedirs(os.path.dirname(fake_srv), exist_ok=True)
@@ -1875,11 +2154,11 @@ def run_self_test() -> None:
         ]
         with patch("updater.platform.system", return_value="Windows"), patch("updater.platform.machine", return_value="AMD64"):
             picked = _select_llama_release_asset(win_assets)
-            assert picked and "vulkan" in picked["name"].lower(), f"Очікувався win-vulkan-x64: {picked}"
-        print(f"       [OK] Знайдено llama-server: {found_srv}")
+            assert picked and "vulkan" in picked["name"].lower(), f"Expected win-vulkan-x64: {picked}"
+        print(f"       [OK] Found llama-server: {found_srv}")
 
-        # 6. Перевірка маркера requirements.txt + .venv
-        print(" [6/6] Перевірка детектора змін requirements.txt для .venv...")
+        # 6. requirements.txt SHA-256 marker and .venv probe
+        print(" [6/6] Testing requirements.txt change detector for .venv...")
         fake_venv = os.path.join(repo_root, ".venv")
         fake_py = _venv_python_path(fake_venv)
         os.makedirs(os.path.dirname(fake_py), exist_ok=True)
@@ -1903,42 +2182,43 @@ def run_self_test() -> None:
         assert os.path.isfile(best_py)
         ok_tk, tk_v, py_v = _probe_python_tk(best_py)
         print(
-            f"       [OK] Детектор SHA-256 requirements.txt OK; обраний Python={py_v[0]}.{py_v[1]}, "
+            f"       [OK] requirements.txt SHA-256 detector OK; selected Python={py_v[0]}.{py_v[1]}, "
             f"Tk={tk_v if ok_tk else 'MISSING'}."
         )
 
     print("====================================================================")
-    print(" [✓] УСІ ТЕСТИ UPDATER.PY ПРОЙДЕНО УСПІШНО!")
+    print(" [OK] ALL UPDATER.PY SELF-TESTS PASSED!")
     print("====================================================================")
 
 
 # =====================================================================
-# CLI ІНТЕРФЕЙС
+# CLI INTERFACE
 # =====================================================================
 def main(argv: Optional[List[str]] = None) -> None:
+    """Parse CLI arguments and dispatch to `sync`, `status`, or `self-test`."""
     raw_argv = list(sys.argv[1:] if argv is None else argv)
     known_cmds = {"sync", "status", "self-test"}
     if not raw_argv or (raw_argv[0] not in known_cmds and raw_argv[0] not in ("-h", "--help")):
         raw_argv = ["sync"] + raw_argv
 
     parser = argparse.ArgumentParser(
-        description="GVK Private AI — Клієнт перевірки DVD, requirements.txt, базової моделі та оновлень"
+        description="GVK Private AI - Media Verification, Dependency Sync & Runtime Asset Updater"
     )
     sub = parser.add_subparsers(dest="cmd", required=True)
 
-    p_sync = sub.add_parser("sync", help="Перевірити .venv, імпортувати DVD та синхронізувати кеш")
-    p_sync.add_argument("--disc-path", default=None, help="Явний шлях до змонтованого DVD GVK_VAULT")
-    p_sync.add_argument("--gvk-home", default=DEFAULT_GVK_HOME, help="Шлях до кешу ~/.gvk_ai")
-    p_sync.add_argument("--repo-root", default=DEFAULT_REPO_ROOT, help="Шлях до кореня репозиторію")
-    p_sync.add_argument("--no-download", action="store_true", help="Не докачувати базову модель і llama-server з мережі")
-    p_sync.add_argument("--skip-pip", action="store_true", help="Пропустити перевірку/встановлення pip")
-    p_sync.add_argument("--pull", action="store_true", help="Оновити репозиторій через git pull перед синхронізацією")
+    p_sync = sub.add_parser("sync", help="Verify .venv, import GVK_VAULT media, and sync local cache")
+    p_sync.add_argument("--disc-path", default=None, help="Explicit path to mounted GVK_VAULT media")
+    p_sync.add_argument("--gvk-home", default=DEFAULT_GVK_HOME, help="Path to local ~/.gvk_ai cache directory")
+    p_sync.add_argument("--repo-root", default=DEFAULT_REPO_ROOT, help="Path to the repository root")
+    p_sync.add_argument("--no-download", action="store_true", help="Do not download base model or llama-server from the network")
+    p_sync.add_argument("--skip-pip", action="store_true", help="Skip .venv creation/verification and pip install")
+    p_sync.add_argument("--pull", action="store_true", help="Update the repository via git pull before syncing")
 
-    p_status = sub.add_parser("status", help="Показати статус кешу ~/.gvk_ai та активованих персонажів")
-    p_status.add_argument("--gvk-home", default=DEFAULT_GVK_HOME, help="Шлях до кешу ~/.gvk_ai")
-    p_status.add_argument("--repo-root", default=DEFAULT_REPO_ROOT, help="Шлях до кореня репозиторію")
+    p_status = sub.add_parser("status", help="Display ~/.gvk_ai cache status and activated personas")
+    p_status.add_argument("--gvk-home", default=DEFAULT_GVK_HOME, help="Path to local ~/.gvk_ai cache directory")
+    p_status.add_argument("--repo-root", default=DEFAULT_REPO_ROOT, help="Path to the repository root")
 
-    sub.add_parser("self-test", help="Запустити автономний офлайн self-test усіх функцій updater.py")
+    sub.add_parser("self-test", help="Run the standalone offline self-test suite for updater.py")
 
     args = parser.parse_args(raw_argv)
 

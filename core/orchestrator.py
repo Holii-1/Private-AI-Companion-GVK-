@@ -1,17 +1,23 @@
 #!/usr/bin/env python3
 """
-GVK Private AI — Оркестратор сесії та контексту (core/orchestrator.py)
+GVK Private AI - Session and Context Orchestrator (core/orchestrator.py)
 
-Відповідає за:
-  1. Універсальне визначення шляхів (RAM-диск -> локальна папка розробки `personas/` -> кеш `~/.gvk_ai`).
-  2. Завантаження `persona_config.json`, `prompt.txt`, портретів (`portraits/*.txt`) та `memory.faiss`.
-  3. Динамічну побудову системного промпту:
-     - Базовий текст із `prompt.txt`
-     - Сьогоднішня дата (`DD.MM.YYYY`) та точний вік персонажа на основі `birth_date` із `persona_config.json`
-     - Ін'єкція співрозмовника (`Собеседник в этом диалоге: ...` або `Ты сейчас в групе с: ...`):
-       * Для основної колонки (`experimental=False`): повний опис зі словника `interlocutor_descriptions`.
-       * Для експериментальних колонок (`experimental=True`): лише ім'я російською зі словника `ua_to_ru_names`.
-  4. Збереження історії попередніх повідомлень діалогу та взаємодію з `llama-server`.
+Manages persona runtime path resolution, dynamic system prompt assembly,
+bounded conversation history, ephemeral RAG memory injection, skill dispatch,
+and `llama-server` lifecycle management.
+
+Key Responsibilities:
+  - Resolve runtime paths across RAM disk, local `personas/` repository, and
+    the `~/.gvk_ai` cache (`persona_config.json`, `prompt.txt`, ASCII portraits,
+    `memory.faiss`, LoRA adapter, base model, and `llama-server`).
+  - Build dynamic system prompts combining base persona instructions, current
+    date and calculated age, interlocutor/group framing, and available skills.
+  - Maintain conversation history, retrieve relevant RAG memories over a
+    two-turn query window, arbitrate multi-bot cross-talk, and log chat turns.
+
+Usage:
+  python3 core/orchestrator.py self-test
+  python3 core/orchestrator.py --help
 """
 
 import datetime
@@ -49,7 +55,7 @@ DEFAULT_RAG_HEADER = (
 )
 _GROUP_PREFIX_RE = re.compile(r"^\[[^\]]+\]:\s*")
 
-# Резервний словник перекладу імен UA -> RU та описів (знеособлені заглушки без roster.json/persona_config.json)
+# Fallback UA -> RU name mapping and descriptions (anonymized placeholders without roster.json/persona_config.json)
 DEFAULT_UA_TO_RU_NAMES: Dict[str, str] = {
     "Друг 1": "Друг 1",
     **{f"Учасник {idx:02d}": f"Участник {idx:02d}" for idx in range(1, 17)},
@@ -65,9 +71,20 @@ def load_roster_mappings(
     gvk_home: str = DEFAULT_GVK_HOME,
     persona_dir: Optional[str] = None,
 ) -> Tuple[Dict[str, str], Dict[str, str], Optional[str]]:
-    """
-    Завантажує відповідності імен/описів із єдиного git-ignored `roster.json`
-    через `core.roster` (RAM-диск -> локальний `personas/roster.json` -> `~/.gvk_ai`).
+    """Load interlocutor name and description mappings from the git-ignored `roster.json`.
+
+    Searches via `core.roster` in priority order: RAM disk -> local
+    `personas/roster.json` -> `~/.gvk_ai`.
+
+    Args:
+        persona_id: Target persona identifier.
+        ram_root: Optional mounted RAM-disk workspace root.
+        repo_root: Local repository root directory.
+        gvk_home: User cache root directory (`~/.gvk_ai`).
+        persona_dir: Optional resolved persona directory.
+
+    Returns:
+        Tuple of `(ua_to_ru_names, interlocutor_descriptions, default_user_name_ua)`.
     """
     roster = load_roster_data(
         ram_root=ram_root,
@@ -92,10 +109,10 @@ DEFAULT_WARMUP_QUESTIONS: List[str] = [
 
 
 # =====================================================================
-# ДОПОМІЖНІ ФУНКЦІЇ ДАТИ, ВІКУ ТА ШЛЯХІВ
+# DATE, AGE, AND PATH UTILITIES
 # =====================================================================
 def calculate_age(birth_date_str: str, today: Optional[datetime.date] = None) -> int:
-    """Обчислює повну кількість років на дату `today` із рядка формату `DD.MM.YYYY`."""
+    """Calculate completed age in years as of `today` from a `DD.MM.YYYY` date string."""
     if today is None:
         today = datetime.date.today()
     day_s, month_s, year_s = birth_date_str.strip().split(".")
@@ -105,7 +122,7 @@ def calculate_age(birth_date_str: str, today: Optional[datetime.date] = None) ->
 
 
 def russian_age_unit(age: int) -> str:
-    """Повертає правильне узгодження ('год', 'года', 'лет') для числівника віку."""
+    """Return the Russian grammatical age unit (`год`, `года`, or `лет`) for `age`."""
     rem100 = age % 100
     if 11 <= rem100 <= 19:
         return "лет"
@@ -118,7 +135,7 @@ def russian_age_unit(age: int) -> str:
 
 
 def ukrainian_age_unit(age: int) -> str:
-    """Повертає правильне узгодження ('рік', 'роки', 'років') для українського UI."""
+    """Return the Ukrainian grammatical age unit (`рік`, `роки`, or `років`) for UI display."""
     rem100 = age % 100
     if 11 <= rem100 <= 19:
         return "років"
@@ -137,17 +154,28 @@ def resolve_runtime_paths(
     gvk_home: str = DEFAULT_GVK_HOME,
     disc_path: Optional[str] = None,
 ) -> Dict[str, Optional[str]]:
-    """
-    Уніфіковано знаходить шляхи як у режимі розробки (локальний репозиторій),
-    так і в продакшні (`~/.gvk_ai` + RAM-диск + DVD/USB носій):
-      - `persona_dir`: директорія з `persona_config.json`, `prompt.txt`, `portraits/`, `memory.faiss`
-      - `adapter_path`: шлях до `<persona_id>.gguf`
-      - `base_model_path`: шлях до `Qwen2.5-14B-Instruct-Q4_K_M.gguf`
-      - `llama_server_path`: шлях до бінарника `llama-server`
+    """Resolve runtime paths across development and production layouts.
+
+    Searches RAM disk, local repository, `~/.gvk_ai`, and optional DVD/USB media for:
+      - `persona_dir`: directory containing `persona_config.json`, `prompt.txt`,
+        `portraits/`, and `memory.faiss`.
+      - `adapter_path`: path to `<persona_id>.gguf` LoRA adapter.
+      - `base_model_path`: path to the base GGUF model (`Qwen2.5-14B-Instruct-Q4_K_M.gguf`).
+      - `llama_server_path`: path to the `llama-server` executable.
+
+    Args:
+        persona_id: Identifier of the persona to resolve.
+        ram_root: Optional decrypted RAM-disk root path.
+        repo_root: Local repository root directory.
+        gvk_home: User cache directory (`~/.gvk_ai`).
+        disc_path: Optional mounted DVD/USB vault path.
+
+    Returns:
+        Dictionary mapping asset keys to resolved absolute paths (or `None`).
     """
     gvk_home_abs = os.path.abspath(os.path.expanduser(gvk_home))
 
-    # 1. Директорія персонажа (RAM -> локальне репо personas/<id> -> ~/.gvk_ai/personas/<id>)
+    # 1. Persona directory (RAM -> local repo personas/<id> -> ~/.gvk_ai/personas/<id>)
     persona_candidates: List[str] = []
     if ram_root:
         persona_candidates.append(os.path.join(ram_root, "personas", persona_id))
@@ -160,7 +188,7 @@ def resolve_runtime_paths(
             persona_dir = os.path.abspath(cand)
             break
 
-    # 2. Шлях до LoRA-адаптера (RAM -> adapters/<id>.gguf -> persona_config files.adapter -> локальні файли)
+    # 2. LoRA adapter path (RAM -> adapters/<id>.gguf -> persona_config files.adapter -> local files)
     cfg_adapter_name: Optional[str] = None
     if persona_dir:
         cfg_path = os.path.join(persona_dir, "persona_config.json")
@@ -210,18 +238,15 @@ def resolve_runtime_paths(
         "base_model_path": base_model_path,
         "llama_server_path": llama_server_path,
     }
-    logger.info("Визначено рантайм-шляхи для '%s': %s", persona_id, json.dumps(resolved, ensure_ascii=False))
+    logger.info("Resolved runtime paths for '%s': %s", persona_id, json.dumps(resolved, ensure_ascii=False))
     return resolved
 
 
 # =====================================================================
-# КЛАС ОРКЕСТРАТОРА (GVKOrchestrator)
+# ORCHESTRATOR CLASS (GVKOrchestrator)
 # =====================================================================
 class GVKOrchestrator:
-    """
-    Керує контекстом бесіди, системним промптом, історії повідомлень
-    та викликами `llama-server` для обраного персонажа.
-    """
+    """Manage conversation context, system prompt assembly, RAG injection, and `llama-server` calls."""
 
     def __init__(
         self,
@@ -231,6 +256,18 @@ class GVKOrchestrator:
         gvk_home: str = DEFAULT_GVK_HOME,
         vault: Optional[Any] = None,
     ) -> None:
+        """Initialize the orchestrator for a given persona.
+
+        Args:
+            persona_id: Identifier of the active persona.
+            ram_root: Optional decrypted RAM-disk root path.
+            repo_root: Local repository root directory.
+            gvk_home: User cache directory (`~/.gvk_ai`).
+            vault: Optional `GVKVault` instance for kill-switch process tracking.
+
+        Raises:
+            FileNotFoundError: If the persona directory or `prompt.txt` cannot be found.
+        """
         self.persona_id = persona_id
         self.ram_root = ram_root
         self.repo_root = repo_root
@@ -247,7 +284,7 @@ class GVKOrchestrator:
         )
         self.persona_dir = self.paths["persona_dir"]
         if not self.persona_dir:
-            raise FileNotFoundError(f"Не знайдено директорію персонажа для '{persona_id}'.")
+            raise FileNotFoundError(f"Persona directory not found for '{persona_id}'.")
 
         self.config = self._load_persona_config()
         self.base_prompt = self._load_prompt_txt()
@@ -270,33 +307,34 @@ class GVKOrchestrator:
         self._roster_descriptions: Dict[str, str] = roster_descriptions
         self._staged_runtime_files: List[str] = []
 
-        # Поточний стан сесії користувача
+        # Active user session state
         self.user_id: int = 2
         self.user_name_ua: str = roster_default_user or "Учасник 02"
         self.is_experimental_user: bool = False
         self.chat_mode: str = "personal"  # "personal" | "group"
         self.group_members_ua: List[str] = []
 
-        # Історія попередніх повідомлень у поточній розмові: [{"role": "user"|"assistant", "content": "..."}]
+        # Conversation history for the current chat: [{"role": "user"|"assistant", "content": "..."}]
         self.history: List[Dict[str, str]] = []
 
-        # Підпроцес llama-server (якщо запущений оркестратором)
+        # Managed llama-server subprocess (when launched by the orchestrator)
         self._server_proc: Optional[subprocess.Popen] = None
         self._server_lock = threading.Lock()
         self._history_generation: int = 0
 
     # -----------------------------------------------------------------
-    # ЗАВАНТАЖЕННЯ КОНФІГУ, ПРОМПТУ ТА ПОРТРЕТІВ
+    # CONFIG, PROMPT, AND PORTRAIT LOADING
     # -----------------------------------------------------------------
     def _load_persona_config(self) -> Dict[str, Any]:
+        """Load `persona_config.json` from `self.persona_dir`, or return defaults."""
         cfg_path = os.path.join(self.persona_dir or "", "persona_config.json")
         if not os.path.isfile(cfg_path):
-            logger.warning("Файл persona_config.json не знайдено (%s), використовуються значення за замовчуванням.", cfg_path)
+            logger.warning("persona_config.json not found (%s); using default settings.", cfg_path)
             return {}
         with open(cfg_path, "r", encoding="utf-8") as f:
             data = json.load(f)
         logger.info(
-            "Завантажено persona_config.json для '%s' (%s, колір=%s, станів емоцій=%d)",
+            "Loaded persona_config.json for '%s' (%s, color=%s, emotional_states=%d)",
             data.get("persona_id", self.persona_id),
             data.get("display_name", ""),
             data.get("color", ""),
@@ -305,20 +343,22 @@ class GVKOrchestrator:
         return data
 
     def _load_prompt_txt(self) -> str:
+        """Load the base system prompt text from the persona directory."""
         prompt_rel = (self.config.get("files") or {}).get("prompt", "prompt.txt")
         prompt_path = os.path.join(self.persona_dir or "", prompt_rel)
         if not os.path.isfile(prompt_path):
-            raise FileNotFoundError(f"Системний промпт не знайдено: {prompt_path}")
+            raise FileNotFoundError(f"System prompt not found: {prompt_path}")
         with open(prompt_path, "r", encoding="utf-8") as f:
             text = f.read().strip()
-        logger.info("Завантажено prompt.txt (%d символів) із %s", len(text), prompt_path)
+        logger.info("Loaded prompt.txt (%d chars) from %s", len(text), prompt_path)
         return text
 
     def _load_rag_memory(self) -> Optional[MemoryRAG]:
+        """Load or auto-build the persona's FAISS/GVKRAG memory index."""
         rag_rel = (self.config.get("files") or {}).get("rag_index", "memory.faiss")
         rag_path = os.path.join(self.persona_dir or "", rag_rel)
 
-        # Якщо у корені data/memory.faiss є свіжіший індекс або в persona_dir немає memory.faiss — підхоплюємо / збираємо
+        # Pick up a newer data/memory.faiss index or auto-compile from memories.txt if missing
         data_faiss = os.path.join(self.repo_root, "data", "memory.faiss")
         data_txt = os.path.join(self.repo_root, "data", "memories.txt")
         persona_txt = os.path.join(self.persona_dir or "", "memories.txt")
@@ -334,17 +374,17 @@ class GVKOrchestrator:
                     build_rag_index(src_txt, rag_path, backend="ngram")
                     chosen_path = rag_path
                 except Exception as exc:
-                    logger.warning("Не вдалося автоматично зібрати memory.faiss із %s: %s", src_txt, exc)
+                    logger.warning("Failed to auto-build memory.faiss from %s: %s", src_txt, exc)
 
         if not chosen_path or not os.path.isfile(chosen_path):
-            logger.warning("Файл індексу RAG не знайдено (%s), сесія без векторної пам'яті.", rag_path)
+            logger.warning("RAG index file not found (%s); running session without vector memory.", rag_path)
             return None
 
         try:
             register_persona_lexicon(self.config.get("rag_lexicon"))
             rag = MemoryRAG(chosen_path)
             logger.info(
-                "Завантажено RAG-пам'ять (%d спогадів, dim=%d, backend=%s) із %s",
+                "Loaded RAG memory (%d memories, dim=%d, backend=%s) from %s",
                 len(rag.memories),
                 rag.dimension,
                 rag.index_backend,
@@ -352,21 +392,21 @@ class GVKOrchestrator:
             )
             return rag
         except Exception as exc:
-            logger.warning("Не вдалося завантажити RAG-пам'ять із %s: %s", chosen_path, exc)
+            logger.warning("Failed to load RAG memory from %s: %s", chosen_path, exc)
             return None
 
     def get_rag_status(self) -> str:
-        """Повертає компактний рядок стану векторної пам'яті для досьє / логів."""
+        """Return a compact localized vector-memory status string for UI dossier display."""
         if self.rag is None:
             return "пам'ять не підключена [IDLE]"
         backend_short = "ST" if self.rag.index_backend == "sentence-transformers" else self.rag.index_backend
         return f"{len(self.rag.memories)} спогадів [{backend_short}] [OK]"
 
     def get_portrait_text(self, emotion: str = "idle") -> str:
-        """
-        Повертає вміст ASCII-портрета для заданої емоції (`idle`, `sleeping`, `smiling`, `talking`).
-        Якщо для однієї емоції задано декілька `.txt` файлів (наприклад `talking.txt`, `talking2.txt`),
-        обирає один із них.
+        """Return ASCII portrait art for the requested emotion (`idle`, `sleeping`, `smiling`, `talking`).
+
+        When multiple frames are configured for a single emotion (for example
+        `talking.txt` and `talking2.txt`), selects one at random.
         """
         sprites_map = self.config.get("emotion_sprites") or {}
         candidates = sprites_map.get(emotion) or [f"{emotion}.txt"]
@@ -393,10 +433,7 @@ class GVKOrchestrator:
             return f.read().rstrip("\n")
 
     def get_all_portraits(self) -> Dict[str, List[str]]:
-        """
-        Попередньо завантажує всі ASCII-портрети для кожної емоції з `emotion_sprites`
-        (наприклад `idle`, `sleeping`, `smiling`, `talking`: [`talking.txt`, `talking2.txt`]).
-        """
+        """Preload all ASCII portrait frames mapped by emotion from `emotion_sprites`."""
         sprites_map = self.config.get("emotion_sprites") or {}
         portraits_rel = (self.config.get("files") or {}).get("portraits_dir", "portraits")
         portraits_dir = os.path.join(self.persona_dir or "", portraits_rel)
@@ -418,7 +455,7 @@ class GVKOrchestrator:
         return loaded
 
     def get_genitive_name(self) -> str:
-        """Повертає ім'я персонажа в родовому відмінку (для 'Завантажуємо ...')."""
+        """Return the persona name in genitive case for loading screen copy."""
         return str(
             self.config.get("display_name_genitive")
             or self.config.get("genitive_name")
@@ -427,21 +464,21 @@ class GVKOrchestrator:
         )
 
     def get_loading_tips(self) -> List[str]:
-        """Повертає список порад для екрана завантаження персонажа."""
+        """Return the list of loading-screen tips configured for the persona."""
         tips = self.config.get("loading_tips")
         if isinstance(tips, list) and tips:
             return [str(t) for t in tips if str(t).strip()]
         return ["loading tip 1", "loading tip 2", "loading tip 3"]
 
     def get_warmup_questions(self) -> List[str]:
-        """Повертає 2 російськомовні фонові питання для прогріву моделі."""
+        """Return two background Russian warmup prompts used to prime the model."""
         questions = self.config.get("warmup_questions")
         if isinstance(questions, list) and len(questions) >= 2:
             return [str(q) for q in questions[:2]]
         return list(DEFAULT_WARMUP_QUESTIONS)
 
     # -----------------------------------------------------------------
-    # КОНФІГУРАЦІЯ КОРИСТУВАЧА ТА ПОБУДОВА СИСТЕМНОГО ПРОМПТУ
+    # USER CONFIGURATION AND SYSTEM PROMPT ASSEMBLY
     # -----------------------------------------------------------------
     def set_interlocutor(
         self,
@@ -451,7 +488,7 @@ class GVKOrchestrator:
         chat_mode: str = "personal",
         reset_history: bool = True,
     ) -> None:
-        """Зберігає вибраного у `menu.py` користувача та оновлює системний промпт."""
+        """Set the active user chosen in `menu.py` and recompile the system prompt."""
         self.user_id = user_id
         self.user_name_ua = user_name_ua.strip()
         self.is_experimental_user = bool(is_experimental)
@@ -460,7 +497,7 @@ class GVKOrchestrator:
             self.clear_history(log_event=False)
 
         logger.info(
-            "Встановлено співрозмовника: id=%d, name='%s', experimental=%s, mode='%s'",
+            "Interlocutor set: id=%d, name='%s', experimental=%s, mode='%s'",
             self.user_id,
             self.user_name_ua,
             self.is_experimental_user,
@@ -468,25 +505,25 @@ class GVKOrchestrator:
         )
         compiled_prompt = self.build_system_prompt()
         logger.info(
-            "Зібраний системний промпт готовий (%d символів, mode=%s).",
+            "Compiled system prompt ready (%d chars, mode=%s).",
             len(compiled_prompt),
             self.chat_mode,
         )
 
     def clear_history(self, log_event: bool = True) -> None:
-        """Очищає історію поточної розмови та скидає стан RAG (для CTRL+N = Новий чат)."""
+        """Clear current conversation history and reset RAG hits (triggered by CTRL+N)."""
         self._history_generation += 1
         self.history.clear()
         self.last_rag_hits = []
         if log_event:
             logger.info(
-                "Розпочато новий чат для '%s' (історію очищено, gen=%d).",
+                "Started new chat for '%s' (history cleared, gen=%d).",
                 self.persona_id,
                 self._history_generation,
             )
 
     def translate_name_to_ru(self, name_ua: str) -> str:
-        """Перекладає українське ім'я на російську за словником `ua_to_ru_names`."""
+        """Translate a Ukrainian participant name to Russian via `ua_to_ru_names`."""
         ua_map: Dict[str, str] = {
             **DEFAULT_UA_TO_RU_NAMES,
             **self._roster_ua_to_ru,
@@ -500,12 +537,11 @@ class GVKOrchestrator:
         user_name_ua: Optional[str] = None,
         is_experimental: Optional[bool] = None,
     ) -> str:
-        """
-        Формує опис співрозмовника:
-          - Якщо користувач із основної колонки (`is_experimental=False`):
-            повертає повний опис зі словника `interlocutor_descriptions`.
-          - Якщо користувач із експериментальних колонок (`is_experimental=True`):
-            повертає лише перекладене на російську ім'я.
+        """Resolve the interlocutor framing text injected into the system prompt.
+
+        For main-column users (`is_experimental=False`), returns the full description
+        from `interlocutor_descriptions`; for experimental-column users
+        (`is_experimental=True`), returns only the Russian name.
         """
         name = (user_name_ua if user_name_ua is not None else self.user_name_ua).strip()
         exp = self.is_experimental_user if is_experimental is None else bool(is_experimental)
@@ -522,11 +558,19 @@ class GVKOrchestrator:
         return desc_map.get(name) or desc_map.get(ru_name) or ru_name
 
     def build_system_prompt(self, today: Optional[datetime.date] = None) -> str:
-        """
-        Збирає повний системний промпт:
-          1. Текст із `prompt.txt`
-          2. `Сегодняшняя дата: DD.MM.YYYY, тебе <age> <год/года/лет>.`
-          3. `Собеседник в этом диалоге: <опис або ім'я>.` (або `Ты сейчас в групе с: ...` для групового режиму)
+        """Assemble the full system prompt with date, age, interlocutor framing, and skills.
+
+        Combines:
+          1. Base text from `prompt.txt`.
+          2. Current date (`DD.MM.YYYY`) and computed persona age.
+          3. Personal interlocutor or group participant framing.
+          4. Active skill declarations when `SkillRunner` is available.
+
+        Args:
+            today: Optional date override used for deterministic age calculation.
+
+        Returns:
+            Compiled system prompt string ready for ChatML injection.
         """
         if today is None:
             today = datetime.date.today()
@@ -564,10 +608,10 @@ class GVKOrchestrator:
         return compiled
 
     def build_rag_query(self, new_user_message: str) -> str:
-        """
-        Формує 2-крокове вікно запиту до RAG:
-        поєднує попередню репліку користувача з `self.history` та поточне повідомлення,
-        щоб уточнюючі питання («а хто ще там був?») зберігали контекст теми.
+        """Build a two-turn RAG query window combining the previous and current user turns.
+
+        Preserves topic continuity for follow-up questions while stripping group
+        sender prefixes.
         """
         cleaned_new = _GROUP_PREFIX_RE.sub("", (new_user_message or "").strip()).strip()
         if not cleaned_new:
@@ -591,11 +635,18 @@ class GVKOrchestrator:
         top_k: int = DEFAULT_RAG_TOP_K,
         threshold: Optional[float] = None,
     ) -> str:
-        """
-        Виконує пошук релевантних спогадів для поточного повідомлення з урахуванням
-        2-крокового вікна діалогу. Спочатку бере прямі збіги за поточним повідомленням,
-        а за наявності вільних слотів доповнює збігами за комбінованим 2-кроковим запитом.
-        Повертає готовий текстовий блок для ефемерної ін'єкції або порожній рядок.
+        """Retrieve relevant memories for the current turn using direct and two-turn search.
+
+        Prioritizes direct matches for `new_user_message`, boosts hits confirmed by
+        the two-turn query window, and formats the result for ephemeral injection.
+
+        Args:
+            new_user_message: Latest user message text.
+            top_k: Maximum number of memory hits to include.
+            threshold: Optional relevance score threshold override.
+
+        Returns:
+            Formatted RAG prompt block, or `""` when no memories qualify.
         """
         if self.rag is None or not new_user_message or not new_user_message.strip() or top_k <= 0:
             self.last_rag_hits = []
@@ -625,11 +676,11 @@ class GVKOrchestrator:
                 if discounted_score < eff_thresh:
                     continue
                 if key in merged:
-                    # Посилюємо спогад, який одночасно збігається і з поточним питанням, і з попереднім ходом
+                    # Boost a memory that matches both the current question and the prior turn
                     boosted = max(float(merged[key]["score"]), discounted_score) + 0.10
                     merged[key]["score"] = round(boosted, 4)
                 elif top_direct_score < 0.90:
-                    # Доповнюємо контекстом попереднього ходу лише якщо поточне повідомлення не має сильного прямого збігу
+                    # Supplement with prior-turn context only if the current message lacks a strong direct hit
                     cand = dict(wh)
                     cand["score"] = discounted_score
                     merged[key] = cand
@@ -652,7 +703,7 @@ class GVKOrchestrator:
             lines.append(f"- {hit['text']}")
 
         logger.info(
-            "RAG ін'єкція (%d спогадів для запиту '%s'): %s",
+            "RAG injection (%d memories for query '%s'): %s",
             len(hits),
             window_query,
             ", ".join(f"{h.get('memory_id')}({h.get('score')})" for h in hits),
@@ -665,12 +716,19 @@ class GVKOrchestrator:
         today: Optional[datetime.date] = None,
         include_rag: bool = True,
     ) -> List[Dict[str, str]]:
-        """
-        Формує масив ChatML-повідомлень для `llama-server`:
-          - `system`: базовий статичний системний промпт
-          - уся попередня історія повідомлень у розмові (`self.history`, без RAG-блоків)
-          - ефемерний `system`-блок зі спогадами RAG для поточного ходу (якщо знайдено збіги)
-          - нове повідомлення користувача (якщо передано)
+        """Construct the ChatML messages payload for `llama-server`.
+
+        Includes the static system prompt, bounded recent history (`self.history`
+        without persisted RAG blocks), an ephemeral RAG `system` block for the
+        active turn if memories match, and the formatted user message.
+
+        Args:
+            new_user_message: Optional new user message to append.
+            today: Optional date override for system prompt generation.
+            include_rag: Whether to perform RAG retrieval for `new_user_message`.
+
+        Returns:
+            List of `{"role": ..., "content": ...}` message dictionaries.
         """
         messages: List[Dict[str, str]] = [
             {"role": "system", "content": self.build_system_prompt(today=today)}
@@ -690,12 +748,14 @@ class GVKOrchestrator:
         return messages
 
     # -----------------------------------------------------------------
-    # ЗАПУСК ТА ВЗАЄМОДІЯ З LLAMA-SERVER
+    # LLAMA-SERVER LIFECYCLE AND INFERENCE
     # -----------------------------------------------------------------
     def _format_lora_path_for_cli(self, adapter_path: str) -> str:
-        """
-        Форматує шлях до LoRA-адаптера без двокрапки диска Windows (`D:`),
-        оскільки `--lora-scaled FNAME:SCALE` у `llama-server` розбиває аргумент за `:`.
+        """Format a LoRA path without Windows drive colons (`D:`) for `--lora-scaled`.
+
+        `llama-server` splits `--lora-scaled FNAME:SCALE` on `:`, so paths on
+        another drive are converted to repo-relative paths or staged into
+        `adapters/_runtime/`.
         """
         if not adapter_path:
             return ""
@@ -724,13 +784,13 @@ class GVKOrchestrator:
             return os.path.join("adapters", "_runtime", os.path.basename(adapter_path))
 
         logger.warning(
-            "LoRA-шлях містить ':' (%s), неможливо звести до відносного шляху.",
+            "LoRA path contains ':' (%s) and could not be converted to a relative path.",
             adapter_path,
         )
         return adapter_path
 
     def get_llama_server_command(self) -> List[str]:
-        """Повертає CLI-команду для запуску `llama-server` із параметрами `persona_config.json` (без `-ngl`)."""
+        """Build the `llama-server` CLI argument list from `persona_config.json` (without `-ngl`)."""
         server_bin = self.paths.get("llama_server_path") or "llama-server"
         base_model = self.paths.get("base_model_path") or ""
         params = self.config.get("llama_params") or {}
@@ -775,7 +835,7 @@ class GVKOrchestrator:
         return cmd
 
     def switch_active_lora(self, adapter_id: int = 0, scale: float = 1.0) -> bool:
-        """Гарячий свічинг активного LoRA-адаптера через POST /lora-adapters (< 1 мс)."""
+        """Hot-switch the active LoRA adapter via `POST /lora-adapters` (< 1 ms)."""
         port = int((self.config.get("llama_params") or {}).get("port", 8080))
         url = f"http://127.0.0.1:{port}/lora-adapters"
         payload = [{"id": int(adapter_id), "scale": float(scale)}]
@@ -789,7 +849,7 @@ class GVKOrchestrator:
             with urllib.request.urlopen(req, timeout=5) as resp:
                 return resp.status == 200
         except Exception as exc:
-            logger.warning("Не вдалося перемкнути LoRA (id=%s, scale=%s): %s", adapter_id, scale, exc)
+            logger.warning("Failed to switch LoRA adapter (id=%s, scale=%s): %s", adapter_id, scale, exc)
             return False
 
     def select_next_speakers(
@@ -799,12 +859,22 @@ class GVKOrchestrator:
         candidate_skill_runners: Optional[Dict[str, SkillRunner]] = None,
         max_bot_turns: int = 2,
     ) -> List[str]:
-        """
-        Арбітр конференції (Cross-Talk Engine):
-          1. Прямий тег / `trigger_words` учасника (`P = 1.0`).
-          2. Перехоплення за відповідністю запиту до скілів у `tools.py` (`Skill Match`).
-          3. Спонтанна реакція (`Chattiness Roll` < `chattiness_prob`).
-          4. Ліміт: максимум `max_bot_turns` (2–3) репліки між ботами поспіль.
+        """Select which personas respond next in group conference mode (Cross-Talk Engine).
+
+        Selection priority:
+          1. Direct mention / `trigger_words` word-boundary match (`P = 1.0`).
+          2. Skill match via `SkillRunner.match_query`.
+          3. Spontaneous reaction roll against `chattiness_prob`.
+          4. Bounded to at most `max_bot_turns` consecutive bot replies.
+
+        Args:
+            user_message: Incoming message text.
+            candidate_configs: Optional map of `persona_id -> persona_config`.
+            candidate_skill_runners: Optional map of `persona_id -> SkillRunner`.
+            max_bot_turns: Maximum number of speakers to select.
+
+        Returns:
+            Ordered list of selected `persona_id` strings.
         """
         pool = candidate_configs or {self.persona_id: self.config}
         runners = candidate_skill_runners or {self.persona_id: self.skill_runner}
@@ -814,14 +884,14 @@ class GVKOrchestrator:
         lowered_msg = (user_message or "").lower()
         chosen: List[str] = []
 
-        # 1. Прямий тригер (P = 1.0) — перевірка на межі слова, щоб короткі тригери ("рл") не спрацьовували всередині слів
+        # 1. Direct trigger (P = 1.0) using word boundaries so short triggers do not match inside words
         for pid, cfg in pool.items():
             triggers = [str(t).strip().lower() for t in (cfg.get("trigger_words") or []) if str(t).strip()]
             if any(re.search(rf"(?<!\w){re.escape(tr)}(?!\w)", lowered_msg) for tr in triggers):
                 if pid not in chosen:
                     chosen.append(pid)
 
-        # 2. Перехоплення за скілами (Skill Match)
+        # 2. Skill Match interception
         best_skill_pid: Optional[str] = None
         best_skill_score = 0.0
         for pid in pool:
@@ -834,7 +904,7 @@ class GVKOrchestrator:
         if best_skill_pid and best_skill_pid not in chosen:
             chosen.append(best_skill_pid)
 
-        # 3. Спонтанна реакція (Chattiness Roll)
+        # 3. Spontaneous reaction (Chattiness Roll)
         for pid, cfg in pool.items():
             if len(chosen) >= max_bot_turns:
                 break
@@ -844,7 +914,7 @@ class GVKOrchestrator:
             if random.random() < prob:
                 chosen.append(pid)
 
-        # Fallback: хоча б один персонаж відповідає, якщо ніхто не спрацював
+        # Fallback: ensure at least one persona replies if no rule matched
         if not chosen:
             chosen.append(self.persona_id if self.persona_id in pool else next(iter(pool.keys())))
 
@@ -855,7 +925,7 @@ class GVKOrchestrator:
         current_emotion: str = "idle",
         today: Optional[datetime.date] = None,
     ) -> Dict[str, str]:
-        """Формує структурований короткий опис та статуси для відображення під портретом у TUI."""
+        """Build a structured persona summary and live status block for UI portrait panels."""
         if today is None:
             today = datetime.date.today()
         display_name = str(self.config.get("display_name") or self.persona_id)
@@ -896,7 +966,7 @@ class GVKOrchestrator:
         rag_hits: Optional[List[Dict[str, Any]]] = None,
         history_path: Optional[str] = None,
     ) -> None:
-        """Зберігає обмін репліками в JSONL для подальшого аудиту та донавчання."""
+        """Append a completed user/assistant turn to JSONL logs for auditing and future fine-tuning."""
         entry = {
             "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
             "persona_id": self.persona_id,
@@ -926,6 +996,7 @@ class GVKOrchestrator:
                 pass
 
     def is_server_healthy(self, timeout: float = 1.5) -> bool:
+        """Check whether the local `llama-server` `/health` endpoint returns HTTP 200."""
         port = int((self.config.get("llama_params") or {}).get("port", 8080))
         url = f"http://127.0.0.1:{port}/health"
         try:
@@ -935,23 +1006,30 @@ class GVKOrchestrator:
             return False
 
     def ensure_server_running(self, wait_timeout: float = 120.0) -> bool:
-        """Запускає `llama-server`, якщо він ще не запущений на вказаному порту."""
+        """Start `llama-server` if it is not already listening on the configured port.
+
+        Args:
+            wait_timeout: Maximum seconds to wait for `/health` to become ready.
+
+        Returns:
+            `True` when `llama-server` is healthy and ready, otherwise `False`.
+        """
         with self._server_lock:
             if self.is_server_healthy():
-                logger.info("llama-server вже активний і відповідає на /health.")
+                logger.info("llama-server is already active and responding on /health.")
                 return True
 
             server_bin = self.paths.get("llama_server_path")
             base_model = self.paths.get("base_model_path")
             if not server_bin or not os.path.isfile(server_bin):
-                logger.warning("Бінарник llama-server не знайдено (%s).", server_bin)
+                logger.warning("llama-server binary not found (%s).", server_bin)
                 return False
             if not base_model or not os.path.isfile(base_model):
-                logger.warning("Базову модель не знайдено (%s).", base_model)
+                logger.warning("Base model not found (%s).", base_model)
                 return False
 
             cmd = self.get_llama_server_command()
-            logger.info("Запуск llama-server: %s", " ".join(f'"{c}"' if " " in c else c for c in cmd))
+            logger.info("Starting llama-server: %s", " ".join(f'"{c}"' if " " in c else c for c in cmd))
             srv_log_path = os.path.join(self.repo_root, "logs", "llama_server.log")
             srv_log_handle = None
             try:
@@ -1000,23 +1078,23 @@ class GVKOrchestrator:
                     except OSError:
                         tail = ""
                     logger.error(
-                        "Процес llama-server завершився достроково з кодом %s.%s",
+                        "llama-server exited prematurely with code %s.%s",
                         self._server_proc.returncode,
                         f"\n{tail}" if tail else "",
                     )
                     return False
                 if self.is_server_healthy(timeout=1.0):
-                    logger.info("llama-server успішно запущено за %.1f с (PID=%d).", time.time() - t0, self._server_proc.pid)
+                    logger.info("llama-server started successfully in %.1f s (PID=%d).", time.time() - t0, self._server_proc.pid)
                     return True
                 time.sleep(0.5)
 
-            logger.error("Час очікування запуску llama-server (%.0f с) вичерпано.", wait_timeout)
+            logger.error("Timed out waiting for llama-server startup (%.0f s).", wait_timeout)
             return False
 
     def build_warmup_payload(self, question: str) -> Dict[str, Any]:
-        """
-        Формує JSON-пейлоад для фонового прогріву `/v1/chat/completions`
-        із вимкненим режимом міркувань (`chat_template_kwargs: {"enable_thinking": false}`).
+        """Build a `/v1/chat/completions` JSON payload for background model warmup.
+
+        Disables chain-of-thought reasoning via `chat_template_kwargs: {"enable_thinking": false}`.
         """
         params = self.config.get("llama_params") or {}
         messages = [
@@ -1042,10 +1120,7 @@ class GVKOrchestrator:
         }
 
     def warmup_model(self, questions: Optional[List[str]] = None) -> List[str]:
-        """
-        Надсилає 2 фонові питання для прогріву моделі (з `enable_thinking: false`),
-        не зберігаючи їх у `self.history` і не показуючи в чаті.
-        """
+        """Send background warmup prompts (`enable_thinking: false`) without mutating chat history."""
         warmup_qs = questions if questions is not None else self.get_warmup_questions()
         params = self.config.get("llama_params") or {}
         port = int(params.get("port", 8080))
@@ -1062,7 +1137,7 @@ class GVKOrchestrator:
             )
             t0 = time.time()
             try:
-                logger.info("Фоновий прогрів [%d/%d]: %s", idx, len(warmup_qs), q)
+                logger.info("Background warmup [%d/%d]: %s", idx, len(warmup_qs), q)
                 with urllib.request.urlopen(req, timeout=120) as resp:
                     raw_body = resp.read().decode("utf-8")
                 data = json.loads(raw_body)
@@ -1072,10 +1147,10 @@ class GVKOrchestrator:
                     .get("content", "")
                     .strip()
                 )
-                logger.info("Відповідь прогріву [%d/%d] за %.2f с: %s", idx, len(warmup_qs), time.time() - t0, reply)
+                logger.info("Warmup reply [%d/%d] in %.2f s: %s", idx, len(warmup_qs), time.time() - t0, reply)
                 answers.append(reply)
             except Exception as exc:
-                logger.warning("Помилка під час фонового прогріву [%d/%d]: %s", idx, len(warmup_qs), exc)
+                logger.warning("Error during background warmup [%d/%d]: %s", idx, len(warmup_qs), exc)
         return answers
 
     def prepare_session(
@@ -1085,11 +1160,10 @@ class GVKOrchestrator:
         is_experimental: bool = False,
         chat_mode: str = "personal",
     ) -> bool:
-        """
-        Повна фонова підготовка сесії під час екрана завантаження:
-          1. Оновлює співрозмовника та скидає історію чату.
-          2. Запускає `llama-server` (якщо ще не запущений).
-          3. Виконує 2 фонові запити прогріву без збереження в історію.
+        """Run full background session preparation during the loading screen.
+
+        Updates the active interlocutor and resets history, starts `llama-server`
+        if needed, and executes background warmup prompts.
         """
         self.set_interlocutor(
             user_id=user_id,
@@ -1109,6 +1183,7 @@ class GVKOrchestrator:
         params: Dict[str, Any],
         port: int,
     ) -> str:
+        """Send a synchronous `/v1/chat/completions` POST request and return the assistant reply."""
         payload = {
             "messages": messages,
             "temperature": float(params.get("temp", 0.52)),
@@ -1141,9 +1216,16 @@ class GVKOrchestrator:
         )
 
     def send_message(self, user_text: str) -> str:
-        """
-        Додає повідомлення користувача до історії, надсилає запит у `llama-server`,
-        за потреби виконує скіли `[SKILL: ...]`, логує хід у JSONL і повертає відповідь.
+        """Send a user message through skills, RAG, and `llama-server`, returning the reply.
+
+        Appends the completed exchange to `self.history` (unless reset concurrently)
+        and logs the turn to JSONL.
+
+        Args:
+            user_text: Raw message entered by the user.
+
+        Returns:
+            Assistant reply string (or localized fallback status text for the chat UI).
         """
         cleaned_user = user_text.strip()
         if not cleaned_user:
@@ -1169,7 +1251,7 @@ class GVKOrchestrator:
         port = int(params.get("port", 8080))
 
         logger.info(
-            "Повідомлення від '%s' (історія=%d реплік): %s",
+            "Message from '%s' (history=%d turns): %s",
             self.user_name_ua,
             len(self.history),
             cleaned_user,
@@ -1182,9 +1264,9 @@ class GVKOrchestrator:
                 active_skill_res = self.skill_runner.execute_for_query(cleaned_user, threshold=0.75)
 
             if active_skill_res is not None and active_skill_res.ok:
-                trigger_kind = "Slash-скіл" if slash_skill_res is not None else "Авто-скіл за тригером"
+                trigger_kind = "Slash skill" if slash_skill_res is not None else "Auto-triggered skill"
                 logger.info(
-                    "%s '%s' (ok=%s, %.1f мс): %s",
+                    "%s '%s' (ok=%s, %.1f ms): %s",
                     trigger_kind,
                     active_skill_res.skill_name,
                     active_skill_res.ok,
@@ -1193,7 +1275,7 @@ class GVKOrchestrator:
                 )
                 skill_out = (active_skill_res.output or "").strip()
                 reaction_messages = list(messages)
-                # Не вставляємо проміжний role='system' (LoRA його ігнорує) — передаємо результат у фінальний user-запит
+                # Avoid an intermediate role='system' message (ignored by LoRA); inject tool result into final user turn
                 reaction_messages[-1] = {
                     "role": "user",
                     "content": (
@@ -1208,7 +1290,7 @@ class GVKOrchestrator:
                     raw_comment = self._request_chat_completion(reaction_messages, params=reaction_params, port=port)
                     comment = strip_skill_tags(raw_comment).strip()
                 except Exception as react_exc:
-                    logger.warning("Не вдалося отримати реакцію моделі на скіл (%s) — показуємо прямий результат.", react_exc)
+                    logger.warning("Failed to get model reaction for skill (%s); returning direct output.", react_exc)
                     comment = ""
 
                 if comment and comment.lower() not in skill_out.lower():
@@ -1222,7 +1304,7 @@ class GVKOrchestrator:
                     parsed_call = self.skill_runner.execute_tag(reply)
                     if parsed_call is not None:
                         logger.info(
-                            "Виконано скіл '%s' (ok=%s, %.1f мс)",
+                            "Executed skill '%s' (ok=%s, %.1f ms)",
                             parsed_call.skill_name,
                             parsed_call.ok,
                             parsed_call.elapsed_ms,
@@ -1240,22 +1322,23 @@ class GVKOrchestrator:
                 self.history.append(messages[-1])
                 self.history.append({"role": "assistant", "content": reply})
                 self._log_chat_turn(cleaned_user, reply, rag_hits=rag_snapshot)
-                logger.info("Відповідь '%s' за %.2f с: %s", self.persona_id, dt, reply)
+                logger.info("Reply from '%s' in %.2f s: %s", self.persona_id, dt, reply)
             else:
-                logger.info("Ігноровано застарілу відповідь '%s' після скидання чату (CTRL+N).", self.persona_id)
+                logger.info("Discarded stale reply from '%s' after chat reset (CTRL+N).", self.persona_id)
             return reply
         except urllib.error.URLError as exc:
-            logger.warning("llama-server недоступний на 127.0.0.1:%d (%s).", port, exc)
+            logger.warning("llama-server unreachable on 127.0.0.1:%d (%s).", port, exc)
             if slash_skill_res is not None and slash_skill_res.ok and slash_skill_res.output:
                 return slash_skill_res.output
             return f"[llama-server не запущений на порту {port}. Запустіть сервер для генерації відповіді.]"
         except Exception as exc:
-            logger.exception("Помилка генерації відповіді: %s", exc)
+            logger.exception("Response generation error: %s", exc)
             return f"[Помилка генерації: {exc}]"
 
     def shutdown(self) -> None:
+        """Terminate the managed `llama-server` subprocess and remove staged runtime files."""
         if self._server_proc is not None and self._server_proc.poll() is None:
-            logger.info("Зупинка підпроцесу llama-server (PID=%d)...", self._server_proc.pid)
+            logger.info("Stopping llama-server subprocess (PID=%d)...", self._server_proc.pid)
             self._server_proc.terminate()
             try:
                 self._server_proc.wait(timeout=3.0)
@@ -1273,18 +1356,19 @@ class GVKOrchestrator:
 
 
 # =====================================================================
-# АВТОНОМНИЙ SELF-TEST ТА CLI
+# STANDALONE SELF-TEST AND CLI
 # =====================================================================
 def run_self_test() -> None:
+    """Run offline self-tests covering CLI commands, prompts, RAG, cross-talk, and JSONL logging."""
     import tempfile
 
     print("====================================================================")
-    print(" [*] GVK Private AI — Self-Test оркестратора (core/orchestrator.py)")
+    print(" [*] GVK Private AI - Orchestrator Self-Test (core/orchestrator.py)")
     print("====================================================================")
 
     orch = GVKOrchestrator(persona_id="friend_1")
     cmd = orch.get_llama_server_command()
-    assert "--lora-scaled" in cmd, f"Очікувався --lora-scaled у команді: {cmd}"
+    assert "--lora-scaled" in cmd, f"Expected --lora-scaled in command: {cmd}"
     assert "-ngl" not in cmd
 
     test_date = datetime.date(2026, 11, 17)
@@ -1295,12 +1379,12 @@ def run_self_test() -> None:
 
     dossier = orch.get_persona_dossier(current_emotion="idle", today=test_date)
     assert dossier["title"] and dossier["description"]
-    assert "[OK]" in dossier["rag_status"], f"Очікувався робочий RAG у досьє: {dossier}"
-    print(f" [1/4] Досьє та CLI OK: {dossier['title']} | {dossier['rag_status']}")
+    assert "[OK]" in dossier["rag_status"], f"Expected active RAG in dossier: {dossier}"
+    print(f" [1/4] Dossier & CLI OK: {dossier['title']} | {dossier['rag_status']}")
 
     rag_block = orch.retrieve_memories_block("го катати в рокет лигу")
     assert rag_block and orch.last_rag_hits
-    print(f" [2/4] RAG-пам'ять ін'єктована: {len(orch.last_rag_hits)} спогадів")
+    print(f" [2/4] RAG memory injected: {len(orch.last_rag_hits)} memories")
 
     speakers = orch.select_next_speakers(
         "друг_1, зайди в рл",
@@ -1321,8 +1405,8 @@ def run_self_test() -> None:
         candidate_skill_runners={"friend_2": None},
         max_bot_turns=2,
     )
-    assert subword_check == ["friend_2"], f"Короткий тригер не повинен спрацьовувати всередині слів: {subword_check}"
-    print(f" [3/4] Cross-Talk арбітр OK: {speakers}")
+    assert subword_check == ["friend_2"], f"Short trigger should not match inside words: {subword_check}"
+    print(f" [3/4] Cross-Talk arbiter OK: {speakers}")
 
     with tempfile.TemporaryDirectory(prefix="gvk_orch_log_") as tmpdir:
         log_file = os.path.join(tmpdir, "chat_history.jsonl")
@@ -1330,18 +1414,24 @@ def run_self_test() -> None:
         with open(log_file, "r", encoding="utf-8") as f:
             row = json.loads(f.readline())
         assert row["persona_id"] == "friend_1" and row["user_text"] == "привіт"
-    print(" [4/4] JSONL-логер діалогів OK")
+    print(" [4/4] JSONL chat turn logger OK")
 
     print("====================================================================")
-    print(" [✓] УСІ ТЕСТИ ORCHESTRATOR.PY ПРОЙДЕНО УСПІШНО!")
+    print(" [OK] ALL ORCHESTRATOR.PY TESTS PASSED!")
     print("====================================================================")
 
 
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="GVK Private AI — Оркестратор (core/orchestrator.py)")
-    parser.add_argument("cmd", nargs="?", choices=["self-test"], default="self-test")
+    parser = argparse.ArgumentParser(description="GVK Private AI - Session Orchestrator (core/orchestrator.py)")
+    parser.add_argument(
+        "cmd",
+        nargs="?",
+        choices=["self-test"],
+        default="self-test",
+        help="Command to execute (default: self-test)",
+    )
     args = parser.parse_args()
     if args.cmd == "self-test":
         run_self_test()

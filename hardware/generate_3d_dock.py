@@ -1,10 +1,19 @@
 #!/usr/bin/env python3
 """
-GVK-DOCK // MK.I — Exact 3D Model Generator (Based on Reference Concept Photo)
-Generates:
-  1. hardware/gvk_dock_mk1.stl       — Printable 3D chassis mesh (watertight triangles)
-  2. hardware/gvk_dock_mk1.obj/.mtl  — Full colored assembly for macOS QuickLook / Blender
-  3. hardware/gvk_dock_viewer.html   — Photorealistic interactive Three.js 3D studio viewer
+GVK Private AI - 3D Dock Chassis & Studio Viewer Generator (hardware/generate_3d_dock.py)
+
+Generates printable 3D meshes and an interactive Three.js studio viewer for the
+GVK-DOCK MK.I slanted desktop hardware console.
+
+Key Responsibilities:
+  - Construct the slanted console chassis, vertical Blu-ray drive bay, 3-slot
+    cartridge bay, status LEDs, and lower kill-switch control apron.
+  - Export watertight binary STL (`hardware/gvk_dock_mk1.stl`) for 3D slicers
+    and colored OBJ/MTL (`hardware/gvk_dock_mk1.obj`, `.mtl`) for Blender/QuickLook.
+  - Generate an interactive Three.js HTML viewer (`hardware/gvk_dock_viewer.html`).
+
+Usage:
+  python3 hardware/generate_3d_dock.py
 """
 
 import os
@@ -12,41 +21,66 @@ import math
 import struct
 
 
+# =====================================================================
+# 3D MESH BUILDER & EXPORTERS
+# =====================================================================
 class MeshBuilder:
-    """Builds 3D geometry with support for tilted/slanted coordinate frames and exports OBJ + STL."""
+    """Builds 3D CAD geometry with rotated local frames and exports OBJ/MTL and STL."""
 
     def __init__(self):
+        """Initialize empty vertex, face, and material registries."""
         self.vertices = []
         self.faces = []  # (material, [v1, v2, v3, ...]) 1-based indices
         self.materials = {}
         self.current_mat = "MatteBlack"
 
     def add_material(self, name, kd, ks=(0.2, 0.2, 0.2), ns=20.0):
+        """Register a named Phong material for MTL export.
+
+        Args:
+            name: Material identifier referenced by face groups.
+            kd: Diffuse RGB color tuple in `[0.0, 1.0]`.
+            ks: Specular RGB color tuple in `[0.0, 1.0]`.
+            ns: Specular shininess exponent.
+        """
         self.materials[name] = {"kd": kd, "ks": ks, "ns": ns}
 
     def use_mat(self, name):
+        """Set the active material for subsequent faces."""
         self.current_mat = name
 
     def v(self, x, y, z):
+        """Append a 3D vertex and return its 1-based OBJ index."""
         self.vertices.append((float(x), float(y), float(z)))
         return len(self.vertices)
 
     def quad(self, i1, i2, i3, i4, mat=None):
+        """Append a quad face using 1-based vertex indices."""
         m = mat or self.current_mat
         self.faces.append((m, [i1, i2, i3, i4]))
 
     def tri(self, i1, i2, i3, mat=None):
+        """Append a triangle face using 1-based vertex indices."""
         m = mat or self.current_mat
         self.faces.append((m, [i1, i2, i3]))
 
     def add_box(self, cx, cy, cz, sx, sy, sz, rx_deg=0.0, ry_deg=0.0, rz_deg=0.0, mat=None):
-        """
-        Adds a box centered at (cx, cy, cz) with size (sx, sy, sz),
-        rotated by Euler angles (rx_deg, ry_deg, rz_deg).
-        Coordinate convention (Z-up for CAD/STL):
-          X: Left (-) to Right (+)
-          Y: Front (-) to Back (+)
-          Z: Bottom (0) to Top (+)
+        """Add an oriented rectangular prism centered at `(cx, cy, cz)`.
+
+        Uses the Z-up CAD/STL coordinate convention:
+        X left (-) to right (+), Y front (-) to back (+), Z bottom (0) to top (+).
+
+        Args:
+            cx: Center X coordinate in millimeters.
+            cy: Center Y coordinate in millimeters.
+            cz: Center Z coordinate in millimeters.
+            sx: Box width along local X in millimeters.
+            sy: Box depth along local Y in millimeters.
+            sz: Box height along local Z in millimeters.
+            rx_deg: Rotation around X axis in degrees.
+            ry_deg: Rotation around Y axis in degrees.
+            rz_deg: Rotation around Z axis in degrees.
+            mat: Optional material name override.
         """
         if mat:
             self.use_mat(mat)
@@ -93,7 +127,7 @@ class MeshBuilder:
         self.quad(idx[1], idx[2], idx[6], idx[5])
 
     def add_cylinder(self, cx, cy, cz, radius, length, rx_deg=0.0, segments=20, mat=None):
-        """Adds a cylinder along local Z axis, rotated by rx_deg around X."""
+        """Add a closed cylinder along local Z, rotated by `rx_deg` around X."""
         if mat:
             self.use_mat(mat)
         rx = math.radians(rx_deg)
@@ -123,9 +157,13 @@ class MeshBuilder:
             self.tri(top_center, top_ring[i], top_ring[ni])
 
     def add_profile_extrusion(self, x_min, x_max, yz_polygon, mat=None):
-        """
-        Extrudes a 2D polygon defined in (Y, Z) along the X axis from x_min to x_max.
-        yz_polygon: list of (y, z) in counter-clockwise order when viewed from +X (right side).
+        """Extrude a 2D (Y, Z) polygon along the X axis from `x_min` to `x_max`.
+
+        Args:
+            x_min: Left X boundary in millimeters.
+            x_max: Right X boundary in millimeters.
+            yz_polygon: Sequence of `(y, z)` vertices ordered counter-clockwise when viewed from `+X`.
+            mat: Optional material name override.
         """
         if mat:
             self.use_mat(mat)
@@ -144,9 +182,15 @@ class MeshBuilder:
             self.tri(right_v[0], right_v[i], right_v[i + 1])
 
     def export_obj(self, obj_path, mtl_path):
+        """Write Wavefront OBJ geometry (Y-up) and companion MTL material library.
+
+        Args:
+            obj_path: Output `.obj` file path.
+            mtl_path: Output `.mtl` file path.
+        """
         mtl_name = os.path.basename(mtl_path)
         with open(obj_path, "w", encoding="utf-8") as f:
-            f.write("# GVK-DOCK // MK.I — Slanted Console 3D Model (Photo-Accurate)\n")
+            f.write("# GVK Private AI - GVK-DOCK MK.I Slanted Console 3D Model\n")
             f.write(f"mtllib {mtl_name}\n\n")
             # Write vertices (converting Z-up CAD to Y-up for QuickLook/Three.js friendliness: X, Z, -Y)
             for vx, vy, vz in self.vertices:
@@ -169,7 +213,12 @@ class MeshBuilder:
                 f.write("illum 2\n")
 
     def export_binary_stl(self, stl_path, filter_materials=None):
-        """Writes binary STL (Z-up, millimeter units, ready for 3D slicers)."""
+        """Write a binary STL mesh (Z-up, millimeter units) ready for 3D slicers.
+
+        Args:
+            stl_path: Output `.stl` file path.
+            filter_materials: Optional set/collection of material names to include.
+        """
         tris = []
         for m, idxs in self.faces:
             if filter_materials and m not in filter_materials:
@@ -198,7 +247,15 @@ class MeshBuilder:
                 f.write(struct.pack("<12fH", nx, ny, nz, *v1, *v2, *v3, 0))
 
 
+# =====================================================================
+# CONSOLE GEOMETRY GENERATION
+# =====================================================================
 def generate_all(output_dir):
+    """Build the complete GVK-DOCK MK.I mesh and export OBJ, MTL, and STL files.
+
+    Args:
+        output_dir: Directory where generated 3D model files are written.
+    """
     os.makedirs(output_dir, exist_ok=True)
     m = MeshBuilder()
 
@@ -217,9 +274,9 @@ def generate_all(output_dir):
     m.add_material("BadgeViolet", kd=(0.68, 0.28, 0.88), ks=(0.6, 0.6, 0.6), ns=40.0)
     m.add_material("RubberFoot", kd=(0.03, 0.03, 0.03), ks=(0.05, 0.05, 0.05), ns=5.0)
 
-    # =========================================================================
-    # GEOMETRY OF THE SLANTED CONSOLE (Photo-exact profile)
-    # =========================================================================
+    # =====================================================================
+    # GEOMETRY OF THE SLANTED CONSOLE (PHOTO-EXACT PROFILE)
+    # =====================================================================
     # Total Width X: 240 mm (-120 to +120)
     # Side profile in (Y, Z):
     #   Front bottom lip: (Y = -90, Z = 0) -> (Y = -90, Z = 16)
@@ -269,9 +326,9 @@ def generate_all(output_dir):
         ny, nz = -0.927, 0.375
         return (u_x, py + ny * normal_offset, pz + nz * normal_offset)
 
-    # =========================================================================
-    # 1. VERTICAL SLIM BLU-RAY DRIVE BAY (Left side of upper faceplate)
-    # =========================================================================
+    # =====================================================================
+    # 1. VERTICAL SLIM BLU-RAY DRIVE BAY (LEFT SIDE OF UPPER FACEPLATE)
+    # =====================================================================
     # Outer bezel frame around the vertical Blu-ray drive
     bx, by, bz = upper_face_pt(-62.0, 0.48, normal_offset=2.0)
     m.add_box(bx, by, bz, 62.0, 8.0, 142.0, rx_deg=face_rot_x, mat="MatteBezel")
@@ -294,9 +351,9 @@ def generate_all(output_dir):
             px, py, pz = upper_face_pt(sx_off, f_up, normal_offset=6.5)
             m.add_cylinder(px, py, pz, 2.2, 3.0, rx_deg=90 + face_rot_x, segments=6, mat="DarkBolt")
 
-    # =========================================================================
-    # 2. SIDE-BY-SIDE CARTRIDGE BAY & 3 PROTRUDING CASES (Right side)
-    # =========================================================================
+    # =====================================================================
+    # 2. SIDE-BY-SIDE CARTRIDGE BAY & 3 PROTRUDING CASES (RIGHT SIDE)
+    # =====================================================================
     # Cartridge housing collar/frame
     rx, ry, rz = upper_face_pt(48.0, 0.56, normal_offset=1.5)
     m.add_box(rx, ry, rz, 118.0, 10.0, 105.0, rx_deg=face_rot_x, mat="MatteBezel")
@@ -319,9 +376,9 @@ def generate_all(output_dir):
         lx, ly, lz = upper_face_pt(cx_pos, 0.36, normal_offset=59.2)
         m.add_box(lx, ly, lz, 18.0, 1.5, 2.5, rx_deg=face_rot_x, mat=badge_mat)
 
-    # =========================================================================
+    # =====================================================================
     # 3. STATUS LED BEZEL PLATE BELOW CARTRIDGES (SUBJ-01 / 02 / 03 / VAULT)
-    # =========================================================================
+    # =====================================================================
     lx, ly, lz = upper_face_pt(48.0, 0.13, normal_offset=3.5)
     m.add_box(lx, ly, lz, 92.0, 5.0, 22.0, rx_deg=face_rot_x, mat="MatteBezel")
 
@@ -331,9 +388,9 @@ def generate_all(output_dir):
         px, py, pz = upper_face_pt(led_x, 0.15, normal_offset=6.5)
         m.add_cylinder(px, py, pz, 2.8, 2.5, rx_deg=90 + face_rot_x, segments=14, mat=lmat)
 
-    # =========================================================================
-    # 4. LOWER SLOPED CONTROL APRON (Status LED, Silver ID Plate, Kill-Switch)
-    # =========================================================================
+    # =====================================================================
+    # 4. LOWER SLOPED CONTROL APRON (STATUS LED, SILVER ID PLATE, KILL-SWITCH)
+    # =====================================================================
     # Lower apron goes from (Y = -90, Z = 16) to (Y = -42, Z = 44)
     # dy = 48, dz = 28 -> slope angle = atan2(28, 48) = 30.25 deg from horizontal
     # So rotation around X from horizontal top face is -(90 - 30.25) = -59.75 deg
@@ -392,11 +449,19 @@ def generate_all(output_dir):
 
     m.export_obj(obj_path, mtl_path)
     m.export_binary_stl(stl_path)
-    print(f"[*] Exported Photo-Accurate OBJ: {obj_path} ({len(m.vertices)} vertices, {len(m.faces)} faces)")
-    print(f"[*] Exported Printable Binary STL: {stl_path}")
+    print(f"[OK] Exported OBJ model: {obj_path} ({len(m.vertices)} vertices, {len(m.faces)} faces)")
+    print(f"[OK] Exported binary STL: {stl_path}")
 
 
+# =====================================================================
+# INTERACTIVE THREE.JS HTML VIEWER GENERATOR
+# =====================================================================
 def generate_photoreal_viewer_html(output_path):
+    """Write the standalone interactive Three.js 3D viewer HTML file.
+
+    Args:
+        output_path: Destination `.html` file path.
+    """
     html = """<!DOCTYPE html>
 <html lang="uk">
 <head>
@@ -881,7 +946,7 @@ def generate_photoreal_viewer_html(output_path):
 """
     with open(output_path, "w", encoding="utf-8") as f:
         f.write(html)
-    print(f"[*] Exported Interactive Photo-Accurate HTML Viewer: {output_path}")
+    print(f"[OK] Exported interactive Three.js HTML viewer: {output_path}")
 
 
 if __name__ == "__main__":

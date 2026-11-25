@@ -1,16 +1,21 @@
 #!/usr/bin/env python3
 """
-GVK Private AI — Термінальний інтерфейс (core/menu.py)
+GVK Private AI - Terminal Menu Shell (core/menu.py)
 
-Автономне вікно 1280x720 (720p, без зміни розміру) у стилі класичного терміналу:
-  - Справжній чорний фон (#000000), єдиний моноширинний шрифт одного розміру,
-    міжрядковий інтервал реального терміналу та вирівнювання по лівому краю.
-  - Приглушена термінальна палітра (Cyan, Amber, Green, Purple, Red, Muted Grey).
-  - Фіксовані позиції блоків без вертикальних стрибків при переносі рядків,
-    відкритті `sudo` (`[17]`) або виклику підтвердження виходу `CTRL+C`.
-  - Підтримка вводу секретного коду `sudo` на EN / DE / UA (`ігвщ`) / RU (`ыгвщ`) розкладках.
+Standalone 1280x720 (fixed 720p) retro terminal UI built on Tkinter,
+implementing the onboarding flow, persona selection, loading screen,
+Braille portrait rendering, and interactive chat shell.
 
-Приклади запуску:
+Key Responsibilities:
+  - Render a classic pure-black (#000000) single-font terminal viewport
+    with muted ANSI-inspired colors and jump-free fixed layouts.
+  - Drive the onboarding sequence (splash screen, user selector with
+    EN/DE/UA/RU `sudo` secret unlock, timed legal warnings, and exact
+    launch phrase confirmation).
+  - Manage the main menu, persona loading modal, emotion-driven Braille
+    portrait canvas, and chat session interface connected to the orchestrator.
+
+Usage:
   python3 core/menu.py
   python3 core/menu.py --fast
   python3 core/menu.py self-test
@@ -28,7 +33,7 @@ import sys
 import threading
 import time
 
-# Автоматичне підхоплення Tcl/Tk для портативного python-build-standalone (.venv із ~/.gvk_ai/python)
+# Auto-detect Tcl/Tk paths for portable python-build-standalone (.venv under ~/.gvk_ai/python)
 if "TCL_LIBRARY" not in os.environ or "TK_LIBRARY" not in os.environ:
     _base_pref = getattr(sys, "base_prefix", sys.prefix)
     for _sub in ("tcl", "lib"):
@@ -51,10 +56,10 @@ if REPO_ROOT not in sys.path:
 from core.roster import load_roster_data
 
 # =====================================================================
-# КОНСТАНТИ ВІКНА ТА ПРИГЛУШЕНОЇ ПАЛІТРИ ТЕРМІНАЛУ
+# WINDOW CONSTANTS AND MUTED TERMINAL PALETTE
 # =====================================================================
 APP_NAME = "GVK PRIVATE AI"
-APP_HEADER = "GVK PRIVATE AI [Release 1.1.1 - Optical Funeral]"
+APP_HEADER = "GVK PRIVATE AI [Release 1.2.0 - Public Exorcism]"
 WINDOW_WIDTH = 1280
 WINDOW_HEIGHT = 720
 DEFAULT_WAIT_SECONDS = 15
@@ -75,7 +80,7 @@ TERM_PURPLE = "#9d7bb8"
 TERM_RED = "#c75656"
 TERM_MUTED = "#666666"
 
-# Мапінг фізичних клавіш S-U-D-O для EN / DE / UA (ігвщ) / RU (ыгвщ)
+# Physical key mapping for S-U-D-O across EN / DE / UA (ігвщ) / RU (ыгвщ) layouts
 SUDO_CHAR_MAP: Dict[str, str] = {
     "s": "s",
     "і": "s",
@@ -95,7 +100,7 @@ SUDO_KEYCODE_MAP: Dict[int, str] = {
 }
 
 # =====================================================================
-# СЛОВНИК КОРИСТУВАЧІВ ТА ТЕКСТИ ЕКРАНІВ (ФОЛБЕК + ПРИВАТНИЙ ROSTER.JSON)
+# USER DIRECTORY AND SCREEN TEXT (FALLBACK + PRIVATE ROSTER.JSON)
 # =====================================================================
 USERS_DICT: Dict[int, Dict[str, object]] = {
     1: {"name": "Учасник 01", "locked": True, "experimental": False},
@@ -221,9 +226,17 @@ def load_roster_config(
     repo_root: str = REPO_ROOT,
     gvk_home: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """
-    Завантажує єдиний приватний `roster.json` через `core.roster.load_roster_data`
-    (з RAM-диска, локального `personas/roster.json` або `~/.gvk_ai`).
+    """Load the unified private `roster.json` via `core.roster.load_roster_data`.
+
+    Searches the RAM disk, local `personas/roster.json`, or `~/.gvk_ai`.
+
+    Args:
+        ram_root: Optional RAM-disk root path where decrypted roster data resides.
+        repo_root: Repository root directory path.
+        gvk_home: Optional user home override directory (defaults to `~/.gvk_ai`).
+
+    Returns:
+        Parsed roster configuration dictionary, or an empty dict if unavailable.
     """
     return load_roster_data(
         ram_root=ram_root,
@@ -233,7 +246,11 @@ def load_roster_config(
 
 
 def apply_roster_config(roster: Dict[str, Any]) -> None:
-    """Накладає дані з `roster.json` поверх фолбек-заглушок модуля `core.menu`."""
+    """Overlay private `roster.json` entries onto the fallback constants in `core.menu`.
+
+    Args:
+        roster: Roster configuration dictionary returned by `load_roster_config`.
+    """
     global SPLASH_MESSAGE
     if not roster:
         return
@@ -295,12 +312,21 @@ LAUNCH_PHRASE_CORE = (
 
 
 def _normalize_apostrophes(text: str) -> str:
-    """Уніфікує типографські апострофи до стандартного `'`, зберігаючи регістр і розділові знаки."""
+    """Normalize typographic apostrophes to ASCII `'` while preserving case and punctuation."""
     return text.replace("’", "'").replace("ʼ", "'").replace("`", "'")
 
 
 def is_valid_launch_phrase(typed: str) -> bool:
-    """Перевіряє точний посимвольний збіг фрази згоди (з лапками «» або без них)."""
+    """Verify exact character-by-character match against the launch consent phrase.
+
+    Accepts the phrase either with or without surrounding guillemets (`«»`).
+
+    Args:
+        typed: User-entered confirmation string.
+
+    Returns:
+        True if the normalized input matches the display or core launch phrase.
+    """
     norm = _normalize_apostrophes(typed)
     return norm in (
         _normalize_apostrophes(LAUNCH_PHRASE_DISPLAY),
@@ -309,9 +335,15 @@ def is_valid_launch_phrase(typed: str) -> bool:
 
 
 def translate_sudo_key(event: tk.Event) -> Optional[str]:
-    """
-    Перетворює натиснуту клавішу в латинський символ з набору {'s', 'u', 'd', 'o'}
-    незалежно від розкладки (English / German / Ukrainian / Russian).
+    """Translate a keypress event into a Latin character from `{'s', 'u', 'd', 'o'}`.
+
+    Works independently of keyboard layout (English / German / Ukrainian / Russian).
+
+    Args:
+        event: Tkinter key event.
+
+    Returns:
+        Matched lowercase Latin character (`'s'`, `'u'`, `'d'`, `'o'`), or None.
     """
     ch = (event.char or "").lower()
     if ch in SUDO_CHAR_MAP:
@@ -323,10 +355,10 @@ def translate_sudo_key(event: tk.Event) -> Optional[str]:
 
 
 def _has_non_text_modifier(event: tk.Event) -> bool:
-    """Перевіряє, чи натиснуто Control/Command/Alt (ігнорує NumLock 0x8 на Windows)."""
+    """Check whether Control, Command, or Alt is held (ignoring NumLock 0x8 on Windows)."""
     state = int(getattr(event, "state", 0) or 0)
     if sys.platform.startswith("win"):
-        # На Windows 0x8 — це NumLock; 0x20000 — Alt; AltGr (0x4|0x20000) може друкувати символи
+        # On Windows 0x8 is NumLock, 0x20000 is Alt, and AltGr (0x4|0x20000) can produce printable characters
         is_ctrl = bool(state & 0x4)
         is_alt = bool(state & 0x20000)
         return is_ctrl != is_alt
@@ -336,7 +368,7 @@ def _has_non_text_modifier(event: tk.Event) -> bool:
 
 
 def _is_paste_event(event: tk.Event) -> bool:
-    """Розпізнає Ctrl+V / Cmd+V незалежно від розкладки (EN / UA / RU / DE)."""
+    """Detect Ctrl+V / Cmd+V paste events regardless of keyboard layout (EN / UA / RU / DE)."""
     state = int(getattr(event, "state", 0) or 0)
     if sys.platform.startswith("win"):
         has_mod = bool(state & 0x4) and not bool(state & 0x20000)
@@ -356,6 +388,7 @@ def _is_paste_event(event: tk.Event) -> bool:
 
 
 def _read_clipboard_text(widget: tk.Widget, multiline: bool = True) -> str:
+    """Read and normalize plain text from the system clipboard."""
     try:
         raw = widget.clipboard_get()
     except tk.TclError:
@@ -378,7 +411,7 @@ def make_term_label(
     justify: str = tk.LEFT,
     anchor: str = "w",
 ) -> tk.Label:
-    """Створює текстовий рядок зі строгим міжрядковим інтервалом реального терміналу (pady=0, bd=0)."""
+    """Create a `tk.Label` with strict terminal line spacing (`pady=0`, `bd=0`)."""
     return tk.Label(
         parent,
         text=text,
@@ -396,14 +429,14 @@ def make_term_label(
 
 
 # =====================================================================
-# ПЕРЕВИКОРИСТОВУВАНІ МОДАЛЬНІ КОМПОНЕНТИ
+# REUSABLE MODAL COMPONENTS
 # =====================================================================
 class TimedMessageModal(tk.Frame):
-    """
-    Перевикористовуваний модальний компонент для показу повідомлення або попередження:
-      - Заголовок попередження розташований на один рядок вище самого повідомлення.
-      - У рядку над футером виходу показується зворотний відлік `20s...` (або `40s...`),
-        а після завершення — `Натисніть ENTER щоб продовжити`.
+    """Reusable modal widget for displaying a timed notice or legal warning.
+
+    Renders an optional warning title one line above the body text and shows a
+    per-second countdown (`15s...` / `60s...`) in the footer status slot,
+    followed by an ENTER prompt when `require_enter` is enabled.
     """
 
     def __init__(
@@ -427,7 +460,7 @@ class TimedMessageModal(tk.Frame):
         self.ready_for_enter = False
         self._timer_id: Optional[str] = None
 
-        # Нижній рядок (тільки якщо не передано зовнішній on_status у футері)
+        # Bottom status line (used only when no external footer on_status callback is provided)
         self.bottom_area = tk.Frame(self, bg=BG_BLACK)
         self.prompt_label = make_term_label(
             self.bottom_area,
@@ -439,7 +472,7 @@ class TimedMessageModal(tk.Frame):
             self.bottom_area.pack(side=tk.BOTTOM, fill=tk.X)
             self.prompt_label.pack(anchor="w")
 
-        # Центральний блок (посередині відносно висоти, текст зліва)
+        # Central area (vertically centered block, left-aligned text)
         self.center_area = tk.Frame(self, bg=BG_BLACK)
         self.center_area.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
 
@@ -448,7 +481,7 @@ class TimedMessageModal(tk.Frame):
 
         wrap_w = WINDOW_WIDTH - (LEFT_PAD * 2)
         if warning_title:
-            # Заголовок рівно на один порожній рядок вище за саме повідомлення
+            # Render title exactly one blank line above the body message
             make_term_label(
                 block_frame,
                 font=term_font,
@@ -465,7 +498,7 @@ class TimedMessageModal(tk.Frame):
             wraplength=wrap_w,
         ).pack(anchor="w")
 
-        # Якщо час >= 1 с, ведемо посекундний відлік "20s...", інакше швидкий таймер (для тестів)
+        # Use a per-second countdown ("15s...") when >= 1s; otherwise use a fast timer (for tests)
         if self.wait_seconds >= 1.0:
             self._remaining_sec = int(math.ceil(self.wait_seconds))
             self._tick_countdown()
@@ -510,10 +543,11 @@ class TimedMessageModal(tk.Frame):
 
 
 class TypingConfirmationModal(tk.Frame):
-    """
-    Перевикористовуваний модальний компонент для посимвольного вводу тексту
-    з миготливим підкресленням `_` та перевіркою точної відповідності.
-    Фіксована верхня точка прив'язки (`anchor="nw"`), щоб при переносі рядків текст не стрибав.
+    """Reusable modal widget for exact character-by-character phrase confirmation.
+
+    Displays a blinking underscore cursor (`_`) and validates input in real time.
+    Uses a fixed top-left anchor (`anchor="nw"`) so line wrapping never shifts
+    the prompt vertically.
     """
 
     def __init__(
@@ -537,7 +571,7 @@ class TypingConfirmationModal(tk.Frame):
 
         wrap_w = WINDOW_WIDTH - (LEFT_PAD * 2)
 
-        # Нижній рядок (якщо не передано зовнішній on_status у футері)
+        # Bottom status line (used only when no external footer on_status callback is provided)
         self.status_label = make_term_label(
             self,
             font=term_font,
@@ -547,8 +581,8 @@ class TypingConfirmationModal(tk.Frame):
         if self.on_status is None:
             self.status_label.pack(side=tk.BOTTOM, anchor="w")
 
-        # Центральна зона з фіксованою точкою прив'язки зверху-зліва (anchor="nw"),
-        # щоб перенос введеного тексту на новий рядок ніколи не зсував блок вгору
+        # Central area anchored at top-left (anchor="nw") so wrapping typed text
+        # never pushes the prompt block upward
         center_area = tk.Frame(self, bg=BG_BLACK)
         center_area.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
 
@@ -661,12 +695,13 @@ class TypingConfirmationModal(tk.Frame):
 
 
 class UserSelectorModal(tk.Frame):
-    """
-    Модальний селектор користувача зі словника `users_dict`:
-      - Фіксована верхня точка прив'язки (`anchor="nw"`), щоб додавання `[17]` не зсувало список.
-      - Перша колонка строго зліва, друга — посередині, третя — справа, `[17]` — під другою колонкою.
-      - Стрілка Вниз на `[12]` або `[16]` переходить на `[17]` (коли `sudo` активне);
-        на `[17]`: Вгору -> `[12]`, Вліво -> `[06]`, Вправо -> `[16]`.
+    """Modal user selector backed by `users_dict`.
+
+    Uses a fixed top-left anchor (`anchor="nw"`) so revealing `[17]` in sudo mode
+    does not shift existing rows. Columns are laid out left (`[01]..[06]`),
+    middle (`[07]..[12]`), and right (`[13]..[16]`), with `[17]` placed below the
+    middle column. Pressing Down from `[12]` or `[16]` moves to `[17]`; from
+    `[17]`, Up goes to `[12]`, Left to `[06]`, and Right to `[16]`.
     """
 
     def __init__(
@@ -695,7 +730,7 @@ class UserSelectorModal(tk.Frame):
 
         self.item_labels: Dict[int, tk.Label] = {}
 
-        # Статус-рядок (якщо не передано зовнішній on_status у футері)
+        # Status line (used only when no external footer on_status callback is provided)
         self.status_label = make_term_label(
             self,
             font=term_font,
@@ -705,8 +740,8 @@ class UserSelectorModal(tk.Frame):
         if self.on_status is None:
             self.status_label.pack(side=tk.BOTTOM, anchor="w")
 
-        # Центральна область із фіксованою верхньою точкою (anchor="nw"),
-        # щоб поява [17] розширювала список лише донизу без зсуву [01]..[06]
+        # Central area anchored at top-left (anchor="nw") so revealing [17] expands
+        # downward without shifting [01]..[06]
         self.center_area = tk.Frame(self, bg=BG_BLACK)
         self.center_area.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
 
@@ -730,7 +765,7 @@ class UserSelectorModal(tk.Frame):
         grid_frame.grid_columnconfigure(1, weight=1, uniform="term_cols")
         grid_frame.grid_columnconfigure(2, weight=1, uniform="term_cols")
 
-        # Заголовок лівої колонки
+        # Left column header
         make_term_label(
             grid_frame,
             font=self.term_font,
@@ -746,7 +781,7 @@ class UserSelectorModal(tk.Frame):
                 fg=TERM_PURPLE,
             ).grid(row=0, column=1, columnspan=2, sticky="w")
 
-        # Колонка 1 (зліва): [01]..[06]
+        # Column 1 (left): [01]..[06]
         for row_idx, uid in enumerate(range(1, 7), start=1):
             lbl = make_term_label(
                 grid_frame,
@@ -757,7 +792,7 @@ class UserSelectorModal(tk.Frame):
             self.item_labels[uid] = lbl
 
         if self.sudo_unlocked:
-            # Колонка 2 (посередині): [07]..[12]
+            # Column 2 (middle): [07]..[12]
             for row_idx, uid in enumerate(range(7, 13), start=1):
                 lbl = make_term_label(
                     grid_frame,
@@ -767,7 +802,7 @@ class UserSelectorModal(tk.Frame):
                 lbl.grid(row=row_idx, column=1, sticky="w")
                 self.item_labels[uid] = lbl
 
-            # Колонка 3 (справа): [13]..[18]
+            # Column 3 (right): [13]..[16]
             for row_idx, uid in enumerate(range(13, 17), start=1):
                 lbl = make_term_label(
                     grid_frame,
@@ -776,7 +811,7 @@ class UserSelectorModal(tk.Frame):
                 )
                 lbl.grid(row=row_idx, column=2, sticky="w")
                 self.item_labels[uid] = lbl
-            # Порожній рядок висотою в 1 термінальний рядок + [17] під другою колонкою
+            # One-line vertical spacer followed by [17] underneath the middle column
             make_term_label(grid_frame, font=self.term_font, text="").grid(row=7, column=1, sticky="w")
             lbl_17 = make_term_label(
                 grid_frame,
@@ -925,7 +960,7 @@ class UserSelectorModal(tk.Frame):
             self._handle_number_input(event.char)
             return
 
-        # Відстеження "sudo" на EN / DE / UA / RU розкладках клавіатури
+        # Track "sudo" sequence across EN / DE / UA / RU keyboard layouts
         if not (event.state & 0x4):
             mapped = translate_sudo_key(event)
             if mapped:
@@ -956,12 +991,11 @@ class UserSelectorModal(tk.Frame):
 
 
 class MainMenuModal(tk.Frame):
-    """
-    Головне меню GVK PRIVATE AI:
-      - Під заголовком зліва: `Увійшли як: <Ім'я>` у кольорі Cyan (вибір за `0` або стрілкою Вгору).
-      - Перша колонка (зліва): пункти режиму `[01]..[04]`.
-      - При натисканні на `[01] Написати комусь` відкривається середня колонка з вибором персонажа:
-        `[01] Друг 1`, `[02] Друг 2 (недоступно)`, `[03] Друг 3 (недоступно)`.
+    """Main menu screen for GVK Private AI.
+
+    Displays the active user indicator (`0` or Up arrow to switch users), the
+    left column of chat modes (`[01]..[04]`), and a secondary middle column of
+    selectable personas opened when choosing mode `[01]`.
     """
 
     def __init__(
@@ -989,7 +1023,7 @@ class MainMenuModal(tk.Frame):
 
         self.selected_index = 1
         self.persona_column_open = False
-        self.active_column = 0  # 0 = ліва колонка режимів, 1 = середня колонка персонажів
+        self.active_column = 0  # 0 = left mode column, 1 = middle persona column
         self.selected_persona_index = 1
 
         self.item_labels: Dict[int, tk.Label] = {}
@@ -1010,7 +1044,7 @@ class MainMenuModal(tk.Frame):
             self.user_label.pack(anchor="w")
         self.item_labels[0] = self.user_label
 
-        # Статус-повідомлення (якщо не передано зовнішній on_status у футері)
+        # Status message (used only when no external footer on_status callback is provided)
         self.status_label = make_term_label(
             self,
             font=term_font,
@@ -1020,7 +1054,7 @@ class MainMenuModal(tk.Frame):
         if self.on_status is None:
             self.status_label.pack(side=tk.BOTTOM, anchor="w")
 
-        # Центральна 3-колонкова зона: Колонка 0 зліва, Колонка 1 посередині
+        # Central 3-column grid: column 0 on the left, column 1 in the middle
         self.center_area = tk.Frame(self, bg=BG_BLACK)
         self.center_area.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
 
@@ -1040,7 +1074,7 @@ class MainMenuModal(tk.Frame):
             if k != 0:
                 del self.item_labels[k]
 
-        # Ліва колонка (режими)
+        # Left column (chat modes)
         for row_idx, item in enumerate(self.menu_items):
             idx = int(item["id"])
             label_text = f"[{idx:02d}] {item['label']}"
@@ -1052,7 +1086,7 @@ class MainMenuModal(tk.Frame):
             lbl.grid(row=row_idx, column=0, sticky="w")
             self.item_labels[idx] = lbl
 
-        # Середня колонка (вибір співрозмовника при натисканні [01] Написати комусь)
+        # Middle column (persona selection opened via mode [01])
         if self.persona_column_open:
             for row_idx, p_item in enumerate(self.persona_items):
                 p_idx = int(p_item["id"])
@@ -1129,7 +1163,7 @@ class MainMenuModal(tk.Frame):
         self._build_columns()
 
     def handle_key(self, event: tk.Event) -> None:
-        # Якщо активна середня колонка вибору персонажа
+        # Handle keys while the middle persona column is active
         if self.active_column == 1 and self.persona_column_open:
             max_p = len(self.persona_items)
 
@@ -1182,7 +1216,7 @@ class MainMenuModal(tk.Frame):
                 return
             return
 
-        # Ліва колонка головного меню
+        # Handle keys in the left main-menu column
         max_idx = len(self.menu_items)
 
         if event.keysym == "Up":
@@ -1241,13 +1275,12 @@ class MainMenuModal(tk.Frame):
 
 
 class PersonaLoadingModal(tk.Frame):
-    """
-    Модальний екран завантаження вибраного персонажа:
-      - Посередині зверху: `Завантажуємо <родовий відмінок>...` (наприклад `Завантажуємо Друга 1...`)
-      - Під ним (над смугою завантаження): випадково обрана порада (`loading_tips`), що змінюється кожні 10 с, у кольорі персонажа.
-      - Посередині: смуга завантаження у кольорі персонажа з випадковою швидкістю (змінюється кожні 5 с), розрахованою на ~60 с до 100%.
-      - У футері справа: час, що минув (`0s...`, `1s...`, ...).
-      - Якщо сервер і 2 warmup-питання завершилися раніше (або сервер уже був запущений), смуга миттєво стрибає на 100% і переходить у чат.
+    """Modal loading screen shown while preparing a selected persona.
+
+    Displays a centered loading header, rotating persona-colored tips, an
+    animated progress bar targeting ~60s with randomized speed intervals, and
+    an elapsed-seconds indicator in the footer. Jumps straight to 100% and
+    transitions into chat as soon as the background task finishes.
     """
 
     def __init__(
@@ -1354,7 +1387,7 @@ class PersonaLoadingModal(tk.Frame):
         return base_rate * random.uniform(0.4, 1.6)
 
     def start(self) -> None:
-        """Запускає таймер відліку часу/смуги та фоновий потік підготовки моделі."""
+        """Start the progress-bar timer and optional background model-preparation thread."""
         now = time.monotonic()
         self._start_time = now
         self._last_tick_time = now
@@ -1371,7 +1404,7 @@ class PersonaLoadingModal(tk.Frame):
                 try:
                     self.background_task()
                 except Exception as exc:
-                    logger.exception("Помилка фонової підготовки персонажа: %s", exc)
+                    logger.exception("Background persona preparation failed: %s", exc)
                 finally:
                     self._task_done = True
 
@@ -1453,12 +1486,12 @@ class PersonaLoadingModal(tk.Frame):
 
 
 def compute_line_delay_ms(line: str) -> int:
-    """Мапить довжину рядка у затримку появи наступного рядка в межах 0..1000 мс (80+ символів = 1 с)."""
+    """Map a line's character length to a reveal delay in `0..1000` ms (`80+` chars = `1000` ms)."""
     ratio = min(1.0, max(0.0, len(line) / 80.0))
     return int(round(ratio * 1000))
 
 
-# Таблиця зміщень 8 точок Unicode Braille (U+2800..U+28FF): (біт, колонка 0..1, рядок 0..3)
+# Bit offsets for the 8 Unicode Braille dots (U+2800..U+28FF): (bitmask, col 0..1, row 0..3)
 _BRAILLE_DOT_BITS: Tuple[Tuple[int, int, int], ...] = (
     (0x01, 0, 0),
     (0x02, 0, 1),
@@ -1472,12 +1505,13 @@ _BRAILLE_DOT_BITS: Tuple[Tuple[int, int, int], ...] = (
 
 
 class BraillePortraitCanvas(tk.Canvas):
-    """
-    Шрифто-незалежний рендерер ASCII/Braille-портретів на `tk.Canvas`:
-      - Символи Unicode Braille (`U+2800`..`U+28FF`) декодуються у 2x4 сітку піксельних прямокутників,
-        що гарантує однакову ширину всіх рядків незалежно від системних шрифтів.
-      - Будь-які інші непробільні символи рендеряться у тій же фіксованій клітинці як запасний варіант.
-      - Метод `set_portrait(text, color)` дозволяє миттєво змінювати емоцію / спрайт без зсуву макета.
+    """Font-independent ASCII/Braille portrait renderer built on `tk.Canvas`.
+
+    Decodes Unicode Braille characters (`U+2800`..`U+28FF`) into a 2x4 grid of
+    pixel rectangles so every line has identical width across platforms and
+    system fonts. Non-whitespace fallback characters render centered in the
+    same fixed cell grid. Call `set_portrait(text, color)` to swap emotion
+    sprites in place without shifting layout.
     """
 
     def __init__(
@@ -1557,9 +1591,16 @@ _SMILE_SLANG_WORDS = ("имба", "база", "кайф", "красава", "у�
 
 
 def detect_reply_emotion(reply_text: str) -> Tuple[str, str]:
-    """
-    Визначає післявідповідну емоцію (`smiling` або `idle`) за легким евристичним аналізом
-    та опційним тегом `[MOOD:<state>]` (який вирізається перед рендером).
+    """Infer the post-reply emotion (`smiling` or `idle`) from reply text.
+
+    Extracts and strips any explicit `[MOOD:<state>]` tag before applying
+    lightweight laugh/slang heuristics.
+
+    Args:
+        reply_text: Raw reply string from the persona model.
+
+    Returns:
+        Tuple of `(cleaned_text, emotion_state)`.
     """
     explicit_mood: Optional[str] = None
     match = _MOOD_TAG_RE.search(reply_text)
@@ -1581,15 +1622,11 @@ def detect_reply_emotion(reply_text: str) -> Tuple[str, str]:
 
 
 class ChatSessionModal(tk.Frame):
-    """
-    Термінальний екран чату із вибраним персонажем (або кількома персонажами):
-      - Верхня стрічка: зліва `Співрозмовник: ...` (або `Співрозмовники: ...`), справа `Увійшли як: ...`,
-        відділена від основної області білою горизонтальною лінією.
-      - Ліва частина: ASCII-портрет персонажа, відділений вертикальною білою лінією до нижньої стрічки.
-      - Права частина: повідомлення співрозмовника зліва (ім'я у дужках `[Ім'я]` у кольорі персонажа),
-        повідомлення користувача справа (`[Ім'я]` без двокрапки, вирівняні по правому краю),
-        анімований індикатор `<Персонаж> друкує...` під останнім повідомленням,
-        та поле вводу знизу з автоматичним перенесенням і `Shift+Enter`, відділене білими лініями.
+    """Terminal chat screen for one-on-one or multi-persona conversations.
+
+    Layout consists of a left pane (Braille portrait and persona dossier panel)
+    separated by a vertical divider from the right pane (scrollable message
+    history with animated typing indicator and multi-line `Shift+Enter` input).
     """
 
     def __init__(
@@ -1655,11 +1692,11 @@ class ChatSessionModal(tk.Frame):
         # (speaker, text, color, is_user)
         self.chat_lines: List[Tuple[str, str, str, bool]] = []
 
-        # Основна область між верхньою та нижньою білими лініями (які рендерить GVKMenuApp)
+        # Main body region between the top and bottom white dividers rendered by GVKMenuApp
         body_area = tk.Frame(self, bg=BG_BLACK)
         body_area.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
 
-        # Ліва колонка: портрет персонажа + короткий опис під портретом (прилягає до краю і вертикальної лінії)
+        # Left pane: persona portrait and dossier panel (flush with window edge and divider)
         self.left_pane = tk.Frame(body_area, bg=BG_BLACK)
         self.left_pane.pack(side=tk.LEFT, fill=tk.Y)
 
@@ -1690,14 +1727,14 @@ class ChatSessionModal(tk.Frame):
         self.dossier_emotion_label: Optional[tk.Label] = None
         self._build_dossier_panel(dossier_info)
 
-        # Вертикальна біла лінія від верхньої лінії до нижньої
+        # Vertical white divider spanning from top rule to bottom rule
         tk.Frame(body_area, bg=TERM_WHITE, width=1).pack(side=tk.LEFT, fill=tk.Y)
 
-        # Права колонка: історія чату зверху + поле вводу знизу
+        # Right pane: scrollable chat history on top and input prompt at bottom
         self.right_pane = tk.Frame(body_area, bg=BG_BLACK)
         self.right_pane.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
-        # Поле вводу знизу (відділене зверху білою лінією від чату)
+        # Bottom input container separated from chat history by a horizontal white rule
         input_container = tk.Frame(self.right_pane, bg=BG_BLACK)
         input_container.pack(side=tk.BOTTOM, fill=tk.X)
 
@@ -1963,7 +2000,7 @@ class ChatSessionModal(tk.Frame):
             self._reset_afk_timer()
 
     def set_portrait(self, portrait_text: str, color: Optional[str] = None) -> None:
-        """Оновлює портрет персонажа (для машини станів емоцій)."""
+        """Update the displayed persona portrait sprite for the emotion state machine."""
         self.portrait_canvas.set_portrait(portrait_text, color=color)
         is_packed = bool(self.portrait_canvas.winfo_manager())
         if portrait_text:
@@ -2168,7 +2205,7 @@ class ChatSessionModal(tk.Frame):
         self._render_messages(smooth_scroll=True)
 
     def reset_chat(self) -> None:
-        """Очищає поточну розмову та запускає новий чистий чат (CTRL+N)."""
+        """Clear the active conversation history and start a fresh chat session (`CTRL+N`)."""
         self._session_generation += 1
         self._stop_typing_indicator()
         self._stop_talking_anim()
@@ -2345,11 +2382,10 @@ class ChatSessionModal(tk.Frame):
 
 
 class ConfirmExitOverlay(tk.Frame):
-    """
-    Перевикористовуваний дворядковий модальний блок підтвердження виходу (`CTRL+C`) внизу зліва:
-      Рядок 1: "Ви дійсно хочете вийти?"
-      Рядок 2: "Так Ні"
-    Займає рівно ті ж 2 фіксовані рядки, що й стандартний футер, тому не зсуває текст на екрані.
+    """Reusable two-line exit confirmation prompt (`CTRL+C`) in the bottom-left slot.
+
+    Occupies the exact same two-line height as the default footer slot so
+    toggling the prompt never shifts screen content.
     """
 
     def __init__(
@@ -2425,10 +2461,10 @@ class ConfirmExitOverlay(tk.Frame):
 
 
 # =====================================================================
-# ГОЛОВНИЙ ДОДАТОК GVK MENU SHELL
+# MAIN APPLICATION: GVK MENU SHELL
 # =====================================================================
 def format_legend_pair(key: str, action: str, target_width: int) -> str:
-    """Вирівнює пару `КЛАВІША = Дія` пробілами навколо `=` до заданої ширини у символах."""
+    """Pad a `KEY = Action` footer legend string around `=` to reach `target_width` characters."""
     total_spaces = max(2, target_width - len(key) - len(action) - 1)
     left_spaces = total_spaces // 2
     right_spaces = total_spaces - left_spaces
@@ -2436,10 +2472,12 @@ def format_legend_pair(key: str, action: str, target_width: int) -> str:
 
 
 class GVKMenuApp:
-    """
-    Головна оболонка `core/menu.py` (1280x720, без зміни розміру, класичний термінал).
-    Зберігає вибраного користувача у `self.selected_user_name` та `self.selected_user_id`
-    для подальшої передачі в `core/orchestrator.py`.
+    """Main terminal UI shell for `core/menu.py` (fixed 1280x720 window).
+
+    Manages navigation across splash, user selection, legal warnings, launch
+    confirmation, main menu, persona loading, and chat views while storing the
+    selected user profile (`selected_user_id`, `selected_user_name`) for
+    `core/orchestrator.py`.
     """
 
     def __init__(
@@ -2521,15 +2559,15 @@ class GVKMenuApp:
         self.root.maxsize(WINDOW_WIDTH, WINDOW_HEIGHT)
         self.root.resizable(False, False)
 
-        # Єдиний моноширинний шрифт одного розміру для всього терміналу
+        # Single uniform monospace font used across the entire terminal UI
         mono_family = "Consolas" if sys.platform.startswith("win") else "Courier"
         self.term_font = tkfont.Font(family=mono_family, size=12, weight="normal")
 
-        # Головний внутрішній контейнер (без бокового padx, щоб лінії в чаті доходили до країв вікна)
+        # Main viewport container (no horizontal padding so chat rules reach window edges)
         self.viewport = tk.Frame(self.root, bg=BG_BLACK)
         self.viewport.pack(fill=tk.BOTH, expand=True, pady=12)
 
-        # Постійний верхній заголовок посередині: GVK PRIVATE AI [1.0.0] (просто білий)
+        # Persistent centered top header banner
         self.header_frame = tk.Frame(self.viewport, bg=BG_BLACK)
         self.header_frame.pack(side=tk.TOP, fill=tk.X, padx=LEFT_PAD)
         self.header_label = make_term_label(
@@ -2541,7 +2579,7 @@ class GVKMenuApp:
         )
         self.header_label.pack(anchor="center")
 
-        # Другий рядок верхньої стрічки (Співрозмовник зліва, Увійшли як справа)
+        # Second header row (active peer(s) on the left, signed-in user on the right)
         self.sub_header_frame = tk.Frame(self.viewport, bg=BG_BLACK)
         self.sub_header_frame.pack(side=tk.TOP, fill=tk.X, padx=LEFT_PAD)
         self.top_peers_label = make_term_label(
@@ -2560,19 +2598,19 @@ class GVKMenuApp:
         )
         self.top_user_label.pack(side=tk.RIGHT, anchor="e")
 
-        # Верхня біла лінія під верхньою стрічкою (прихована на екрані-заставці через BG_BLACK)
+        # Top white divider rule (hidden on the initial splash screen via BG_BLACK)
         self.top_white_line = tk.Frame(self.viewport, bg=BG_BLACK, height=1)
         self.top_white_line.pack(side=tk.TOP, fill=tk.X, pady=(4, 0))
 
-        # Постійний дворядковий нижній бар:
-        #   Ліворуч: слот CTRL+C = Вийти (2 рядки під "Вийти з GVK? / Так Ні")
-        #   Праворуч: 2 рядки на всю решту ширини:
-        #     Рядок 1: усі легенди клавіш В ОДИН РЯДОК
-        #     Рядок 2: статус / відлік / помилки справа (не заважає 1-му рядку)
+        # Persistent two-line footer bar:
+        #   Left: CTRL+C exit slot (2 lines reserved for ConfirmExitOverlay)
+        #   Right: 2 lines spanning remaining width:
+        #     Row 1: all keybinding legends on a single line
+        #     Row 2: right-aligned status / countdown / error messages
         self.footer_frame = tk.Frame(self.viewport, bg=BG_BLACK)
         self.footer_frame.pack(side=tk.BOTTOM, fill=tk.X, padx=LEFT_PAD)
 
-        # Елемент 1: CTRL+C = Вийти (або ConfirmExitOverlay тієї ж ширини)
+        # Left footer slot: exit hint (or ConfirmExitOverlay of matching width)
         self.footer_col1_slot = tk.Frame(self.footer_frame, bg=BG_BLACK)
         self.footer_col1_slot.pack(side=tk.LEFT, anchor="nw", padx=(0, 16))
 
@@ -2597,7 +2635,7 @@ class GVKMenuApp:
         self.footer_legend_frame = tk.Frame(self.footer_right_area, bg=BG_BLACK)
         self.footer_legend_frame.pack(side=tk.TOP, fill=tk.X, anchor="nw")
 
-        # Динамічні легенди в 1-му рядку: компенсуємо пробілами лише коротші варіанти
+        # Dynamic row-1 legends: pad shorter variants with spaces to preserve alignment
         self._arrows_width = len("СТРІЛОЧКИ = Навігація")
         self._enter_width = len("ENTER = Підтвердити")
 
@@ -2617,7 +2655,7 @@ class GVKMenuApp:
         )
         self.footer_enter_label.pack(side=tk.LEFT, anchor="nw", padx=(0, 16))
 
-        # Додаткові легенди в 1-му рядку (лише в чаті)
+        # Extra row-1 legends shown only in chat sessions
         self.footer_chat_legends = tk.Frame(self.footer_legend_frame, bg=BG_BLACK)
         make_term_label(
             self.footer_chat_legends,
@@ -2639,7 +2677,7 @@ class GVKMenuApp:
         )
         self.footer_new_chat_label.pack(side=tk.LEFT, anchor="nw")
 
-        # Правий статус/помилка/відлік на нижньому (2-му) рядку справа
+        # Right-aligned status / error / countdown label on row 2
         footer_row2 = tk.Frame(self.footer_right_area, bg=BG_BLACK)
         footer_row2.pack(side=tk.TOP, fill=tk.X)
         self.footer_status_label = make_term_label(
@@ -2652,11 +2690,11 @@ class GVKMenuApp:
         )
         self.footer_status_label.pack(side=tk.RIGHT, anchor="e")
 
-        # Нижня біла лінія над нижньою стрічкою (піднята на 3px; прихована на заставці через BG_BLACK)
+        # Bottom white divider rule (3px above footer; hidden on splash via BG_BLACK)
         self.bottom_white_line = tk.Frame(self.viewport, bg=BG_BLACK, height=1)
         self.bottom_white_line.pack(side=tk.BOTTOM, fill=tk.X, pady=(0, 3))
 
-        # Динамічна робоча область між заголовком і футером
+        # Dynamic stage area between header and footer
         self.stage_frame = tk.Frame(self.viewport, bg=BG_BLACK)
         self.stage_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
 
@@ -2664,7 +2702,7 @@ class GVKMenuApp:
         self.exit_overlay: Optional[ConfirmExitOverlay] = None
         self._last_paste_ts: float = 0.0
 
-        # Перехоплення клавіш, CTRL+C, CTRL+N та вставки тексту
+        # Global keybindings for navigation, CTRL+C, CTRL+N, and clipboard paste
         self.root.bind("<Key>", self._on_key_press)
         self.root.bind("<Control-c>", self._on_ctrl_c)
         self.root.bind("<Control-C>", self._on_ctrl_c)
@@ -2678,7 +2716,7 @@ class GVKMenuApp:
             self.root.bind("<Command-V>", self._on_paste)
         self.root.protocol("WM_DELETE_WINDOW", self.show_exit_overlay)
 
-        # Стартуємо з 20-секундного екрана авторських прав
+        # Start with the initial copyright / disclaimer splash screen
         self.show_initial_splash()
 
     def set_footer_status(self, text: str = "", fg: str = TERM_RED) -> None:
@@ -2734,7 +2772,7 @@ class GVKMenuApp:
             self.footer_chat_legends.pack_forget()
 
     # -----------------------------------------------------------------
-    # ЕТАПИ ОНБОРДИНГУ ТА ГОЛОВНОГО МЕНЮ
+    # ONBOARDING FLOW AND MAIN MENU
     # -----------------------------------------------------------------
     def show_initial_splash(self) -> None:
         modal = TimedMessageModal(
@@ -2768,7 +2806,7 @@ class GVKMenuApp:
         entry = USERS_DICT.get(user_id, {})
         self.selected_user_experimental = bool(entry.get("experimental", user_id >= 7))
         logger.info(
-            "Користувач обрав профіль: [%02d] %s (experimental=%s, sudo=%s)",
+            "User selected profile: [%02d] %s (experimental=%s, sudo=%s)",
             user_id,
             user_name,
             self.selected_user_experimental,
@@ -2846,12 +2884,12 @@ class GVKMenuApp:
         self._set_modal(modal)
 
     def _on_main_menu_action(self, item_id: int, label: str) -> None:
-        logger.info("Обрано пункт головного меню: [%02d] %s", item_id, label)
+        logger.info("Main menu item selected: [%02d] %s", item_id, label)
         self.set_footer_status(f"Вибрано: [{item_id:02d}] {label}", TERM_GREEN)
 
     def _on_persona_selected(self, persona_id: str, persona_label: str) -> None:
         self.selected_persona_id = persona_id
-        logger.info("Обрано персонажа для діалогу: %s (%s)", persona_id, persona_label)
+        logger.info("Persona selected for dialogue: %s (%s)", persona_id, persona_label)
         if self.on_persona_selected_callback is not None:
             self.on_persona_selected_callback(persona_id, persona_label)
         self.show_persona_loading(persona_id, persona_label)
@@ -2992,7 +3030,7 @@ class GVKMenuApp:
                 if hasattr(self.orchestrator, "get_persona_dossier"):
                     dossier_info = self.orchestrator.get_persona_dossier(current_emotion="idle")
             except Exception as exc:
-                logger.exception("Помилка ініціалізації сесії оркестратора: %s", exc)
+                logger.exception("Failed to initialize orchestrator session: %s", exc)
 
         def _async_send(user_msg: str, deliver_cb: Callable[[str], None]) -> None:
             if self.orchestrator is None:
@@ -3036,7 +3074,7 @@ class GVKMenuApp:
             self.set_footer_status(startup_warning, TERM_AMBER)
 
     # -----------------------------------------------------------------
-    # МОДАЛЬНИЙ ОВЕРЛЕЙ ВИХОДУ (CTRL+C) ТА НОВИЙ ЧАТ (CTRL+N)
+    # EXIT CONFIRMATION OVERLAY (CTRL+C) AND NEW CHAT (CTRL+N)
     # -----------------------------------------------------------------
     def _on_ctrl_c(self, _event: Optional[tk.Event] = None) -> str:
         self.show_exit_overlay()
@@ -3117,14 +3155,15 @@ class GVKMenuApp:
 
 
 # =====================================================================
-# АВТОМАТИЧНА САМОПЕРЕВІРКА (SELF-TEST)
+# AUTOMATED SELF-TEST
 # =====================================================================
 def run_self_test() -> None:
+    """Run headless Tkinter self-tests verifying menu navigation, paste, and chat widgets."""
     print("====================================================================")
-    print(" [*] GVK Private AI — Самоперевірка core/menu.py")
+    print(" [*] GVK Private AI - Self-test for core/menu.py")
     print("====================================================================")
 
-    assert len(USERS_DICT) == 17, f"Очікувалось 17 записів у USERS_DICT, отримано {len(USERS_DICT)}"
+    assert len(USERS_DICT) == 17, f"Expected 17 entries in USERS_DICT, got {len(USERS_DICT)}"
     assert USERS_DICT[1]["locked"] is True
     assert len(WARNING_SCREENS) == 4
     assert is_valid_launch_phrase(LAUNCH_PHRASE_DISPLAY) is True
@@ -3137,7 +3176,7 @@ def run_self_test() -> None:
     assert app.header_label.cget("text") == APP_HEADER
     assert app.header_label.cget("fg") == TERM_WHITE
 
-    # 1. Перевірка розблокування sudo українською розкладкою ("ігвщ") та переходів [12]/[16] <-> [17] і [17] -> Left -> [06]
+    # 1. Verify sudo unlock on Ukrainian layout ("ігвщ") and [12]/[16] <-> [17], [17] -> Left -> [06] navigation
     app.show_user_selector()
     app.root.update()
     selector = app.active_modal
@@ -3151,7 +3190,7 @@ def run_self_test() -> None:
         ev.keycode = 0
         ev.state = 0
         selector.handle_key(ev)
-    assert selector.sudo_unlocked is True, "Не спрацювало розблокування sudo на українській розкладці (ігвщ)"
+    assert selector.sudo_unlocked is True, "Failed to unlock sudo using Ukrainian layout (ігвщ)"
     assert len(selector.item_labels) == 17
     assert int(selector.item_labels[17].grid_info()["column"]) == 1
 
@@ -3178,38 +3217,38 @@ def run_self_test() -> None:
     # [06] -> Down -> [07]
     selector.selected_id = 6
     selector.handle_key(ev_down)
-    assert selector.selected_id == 7, f"Очікувався перехід [06] -> [07], отримано {selector.selected_id}"
+    assert selector.selected_id == 7, f"Expected transition [06] -> [07], got {selector.selected_id}"
 
     # [12] -> Down -> [17] -> Up -> [12]
     selector.selected_id = 12
     selector.handle_key(ev_down)
-    assert selector.selected_id == 17, f"Очікувався перехід [12] -> [17], отримано {selector.selected_id}"
+    assert selector.selected_id == 17, f"Expected transition [12] -> [17], got {selector.selected_id}"
     selector.handle_key(ev_up)
-    assert selector.selected_id == 12, f"Очікувався перехід [17] -> [12], отримано {selector.selected_id}"
+    assert selector.selected_id == 12, f"Expected transition [17] -> [12], got {selector.selected_id}"
 
     # [16] -> Down -> [17] -> Up -> [12]
     selector.selected_id = 16
     selector.handle_key(ev_down)
-    assert selector.selected_id == 17, f"Очікувався перехід [16] -> [17], отримано {selector.selected_id}"
+    assert selector.selected_id == 17, f"Expected transition [16] -> [17], got {selector.selected_id}"
     selector.handle_key(ev_up)
-    assert selector.selected_id == 12, f"Очікувався перехід [17] -> [12], отримано {selector.selected_id}"
+    assert selector.selected_id == 12, f"Expected transition [17] -> [12], got {selector.selected_id}"
 
     # [17] -> Left -> [06], [17] -> Right -> [16]
     selector.selected_id = 17
     selector.handle_key(ev_left)
-    assert selector.selected_id == 6, f"Очікувався перехід [17] -> [06] по Left, отримано {selector.selected_id}"
+    assert selector.selected_id == 6, f"Expected transition [17] -> [06] on Left, got {selector.selected_id}"
     selector.selected_id = 17
     selector.handle_key(ev_right)
-    assert selector.selected_id == 16, f"Очікувався перехід [17] -> [16] по Right, отримано {selector.selected_id}"
+    assert selector.selected_id == 16, f"Expected transition [17] -> [16] on Right, got {selector.selected_id}"
 
-    # [17] -> paste у кастомне поле імені
+    # [17] -> paste into custom username field
     selector.selected_id = 17
     app.root.clipboard_clear()
     app.root.clipboard_append("ТестовийКористувач")
     selector.handle_paste()
-    assert selector.custom_text == "ТестовийКористувач", f"Не спрацював paste у [17]: {selector.custom_text!r}"
+    assert selector.custom_text == "ТестовийКористувач", f"Paste failed in [17]: {selector.custom_text!r}"
 
-    # 2. Перевірка розблокування sudo російською розкладкою ("ыгвщ")
+    # 2. Verify sudo unlock on Russian layout ("ыгвщ")
     app.sudo_mode = False
     app.show_user_selector()
     app.root.update()
@@ -3222,9 +3261,9 @@ def run_self_test() -> None:
         ev.keycode = 0
         ev.state = 0
         selector_ru.handle_key(ev)
-    assert selector_ru.sudo_unlocked is True, "Не спрацювало розблокування sudo на російській розкладці (ыгвщ)"
+    assert selector_ru.sudo_unlocked is True, "Failed to unlock sudo using Russian layout (ыгвщ)"
 
-    # 3. Перевірка вибору користувача [02] та відліку часу
+    # 3. Verify user [02] selection and timed modal transition
     user2_name = str(USERS_DICT[2]["name"])
     p1_name = str(PERSONA_SELECT_ITEMS[0]["label"]).replace(" (недоступно)", "")
     p3_name = str(PERSONA_SELECT_ITEMS[2]["label"]).replace(" (недоступно)", "")
@@ -3233,7 +3272,7 @@ def run_self_test() -> None:
     assert app.selected_user_name == user2_name
     assert isinstance(app.active_modal, TimedMessageModal)
 
-    # 4. Перевірка екрана підтвердження фрази та вставки з буфера обміну (з debounce від подвійного paste)
+    # 4. Verify launch-phrase confirmation screen and clipboard paste (with double-paste debounce)
     app.show_launch_confirmation()
     app.root.update()
     assert isinstance(app.active_modal, TypingConfirmationModal)
@@ -3244,7 +3283,7 @@ def run_self_test() -> None:
     app._on_paste()
     assert app.active_modal.typed_text == LAUNCH_PHRASE_CORE
 
-    # Перевірка групового чату: Співрозмовники у кольорі TERM_CYAN
+    # Verify group chat header renders peers in TERM_CYAN
     group_modal = ChatSessionModal(
         app.stage_frame,
         user_name=user2_name,
@@ -3267,14 +3306,14 @@ def run_self_test() -> None:
     assert app.active_modal.user_label.cget("text") == f"Увійшли як: {user2_name}"
     assert app.active_modal.user_label.cget("fg") == TERM_CYAN
 
-    # 5. Перевірка оверлею виходу CTRL+C
+    # 5. Verify CTRL+C exit confirmation overlay
     app.show_exit_overlay()
     app.root.update()
     assert app.exit_overlay is not None
     app.hide_exit_overlay()
     assert app.exit_overlay is None
 
-    # 6. Перевірка чату: футер з ESC, вирівнювання багаторядкових повідомлень, анімація крапок та затримка 0..1 с
+    # 6. Verify chat screen: ESC footer, multi-line alignment, typing animation, and 0..1s line delay
     assert compute_line_delay_ms("") == 0
     assert compute_line_delay_ms("a" * 40) == 500
     assert compute_line_delay_ms("a" * 80) == 1000
@@ -3294,7 +3333,7 @@ def run_self_test() -> None:
     assert app.footer_enter_label.cget("text") == format_legend_pair("ENTER", "Надіслати", app._enter_width)
     assert app.footer_chat_legends.winfo_manager() == "pack"
 
-    # Перевірка рендерера Braille-портрету та динамічної зміни емоції
+    # Verify Braille portrait renderer and dynamic emotion swap
     chat.set_portrait("⠀⣿\n⣿⠀", color="#ffaa00")
     app.root.update()
     assert chat.portrait_canvas.winfo_manager() == "pack"
@@ -3302,7 +3341,7 @@ def run_self_test() -> None:
     assert int(chat.portrait_canvas.cget("width")) == 2 * chat.portrait_canvas.cell_w
     assert int(chat.portrait_canvas.cget("height")) == 2 * chat.portrait_canvas.cell_h
 
-    # Перевірка Shift+Enter та вставки у чаті
+    # Verify Shift+Enter newline insertion and clipboard paste in chat
     app.root.clipboard_clear()
     app.root.clipboard_append("вставлено")
     ev_paste = tk.Event()
@@ -3328,7 +3367,7 @@ def run_self_test() -> None:
     chat.append_message(user2_name, "привіт", TERM_WHITE, is_user=True)
     chat._start_typing_indicator()
 
-    # Поки друг друкує, користувач може вводити текст, але Enter показує помилку "Дочекайтеся відповіді!"
+    # While waiting for a reply, typing works but Enter shows the wait warning
     ev_char = tk.Event()
     ev_char.keysym = "a"
     ev_char.char = "a"
@@ -3358,7 +3397,7 @@ def run_self_test() -> None:
     chat._on_reply_received("ок\nта ні")
     assert chat.chat_lines[-1][1] == "ок"
     assert chat.is_waiting_reply is True
-    # Дочекаємось появи другого рядка ("та ні" -> ~63 мс)
+    # Wait for the second line to appear ("та ні" -> ~63 ms)
     import time
 
     deadline = time.time() + 1.0
@@ -3370,7 +3409,7 @@ def run_self_test() -> None:
     assert chat.typing_label is None
     assert app.footer_status_label.cget("text") == ""
 
-    # Перевірка скролінгу чату при переповненні (Up/Down)
+    # Verify chat scrolling on overflow (Up/Down)
     for i in range(25):
         chat.append_message(p1_name, f"повідомлення {i}", "#ffaa00", is_user=False)
     app.root.update()
@@ -3380,7 +3419,7 @@ def run_self_test() -> None:
     assert chat._user_scrolled_up is True
     assert float(chat.chat_canvas.yview()[1]) < 0.999
 
-    # Нове повідомлення від друга примусово прокручує чат донизу
+    # Incoming persona message forces chat to scroll back to bottom
     chat._on_reply_received("нове повідомлення знизу")
     assert chat._user_scrolled_up is False
     deadline = time.time() + 1.0
@@ -3389,7 +3428,7 @@ def run_self_test() -> None:
         time.sleep(0.01)
     assert float(chat.chat_canvas.yview()[1]) >= 0.999
 
-    # Перевірка CTRL+N = Новий чат (підпис у футері + скидання історії на EN та UA розкладках)
+    # Verify CTRL+N new chat (footer legend + history reset on EN and UA layouts)
     assert app.footer_new_chat_label.cget("text") == "CTRL+N = Новий чат"
     chat.typed_text = "недописаний текст"
     ev_ctrl_n_ua = tk.Event()
@@ -3403,7 +3442,7 @@ def run_self_test() -> None:
     assert chat.current_emotion == "idle"
     assert app.footer_status_label.cget("text") == "Новий чат розпочато."
 
-    # Перевірка групового чату: Співрозмовники у кольорі TERM_CYAN
+    # Verify group chat header renders peers in TERM_CYAN
     group_modal = ChatSessionModal(
         app.stage_frame,
         user_name=user2_name,
@@ -3420,7 +3459,7 @@ def run_self_test() -> None:
     assert app.top_peers_label.cget("text") == f"Співрозмовники: {p1_name}, {p3_name}"
     assert app.top_peers_label.cget("fg") == TERM_CYAN
 
-    # Перевірка, що вертикальний розділювач прилягає впритул до правого краю портрета навіть із довгим текстом профілю
+    # Verify vertical divider stays flush with portrait right edge even with long dossier text
     dossier_modal = ChatSessionModal(
         app.stage_frame,
         user_name=user2_name,
@@ -3455,22 +3494,23 @@ def run_self_test() -> None:
     assert app.bottom_white_line.cget("bg") == BG_BLACK
 
     app.root.destroy()
-    print(" [✓] Усі компоненти core/menu.py успішно пройшли самоперевірку!")
+    print(" [OK] All core/menu.py components passed self-test!")
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="GVK Private AI — Термінальне меню (core/menu.py)")
+    """Parse CLI arguments and launch the terminal UI or its headless self-test."""
+    parser = argparse.ArgumentParser(description="GVK Private AI - Terminal Menu Shell (core/menu.py)")
     parser.add_argument(
         "cmd",
         nargs="?",
         choices=["run", "self-test"],
         default="run",
-        help="Режим запуску: 'run' (за замовчуванням) або 'self-test'",
+        help="Execution mode: 'run' (default) or 'self-test'",
     )
     parser.add_argument(
         "--fast",
         action="store_true",
-        help="Швидкий режим для розробки (таймери по 1 секунді замість 20/40 с)",
+        help="Fast development mode (1s/2s timers instead of 15s/60s)",
     )
     args = parser.parse_args()
 

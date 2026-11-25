@@ -1,3 +1,24 @@
+#!/usr/bin/env python3
+"""
+GVK Private AI - Local PEFT LoRA to GGUF Converter (tools/convert_lora_to_gguf_local.py)
+
+Converts a downloaded PEFT LoRA adapter directory (`adapter_config.json` and
+`adapter_model.safetensors`) into a `llama.cpp`-compatible `.gguf` LoRA file locally
+without downloading the full base model weights.
+
+Key Responsibilities:
+  - Locate `adapter_config.json` even inside nested archive subdirectories.
+  - Bootstrap minimal CPU-only Python dependencies and shallow-clone `llama.cpp` conversion scripts.
+  - Assemble and invoke `convert_lora_to_gguf.py` with configurable quantization (`f16`, `bf16`, `q8_0`, `f32`).
+  - Support `--dry-run` inspection and an offline `self-test` command.
+
+Usage:
+  python3 tools/convert_lora_to_gguf_local.py --persona friend_1
+  python3 tools/convert_lora_to_gguf_local.py -i ./adapters/lora_final -o ./adapters/friend_1.gguf -t f16
+  python3 tools/convert_lora_to_gguf_local.py --dry-run
+  python3 tools/convert_lora_to_gguf_local.py self-test
+"""
+
 import argparse
 import importlib.util
 import os
@@ -6,34 +27,47 @@ import sys
 import tempfile
 from typing import List, Optional
 
-# ==============================================================================
-# 1. Global Configuration Variables (Defaults; override via CLI flags)
-# ==============================================================================
-# Шлях до розпакованої папки lora_final (завантаженої з Google Drive)
+# =====================================================================
+# 1. GLOBAL CONFIGURATION
+# =====================================================================
+# Path to the extracted lora_final directory (e.g., downloaded from Google Drive)
 LORA_INPUT_DIR: str = r"./adapters/lora_final"
 
-# Шлях, куди зберегти готовий файл LoRA у форматі .gguf
+# Destination path for the converted .gguf LoRA adapter file
 GGUF_OUTPUT_PATH: str = r"./adapters/friend_1.gguf"
 
-# Оригінальна базова модель на HuggingFace (скрипт скачає лише ~10 МБ конфігів/заголовків, без 28 ГБ ваг)
+# Upstream base model on Hugging Face (only ~10 MB of config/header metadata is fetched, not 28 GB of weights)
 BASE_MODEL_HF_ID: str = "Qwen/Qwen2.5-14B-Instruct"
 
-# Тип вихідних ваг адаптера: "f16" (рекомендовано), "bf16", "q8_0" або "f32"
+# Output adapter weight type: "f16" (recommended), "bf16", "q8_0", or "f32"
 OUTTYPE: str = "f16"
 
-# Робоча папка для кешування скриптів конвертації llama.cpp (вже в .gitignore під build/)
+# Local cache directory for llama.cpp conversion scripts (ignored by git under build/)
 LLAMA_CPP_DIR: str = r"./build/llama_cpp_converter"
 
 
-# ==============================================================================
-# 2. Helper Functions
-# ==============================================================================
+# =====================================================================
+# 2. HELPER FUNCTIONS
+# =====================================================================
 def resolve_lora_dir(input_dir: str) -> str:
-    """Знаходить папку з adapter_config.json (навіть якщо архів розпакувався як lora_final/lora_final)."""
+    """Locate the directory containing `adapter_config.json`.
+
+    Handles archives that extract into an extra nested folder (such as
+    `lora_final/lora_final`).
+
+    Args:
+        input_dir: Root path to search for the PEFT adapter files.
+
+    Returns:
+        Path to the directory directly containing `adapter_config.json`.
+
+    Raises:
+        FileNotFoundError: If `input_dir` does not exist or contains no `adapter_config.json`.
+    """
     if not os.path.exists(input_dir):
         raise FileNotFoundError(
-            f"❌ Папку з адаптером не знайдено за шляхом:\n   {input_dir}\n"
-            "Завантажте папку 'lora_final' із Google Drive і перевірте змінну LORA_INPUT_DIR."
+            f"[!] Adapter directory not found at:\n   {input_dir}\n"
+            "Download the 'lora_final' directory from Google Drive and verify LORA_INPUT_DIR or --input."
         )
 
     if os.path.isfile(os.path.join(input_dir, "adapter_config.json")):
@@ -41,16 +75,24 @@ def resolve_lora_dir(input_dir: str) -> str:
 
     for root, _, files in os.walk(input_dir):
         if "adapter_config.json" in files:
-            print(f"ℹ️ Знайдено adapter_config.json у вкладеній папці: {root}")
+            print(f"[*] Found adapter_config.json in nested directory: {root}")
             return root
 
     raise FileNotFoundError(
-        f"❌ У папці {input_dir} не знайдено 'adapter_config.json'.\n"
-        "Переконайтеся, що там лежать файли adapter_config.json та adapter_model.safetensors."
+        f"[!] 'adapter_config.json' not found in {input_dir}.\n"
+        "Ensure both adapter_config.json and adapter_model.safetensors are present."
     )
 
 
 def _is_installed(mod_name: str) -> bool:
+    """Check whether a Python module is importable in the current environment.
+
+    Args:
+        mod_name: Dotted module name to probe with `importlib.util.find_spec`.
+
+    Returns:
+        `True` if the module spec exists, `False` otherwise.
+    """
     try:
         return importlib.util.find_spec(mod_name) is not None
     except ModuleNotFoundError:
@@ -58,9 +100,9 @@ def _is_installed(mod_name: str) -> bool:
 
 
 def ensure_dependencies() -> None:
-    """Перевіряє та за потреби встановлює мінімальні Python-пакети для конвертації."""
+    """Install minimal CPU-only Python packages required for LoRA-to-GGUF conversion."""
     if not _is_installed("torch"):
-        print("📦 Встановлення легкого CPU-варіанту PyTorch (потрібен для читання тензорів)...")
+        print("[*] Installing lightweight CPU build of PyTorch (required for reading tensors)...")
         subprocess.run(
             [
                 sys.executable,
@@ -85,17 +127,24 @@ def ensure_dependencies() -> None:
     }
     missing = [pkg for mod, pkg in required.items() if not _is_installed(mod)]
     if missing:
-        print(f"📦 Встановлення залежностей: {', '.join(missing)}...")
+        print(f"[*] Installing missing dependencies: {', '.join(missing)}...")
         subprocess.run([sys.executable, "-m", "pip", "install", "-q", *missing], check=True)
 
 
 def ensure_llama_cpp(repo_dir: str) -> str:
-    """Клонує репозиторій llama.cpp (тільки останній коміт), якщо скрипт конвертації ще не завантажено."""
+    """Shallow-clone `llama.cpp` when `convert_lora_to_gguf.py` is not cached locally.
+
+    Args:
+        repo_dir: Local cache directory for the `llama.cpp` repository.
+
+    Returns:
+        Path to `convert_lora_to_gguf.py` inside `repo_dir`.
+    """
     script_path = os.path.join(repo_dir, "convert_lora_to_gguf.py")
     if os.path.isfile(script_path):
         return script_path
 
-    print(f"⬇️ Клонування скриптів конвертації llama.cpp у {repo_dir}...")
+    print(f"[*] Cloning llama.cpp conversion scripts into {repo_dir}...")
     os.makedirs(os.path.dirname(os.path.abspath(repo_dir)), exist_ok=True)
     subprocess.run(
         ["git", "clone", "--depth", "1", "https://github.com/ggml-org/llama.cpp.git", repo_dir],
@@ -114,7 +163,16 @@ def resolve_default_paths(
     input_dir: Optional[str] = None,
     output_path: Optional[str] = None,
 ) -> tuple[str, str]:
-    """Визначає вхідну папку PEFT-адаптера та вихідний шлях .gguf."""
+    """Resolve default input PEFT directory and output `.gguf` file path.
+
+    Args:
+        persona: Optional persona ID (e.g., `"friend_1"`).
+        input_dir: Explicit input directory override.
+        output_path: Explicit output `.gguf` file path override.
+
+    Returns:
+        Tuple of `(resolved_input_dir, resolved_output_path)`.
+    """
     if input_dir:
         resolved_in = input_dir
     elif persona:
@@ -141,7 +199,19 @@ def build_convert_command(
     outtype: str = OUTTYPE,
     python_exe: str = sys.executable,
 ) -> List[str]:
-    """Формує CLI-команду для convert_lora_to_gguf.py."""
+    """Construct the subprocess command list for `convert_lora_to_gguf.py`.
+
+    Args:
+        converter_script: Path to `llama.cpp/convert_lora_to_gguf.py`.
+        lora_dir: Resolved PEFT adapter directory.
+        output_path: Destination `.gguf` file path.
+        base_model_id: Hugging Face model ID of the base model.
+        outtype: Target weight quantization/precision (`f16`, `bf16`, `q8_0`, `f32`).
+        python_exe: Python interpreter executable path.
+
+    Returns:
+        Argument list suitable for `subprocess.run`.
+    """
     return [
         python_exe,
         converter_script,
@@ -155,9 +225,9 @@ def build_convert_command(
     ]
 
 
-# ==============================================================================
-# 3. Main Execution & CLI
-# ==============================================================================
+# =====================================================================
+# 3. MAIN EXECUTION & CLI
+# =====================================================================
 def run_convert(
     input_dir: str,
     output_path: str,
@@ -166,22 +236,35 @@ def run_convert(
     llama_cpp_dir: str = LLAMA_CPP_DIR,
     dry_run: bool = False,
 ) -> List[str]:
-    print("=" * 65)
-    print("GVK Local LoRA -> GGUF Converter")
-    print("=" * 65)
+    """Run (or preview via `dry_run`) the local PEFT LoRA to GGUF conversion.
+
+    Args:
+        input_dir: Path to the PEFT adapter folder.
+        output_path: Destination `.gguf` file path.
+        base_model_id: Hugging Face ID of the base model.
+        outtype: Target adapter precision (`f16`, `bf16`, `q8_0`, or `f32`).
+        llama_cpp_dir: Cache directory for the `llama.cpp` repository.
+        dry_run: If `True`, validate paths and print the command without executing it.
+
+    Returns:
+        The assembled conversion command list.
+    """
+    print("=" * 69)
+    print(" [*] GVK Private AI - Local LoRA to GGUF Converter")
+    print("=" * 69)
 
     lora_dir = resolve_lora_dir(input_dir)
-    print(f"📂 Папка вхідного адаптера : {lora_dir}")
-    print(f"🎯 Файл виходу GGUF        : {output_path}")
-    print(f"🧬 Базова модель (HF ID)   : {base_model_id}")
-    print(f"🗜️ Тип квантування        : {outtype}")
-    print("-" * 65)
+    print(f" Input adapter dir : {lora_dir}")
+    print(f" Output GGUF file  : {output_path}")
+    print(f" Base model (HF)   : {base_model_id}")
+    print(f" Output weight type: {outtype}")
+    print("-" * 69)
 
     if dry_run:
         converter_script = os.path.join(llama_cpp_dir, "convert_lora_to_gguf.py")
         cmd = build_convert_command(converter_script, lora_dir, output_path, base_model_id, outtype)
-        print(" [DRY-RUN] Команда конвертації:")
-        print(" ▶", " ".join(f'"{c}"' if " " in c else c for c in cmd))
+        print(" [*] [DRY-RUN] Conversion command:")
+        print("     ", " ".join(f'"{c}"' if " " in c else c for c in cmd))
         return cmd
 
     ensure_dependencies()
@@ -193,22 +276,23 @@ def run_convert(
 
     cmd = build_convert_command(converter_script, lora_dir, output_path, base_model_id, outtype)
 
-    print("⚙️ Запускаю конвертацію LoRA -> GGUF...")
-    print("▶", " ".join(f'"{c}"' if " " in c else c for c in cmd))
+    print("[*] Starting LoRA -> GGUF conversion...")
+    print("    ", " ".join(f'"{c}"' if " " in c else c for c in cmd))
     subprocess.run(cmd, check=True)
 
     size_mb = os.path.getsize(output_path) / (1024 * 1024)
-    print("=" * 65)
-    print("✅ УСПІШНО! LoRA GGUF збережено:")
-    print(f"   {output_path} ({size_mb:.1f} MB)")
-    print("=" * 65)
+    print("=" * 69)
+    print("[OK] Conversion complete! LoRA GGUF saved to:")
+    print(f"     {output_path} ({size_mb:.1f} MB)")
+    print("=" * 69)
     return cmd
 
 
 def run_self_test() -> None:
-    print("====================================================================")
-    print(" [*] GVK Private AI — Self-Test (tools/convert_lora_to_gguf_local.py)")
-    print("====================================================================")
+    """Run an offline self-test covering nested path resolution and dry-run CLI generation."""
+    print("=====================================================================")
+    print(" [*] GVK Private AI - Self-Test (tools/convert_lora_to_gguf_local.py)")
+    print("=====================================================================")
 
     with tempfile.TemporaryDirectory(prefix="gvk_lora_conv_test_") as tmp_dir:
         nested = os.path.join(tmp_dir, "lora_final", "lora_final")
@@ -219,7 +303,7 @@ def run_self_test() -> None:
             f.write(b"\x00" * 16)
 
         resolved = resolve_lora_dir(os.path.join(tmp_dir, "lora_final"))
-        assert os.path.abspath(resolved) == os.path.abspath(nested), f"Очікувався вкладений шлях: {resolved}"
+        assert os.path.abspath(resolved) == os.path.abspath(nested), f"Expected nested path, got: {resolved}"
 
         out_gguf = os.path.join(tmp_dir, "friend_2.gguf")
         cmd = run_convert(
@@ -231,37 +315,38 @@ def run_self_test() -> None:
         )
         assert "--outtype" in cmd and cmd[cmd.index("--outtype") + 1] == "q8_0"
         assert "--outfile" in cmd and cmd[cmd.index("--outfile") + 1] == out_gguf
-        print(" [✓] resolve_lora_dir, q8_0 --dry-run та побудова CLI-команди OK!")
+        print(" [OK] resolve_lora_dir, q8_0 --dry-run, and CLI command assembly passed.")
 
-    print("====================================================================")
-    print(" [✓] SELF-TEST CONVERT_LORA_TO_GGUF ПРОЙДЕНО УСПІШНО!")
-    print("====================================================================")
+    print("=====================================================================")
+    print(" [OK] CONVERT_LORA_TO_GGUF SELF-TEST PASSED!")
+    print("=====================================================================")
 
 
 def main() -> None:
+    """Parse CLI arguments and run either LoRA conversion or offline self-test."""
     parser = argparse.ArgumentParser(
-        description="GVK Private AI — Локальний конвертер PEFT LoRA у GGUF"
+        description="GVK Private AI - Local PEFT LoRA to GGUF converter"
     )
     parser.add_argument(
         "cmd",
         nargs="?",
         choices=["convert", "self-test"],
         default="convert",
-        help="Режим: 'convert' (за замовчуванням) або 'self-test'",
+        help="Execution mode: 'convert' (default) or 'self-test'",
     )
-    parser.add_argument("-p", "--persona", default=None, help="ID персони (friend_1, friend_2, friend_3)")
-    parser.add_argument("-i", "--input", default=None, help="Папка з adapter_config.json (lora_final)")
-    parser.add_argument("-o", "--output", default=None, help="Вихідний шлях до файлу .gguf")
+    parser.add_argument("-p", "--persona", default=None, help="Persona ID (e.g., friend_1, friend_2, friend_3)")
+    parser.add_argument("-i", "--input", default=None, help="Directory containing adapter_config.json (lora_final)")
+    parser.add_argument("-o", "--output", default=None, help="Output path for the .gguf adapter file")
     parser.add_argument(
         "-t",
         "--outtype",
         choices=("f16", "bf16", "q8_0", "f32"),
         default=OUTTYPE,
-        help="Тип вихідних ваг (f16, bf16, q8_0, f32)",
+        help="Output weight precision/quantization (f16, bf16, q8_0, f32)",
     )
-    parser.add_argument("--base-model", default=BASE_MODEL_HF_ID, help="Hugging Face ID базової моделі")
-    parser.add_argument("--llama-cpp-dir", default=LLAMA_CPP_DIR, help="Папка кешу llama.cpp")
-    parser.add_argument("--dry-run", action="store_true", help="Лише перевірити шляхи та команду без запуску")
+    parser.add_argument("--base-model", default=BASE_MODEL_HF_ID, help="Hugging Face ID of the base model")
+    parser.add_argument("--llama-cpp-dir", default=LLAMA_CPP_DIR, help="Local cache directory for llama.cpp")
+    parser.add_argument("--dry-run", action="store_true", help="Validate paths and print command without executing")
     args = parser.parse_args()
 
     if args.cmd == "self-test":

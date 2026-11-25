@@ -1,30 +1,22 @@
 #!/usr/bin/env python3
 """
-GVK Private AI — Генератор ASCII-портретів (tools/ascii_portrait.py)
+GVK Private AI - ASCII Portrait Generator (tools/ascii_portrait.py)
 
-Перетворює звичайні фотографії (.jpg, .png, .heic, .webp) у висококонтрастні
-ASCII-спрайти для термінального інтерфейсу (TUI) GVK Private AI.
+Converts standard photos (.jpg, .png, .heic, .webp, .bmp) into high-contrast
+ASCII and Unicode Braille sprites for the GVK Private AI terminal interface (TUI).
 
-Особливості:
-  - Працює БЕЗ сторонніх бібліотек на macOS (використовує системний `sips` + чистий Python),
-    або через `Pillow` (якщо встановлено). Підтримує навіть iPhone-фото (.HEIC).
-  - Автоматично вирівнює контраст (Auto-Contrast / CLAHE) та підкреслює контури обличчя
-    (очі, брови, посмішку, окуляри) фільтром різкості, щоб міміка читалася у невеликому вікні.
-  - Коригує пропорції символів терміналу (оскільки символ у консолі вдвічі вищий за ширину).
-  - Підтримує 3 стилі рендерингу:
-      * cyber   — класичний кіберпанк ASCII (" .:-=+*#%@")
-      * blocks  — щільна псевдографіка (" ░▒▓█")
-      * braille — ультра-деталізована матриця Брайля (8 точок на 1 символ!)
+Key Responsibilities:
+  - Load and center-crop portrait images via Pillow or macOS native `sips` (zero-dependency fallback).
+  - Enhance facial clarity (eyes, brows, smile, glasses) using percentile normalization,
+    unsharp-mask edge boosting, and contrast/gamma tuning.
+  - Render terminal-aspect-corrected art in four styles (`clean`, `cyber`, `blocks`, `braille`).
+  - Batch-generate five persona emotion sprites (`idle`, `sleeping`, `smiling`, `talking`, `talking2`).
 
-Приклади запуску:
-  1. Одне фото з переглядом у терміналі та збереженням:
-     python3 tools/ascii_portrait.py photo.jpg -o portraits/говорить_спокійно.txt --color cyan
-
-  2. Ультра-детальний режим Брайля:
-     python3 tools/ascii_portrait.py photo.jpg --style braille -w 44 --color cyan
-
-  3. Пакетна генерація одразу 4 емоцій для друга:
-     python3 tools/ascii_portrait.py --init-pack ./my_photos/ --out-dir ./portraits/friend_1/
+Usage:
+  python3 tools/ascii_portrait.py photo.jpg -o portraits/idle.txt --color cyan
+  python3 tools/ascii_portrait.py photo.jpg --style braille -w 44 --color cyan
+  python3 tools/ascii_portrait.py --init-pack ./my_photos/ --out-dir ./portraits/friend_1/
+  python3 tools/ascii_portrait.py self-test
 """
 
 import argparse
@@ -36,7 +28,10 @@ import sys
 import tempfile
 from typing import Dict, List, Optional
 
-# Палітри символів від найтемнішого до найсвітлішого (для темного фону терміналу)
+# =====================================================================
+# CONSTANTS & PALETTES
+# =====================================================================
+# Character palettes ordered from darkest to brightest (for dark terminal backgrounds)
 PALETTES = {
     "cyber": " .'`^\",:;Il!i><~+_-?][}{1)(|/tfjrxnuvczXYUJCLQ0OZmwqpdbkhao*#MW&8%B@$",
     "clean": " .:-=+*#%@",
@@ -54,23 +49,37 @@ ANSI_COLORS = {
 }
 
 
+# =====================================================================
+# IMAGE LOADING & PREPROCESSING
+# =====================================================================
 def load_grayscale_grid(image_path: str, target_w: int, target_h: int):
-    """
-    Завантажує зображення, обрізає по центру під портретні пропорції та повертає
-    2D-масив яскравості [target_h][target_w] зі значеннями 0.0 .. 1.0.
-    Використовує Pillow (якщо є) або вбудований у macOS інструмент `sips`.
+    """Load an image, center-crop to portrait proportions, and resize to a grayscale grid.
+
+    Uses Pillow when installed, falling back to macOS native `sips` converted to BMP
+    so the tool works without external dependencies on macOS.
+
+    Args:
+        image_path: Path to the source image file.
+        target_w: Desired output grid width in pixels.
+        target_h: Desired output grid height in pixels.
+
+    Returns:
+        2D list of normalized luminance floats (`[target_h][target_w]`) in `[0.0, 1.0]`.
+
+    Raises:
+        FileNotFoundError: If `image_path` does not exist.
     """
     if not os.path.isfile(image_path):
-        raise FileNotFoundError(f"Файл не знайдено: {image_path}")
+        raise FileNotFoundError(f"Image file not found: {image_path}")
 
-    # Спроба 1: Через Pillow (якщо встановлено)
+    # Attempt 1: Load via Pillow (if installed)
     try:
         from PIL import Image, ImageOps
 
         img = Image.open(image_path).convert("L")
         img = ImageOps.exif_transpose(img)
         w, h = img.size
-        # Портретний кроп по центру (співвідношення ~ 4:5)
+        # Center portrait crop (~4:5 aspect ratio)
         desired_ratio = 0.82
         cur_ratio = w / float(h)
         if cur_ratio > desired_ratio:
@@ -87,12 +96,12 @@ def load_grayscale_grid(image_path: str, target_w: int, target_h: int):
     except ImportError:
         pass
 
-    # Спроба 2: Без залежностей через системний `sips` (macOS) -> BMP
+    # Attempt 2: Zero-dependency fallback via macOS `sips` -> temporary BMP
     with tempfile.NamedTemporaryFile(suffix=".bmp", delete=False) as tmp:
         tmp_bmp = tmp.name
 
     try:
-        # Конвертуємо будь-який формат (JPG/PNG/HEIC) у BMP з ресайзом по більшій стороні
+        # Convert any supported format (JPG/PNG/HEIC) to a resized BMP along the longest edge
         subprocess.run(
             ["sips", "-s", "format", "bmp", "-Z", "600", image_path, "--out", tmp_bmp],
             check=True,
@@ -107,12 +116,22 @@ def load_grayscale_grid(image_path: str, target_w: int, target_h: int):
 
 
 def _read_bmp_grayscale(bmp_path: str):
-    """Читає нестиснутий 24-bit або 32-bit BMP файл у 2D масив яскравості [h][w]."""
+    """Read an uncompressed 24-bit or 32-bit BMP file into a 2D luminance grid.
+
+    Args:
+        bmp_path: Path to the BMP file.
+
+    Returns:
+        2D list of luminance values `[height][width]` normalized to `[0.0, 1.0]`.
+
+    Raises:
+        ValueError: If the file does not start with a valid `BM` header.
+    """
     with open(bmp_path, "rb") as f:
         data = f.read()
 
     if data[:2] != b"BM":
-        raise ValueError("Непідтримуваний формат BMP")
+        raise ValueError("Unsupported BMP format")
 
     pixel_offset = struct.unpack_from("<I", data, 10)[0]
     width, height = struct.unpack_from("<ii", data, 18)
@@ -133,7 +152,7 @@ def _read_bmp_grayscale(bmp_path: str):
             b = data[px_off]
             g = data[px_off + 1]
             r = data[px_off + 2]
-            # Перетворення у відтінки сірого за формулою сприйняття ока (ITU-R BT.601)
+            # Perceptual grayscale conversion (ITU-R BT.601)
             lum = (0.299 * r + 0.587 * g + 0.114 * b) / 255.0
             row.append(lum)
         grid.append(row)
@@ -141,11 +160,20 @@ def _read_bmp_grayscale(bmp_path: str):
 
 
 def _crop_and_resize_grid(grid, target_w: int, target_h: int):
-    """Обрізає по центру під портрет та масштабує білінійною інтерполяцією."""
+    """Center-crop a luminance grid to portrait ratio and resize via bilinear interpolation.
+
+    Args:
+        grid: Input 2D luminance grid.
+        target_w: Desired output width.
+        target_h: Desired output height.
+
+    Returns:
+        Resized 2D luminance grid of shape `[target_h][target_w]`.
+    """
     h = len(grid)
     w = len(grid[0]) if h else 0
 
-    # Портретний кроп по центру (відрізаємо зайвий фон з боків на ширококутних фото)
+    # Center portrait crop (trim wide horizontal background)
     desired_ratio = 0.82
     if w / float(h) > desired_ratio:
         new_w = int(h * desired_ratio)
@@ -176,11 +204,21 @@ def _crop_and_resize_grid(grid, target_w: int, target_h: int):
 
 
 def enhance_portrait(grid, contrast: float = 1.35, edge_boost: float = 0.45, gamma: float = 0.9):
-    """
-    Робить риси обличчя (очі, рот, брови) чіткими у малому розмірі:
-    1. Нормалізація гістограми за перцентилями (2% .. 98%)
-    2. Локальне підсилення контурів (Unsharp Mask)
-    3. Гамма-корекція та контраст
+    """Sharpen facial features for small terminal portraits.
+
+    Applies a three-stage enhancement pipeline:
+    1. Percentile histogram stretch (2nd to 98th percentile).
+    2. Local edge boost via a 3x3 unsharp mask.
+    3. Gamma correction and contrast scaling around midpoint `0.5`.
+
+    Args:
+        grid: Input 2D luminance grid in `[0.0, 1.0]`.
+        contrast: Linear contrast multiplier applied around `0.5`.
+        edge_boost: Strength of local unsharp-mask edge enhancement.
+        gamma: Gamma exponent applied before contrast adjustment.
+
+    Returns:
+        Enhanced 2D luminance grid clamped to `[0.0, 1.0]`.
     """
     h = len(grid)
     w = len(grid[0])
@@ -189,10 +227,10 @@ def enhance_portrait(grid, contrast: float = 1.35, edge_boost: float = 0.45, gam
     hi = flat[int(len(flat) * 0.98)]
     span = max(hi - lo, 1e-5)
 
-    # 1. Розтягнення динамічного діапазону
+    # 1. Stretch dynamic range
     norm = [[max(0.0, min(1.0, (v - lo) / span)) for v in row] for row in grid]
 
-    # 2. Підсилення контурів (різниця з локальним середнім 3x3)
+    # 2. Boost local edges (difference against 3x3 neighborhood mean)
     sharpened = []
     for y in range(h):
         row = []
@@ -206,7 +244,7 @@ def enhance_portrait(grid, contrast: float = 1.35, edge_boost: float = 0.45, gam
                     neighbors.append(norm[ny][nx])
             avg = sum(neighbors) / 9.0
             val = c + edge_boost * (c - avg)
-            # Гамма і контраст навколо 0.5
+            # Apply gamma and contrast around 0.5
             val = max(0.0, min(1.0, val)) ** gamma
             val = 0.5 + (val - 0.5) * contrast
             row.append(max(0.0, min(1.0, val)))
@@ -214,6 +252,9 @@ def enhance_portrait(grid, contrast: float = 1.35, edge_boost: float = 0.45, gam
     return sharpened
 
 
+# =====================================================================
+# ASCII & BRAILLE RENDERING
+# =====================================================================
 def render_ascii(
     image_path: str,
     width: int = 38,
@@ -222,12 +263,27 @@ def render_ascii(
     contrast: float = 1.35,
     edge_boost: float = 0.45,
 ) -> str:
-    """Генерує багаторядковий ASCII-портрет із фотографії."""
-    # У терміналі висота символу приблизно вдвічі більша за ширину
+    """Render a multi-line ASCII or Unicode Braille portrait from an image file.
+
+    Args:
+        image_path: Path to the source photo.
+        width: Output width in terminal columns.
+        style: Rendering style (`"clean"`, `"cyber"`, `"blocks"`, or `"braille"`).
+        invert: Whether to invert light and shadow tones (for light backgrounds).
+        contrast: Contrast boost multiplier passed to `enhance_portrait`.
+        edge_boost: Edge sharpening strength passed to `enhance_portrait`.
+
+    Returns:
+        Multi-line string containing the rendered portrait.
+
+    Example:
+        >>> art = render_ascii("photo.jpg", width=38, style="braille")
+    """
+    # Terminal character cells are roughly twice as tall as they are wide
     char_aspect = 0.46
 
     if style == "braille":
-        # Кожен символ Брайля — це матриця 2x4 пікселі
+        # Each Braille character encodes a 2x4 pixel matrix
         px_w = width * 2
         px_h = int(width * char_aspect * 4)
         grid = load_grayscale_grid(image_path, px_w, px_h)
@@ -255,10 +311,18 @@ def render_ascii(
 
 
 def _grid_to_braille(grid, invert: bool = False) -> str:
-    """Перетворює піксельну сітку на високодеталізовані символи Unicode Braille (U+2800..U+28FF)."""
+    """Convert a pixel luminance grid into Unicode Braille characters (U+2800..U+28FF).
+
+    Args:
+        grid: 2D luminance grid with dimensions divisible by 2x4 blocks.
+        invert: Whether to invert brightness before thresholding.
+
+    Returns:
+        Multi-line Braille string.
+    """
     h = len(grid)
     w = len(grid[0])
-    # Бітова карта Брайля (2 колонки x 4 рядки)
+    # Braille dot bitmask mapping (2 columns x 4 rows)
     dot_map = [
         (0, 0, 0x01),
         (0, 1, 0x02),
@@ -278,7 +342,7 @@ def _grid_to_braille(grid, invert: bool = False) -> str:
                 val = grid[y + dy][x + dx]
                 if invert:
                     val = 1.0 - val
-                # Поріг з легким дизерингом для об'єму
+                # Checkerboard-dithered threshold for smoother midtone depth
                 threshold = 0.42 if ((x + dx + y + dy) % 2 == 0) else 0.52
                 if val >= threshold:
                     mask |= bit
@@ -287,6 +351,9 @@ def _grid_to_braille(grid, invert: bool = False) -> str:
     return "\n".join(lines)
 
 
+# =====================================================================
+# SPRITE PACK GENERATION
+# =====================================================================
 REQUIRED_SPRITE_EMOTIONS = ("idle", "sleeping", "smiling", "talking", "talking2")
 _SPRITE_ALIASES: Dict[str, tuple] = {
     "idle": ("idle", "мовчить", "спок", "neutral"),
@@ -299,12 +366,22 @@ _IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".heic", ".bmp")
 
 
 def _resolve_pack_sources(input_path: str) -> Dict[str, str]:
-    """Зіставляє кожній із 5 емоцій вхідне фото з папки або єдине зображення."""
+    """Map each of the five required emotions to a source image from a folder or single file.
+
+    Args:
+        input_path: Directory of emotion photos or a single fallback image file.
+
+    Returns:
+        Dictionary mapping each emotion name in `REQUIRED_SPRITE_EMOTIONS` to an image path.
+
+    Raises:
+        FileNotFoundError: If `input_path` does not exist or contains no supported images.
+    """
     if os.path.isfile(input_path):
         return {emo: input_path for emo in REQUIRED_SPRITE_EMOTIONS}
 
     if not os.path.isdir(input_path):
-        raise FileNotFoundError(f"Шлях --init-pack не знайдено: {input_path}")
+        raise FileNotFoundError(f"--init-pack path not found: {input_path}")
 
     candidates = sorted(
         os.path.join(input_path, fname)
@@ -312,7 +389,7 @@ def _resolve_pack_sources(input_path: str) -> Dict[str, str]:
         if os.path.isfile(os.path.join(input_path, fname)) and fname.lower().endswith(_IMAGE_EXTS)
     )
     if not candidates:
-        raise FileNotFoundError(f"У папці --init-pack не знайдено жодного зображення: {input_path}")
+        raise FileNotFoundError(f"No supported images found in --init-pack directory: {input_path}")
 
     resolved: Dict[str, str] = {}
     for emo in REQUIRED_SPRITE_EMOTIONS:
@@ -335,7 +412,19 @@ def generate_init_pack(
     contrast: float = 1.35,
     invert: bool = False,
 ) -> List[str]:
-    """Генерує 5 спрайтів емоцій (idle, sleeping, smiling, talking, talking2) у цільову папку."""
+    """Generate all five emotion sprites (`idle`, `sleeping`, `smiling`, `talking`, `talking2`).
+
+    Args:
+        input_path: Directory of source photos or a single image file.
+        out_dir: Destination directory for the generated `<emotion>.txt` files.
+        width: Output portrait width in terminal columns.
+        style: Rendering style (`"braille"`, `"clean"`, `"cyber"`, or `"blocks"`).
+        contrast: Contrast multiplier for image enhancement.
+        invert: Whether to invert light and shadow tones.
+
+    Returns:
+        List of generated sprite file paths.
+    """
     sources = _resolve_pack_sources(input_path)
     os.makedirs(out_dir, exist_ok=True)
     generated_files: List[str] = []
@@ -355,8 +444,17 @@ def generate_init_pack(
     return generated_files
 
 
+# =====================================================================
+# SELF-TEST & CLI
+# =====================================================================
 def _write_synthetic_bmp(path: str, width: int = 40, height: int = 48) -> None:
-    """Створює синтетичний 24-bit BMP портрет для автономного self-test без зовнішніх картинок."""
+    """Create a synthetic 24-bit BMP face image for offline self-testing.
+
+    Args:
+        path: Output file path for the synthetic BMP.
+        width: Image width in pixels.
+        height: Image height in pixels.
+    """
     row_stride = (width * 3 + 3) & ~3
     pixel_size = row_stride * height
     file_size = 54 + pixel_size
@@ -378,9 +476,10 @@ def _write_synthetic_bmp(path: str, width: int = 40, height: int = 48) -> None:
 
 
 def run_self_test() -> None:
-    print("====================================================================")
-    print(" [*] GVK Private AI — Self-Test (tools/ascii_portrait.py)")
-    print("====================================================================")
+    """Run an offline self-test verifying single rendering and 5-emotion pack generation."""
+    print("=====================================================================")
+    print(" [*] GVK Private AI - Self-Test (tools/ascii_portrait.py)")
+    print("=====================================================================")
 
     with tempfile.TemporaryDirectory(prefix="gvk_portrait_test_") as tmp_dir:
         sample_bmp = os.path.join(tmp_dir, "idle_face.bmp")
@@ -388,60 +487,61 @@ def run_self_test() -> None:
 
         single = render_ascii(sample_bmp, width=32, style="braille")
         lines = single.splitlines()
-        assert lines and len(lines[0]) == 32, f"Очікувалась ширина 32 символи, отримано: {len(lines[0]) if lines else 0}"
+        assert lines and len(lines[0]) == 32, f"Expected width of 32 chars, got: {len(lines[0]) if lines else 0}"
 
         out_pack_dir = os.path.join(tmp_dir, "portraits")
         written = generate_init_pack(tmp_dir, out_pack_dir, width=32, style="braille")
-        assert len(written) == 5, f"Очікувалось 5 файлів спрайтів, отримано {len(written)}"
+        assert len(written) == 5, f"Expected 5 sprite files, got {len(written)}"
         for emo in REQUIRED_SPRITE_EMOTIONS:
             fp = os.path.join(out_pack_dir, f"{emo}.txt")
-            assert os.path.isfile(fp) and os.path.getsize(fp) > 10, f"Некоректний спрайт: {fp}"
-        print(" [✓] Одиночний рендер + --init-pack (5 емоцій: idle, sleeping, smiling, talking, talking2) OK!")
+            assert os.path.isfile(fp) and os.path.getsize(fp) > 10, f"Invalid sprite file: {fp}"
+        print(" [OK] Single render + --init-pack (5 emotions: idle, sleeping, smiling, talking, talking2) passed.")
 
-    print("====================================================================")
-    print(" [✓] SELF-TEST ASCII_PORTRAIT ПРОЙДЕНО УСПІШНО!")
-    print("====================================================================")
+    print("=====================================================================")
+    print(" [OK] ASCII PORTRAIT SELF-TEST PASSED!")
+    print("=====================================================================")
 
 
 def main():
+    """Parse CLI arguments and render a portrait, generate an emotion pack, or run self-test."""
     parser = argparse.ArgumentParser(
-        description="GVK Private AI — Перетворення фотографії на ASCII-портрет для TUI"
+        description="GVK Private AI - Convert photos into ASCII/Braille portraits for TUI"
     )
     parser.add_argument(
         "image",
         nargs="?",
-        help="Шлях до фотографії (.jpg, .png, .heic) або команда 'self-test'",
+        help="Path to a source photo (.jpg, .png, .heic) or 'self-test'",
     )
     parser.add_argument(
-        "-w", "--width", type=int, default=38, help="Ширина портрета в символах (за замовчуванням: 38)"
+        "-w", "--width", type=int, default=38, help="Portrait width in characters (default: 38)"
     )
     parser.add_argument(
         "-s",
         "--style",
         choices=["clean", "cyber", "blocks", "braille"],
         default="clean",
-        help="Стиль символів: clean (контрастний ASCII), cyber (детальний), blocks (блоки ░▒▓█), braille (точки Брайля)",
+        help="Rendering style: clean (high-contrast ASCII), cyber (detailed), blocks (░▒▓█), braille (2x4 Braille dots)",
     )
-    parser.add_argument("-o", "--output", help="Зберегти результат у .txt файл (напр. portraits/idle.txt)")
+    parser.add_argument("-o", "--output", help="Save rendered output to a .txt file (e.g., portraits/idle.txt)")
     parser.add_argument(
         "--init-pack",
         default=None,
-        help="Папка з фото емоцій або єдине фото для пакетної генерації 5 спрайтів",
+        help="Directory of emotion photos or a single photo for batch-generating 5 sprites",
     )
     parser.add_argument(
         "--out-dir",
         default="./portraits/friend_1",
-        help="Цільова папка збереження спрайтів при --init-pack (за замовч. ./portraits/friend_1)",
+        help="Target output directory for --init-pack sprites (default: ./portraits/friend_1)",
     )
     parser.add_argument(
         "-c",
         "--color",
         choices=["cyan", "amber", "violet", "green", "red", "white"],
         default="cyan",
-        help="Колір попереднього перегляду в терміналі",
+        help="Terminal preview ANSI color",
     )
-    parser.add_argument("--contrast", type=float, default=1.35, help="Коефіцієнт контрасту (за замовч. 1.35)")
-    parser.add_argument("--invert", action="store_true", help="Інвертувати світло/тінь (для світлого фону)")
+    parser.add_argument("--contrast", type=float, default=1.35, help="Contrast multiplier (default: 1.35)")
+    parser.add_argument("--invert", action="store_true", help="Invert light/shadow tones (for light terminal backgrounds)")
 
     args = parser.parse_args()
 
@@ -459,7 +559,7 @@ def main():
             contrast=args.contrast,
             invert=args.invert,
         )
-        print(f"[✓] Згенеровано {len(generated)} спрайтів у {os.path.abspath(args.out_dir)}:")
+        print(f"[OK] Generated {len(generated)} sprites in {os.path.abspath(args.out_dir)}:")
         for p in generated:
             print(f"    - {os.path.basename(p)}")
         return
@@ -489,7 +589,7 @@ def main():
         os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
         with open(args.output, "w", encoding="utf-8") as f:
             f.write(art + "\n")
-        print(f"[✓] Портрет збережено у файл: {args.output}")
+        print(f"[OK] Portrait saved to: {args.output}")
 
 
 if __name__ == "__main__":

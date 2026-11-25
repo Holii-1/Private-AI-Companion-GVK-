@@ -1,23 +1,24 @@
 #!/usr/bin/env python3
 """
-GVK Private AI — Векторна пам'ять RAG (core/memory_rag.py)
+GVK Private AI - Vector Memory RAG Engine (core/memory_rag.py)
 
-Забезпечує спільний конвеєр ембедінгів, парсинг спогадів, збірку індексу
-`memory.faiss` та швидкий гібридний (семантичний + лексичний) пошук спогадів
-під час сесії оркестратора `core/orchestrator.py`.
+Provides a shared embedding pipeline, structured memory parsing, `memory.faiss`
+index compilation, and fast hybrid (semantic + lexical) memory retrieval for
+`core/orchestrator.py` runtime sessions.
 
-Особливості:
-  - Основний бекенд: `sentence-transformers` (`paraphrase-multilingual-MiniLM-L12-v2`, 384 dim).
-  - Автоматичний фолбек: детермінований 384-мірний N-gram / морфологічний feature-hashing
-    енкодер, якщо `sentence-transformers` недоступний або середовище працює офлайн.
-  - Підтримує як нативний індекс FAISS (`faiss.IndexFlatIP`), так і самодостатній
-    бінарний контейнер `GVKRAG01` із вбудованим мета-трейлером `GVKMETA1`.
-  - Безпосередньо приймає директорію персонажа (розпаковану з `payload.tar.enc` у RAM)
-    або прямий шлях до файлу `memory.faiss`.
+Key Responsibilities:
+  - Encode queries and memories via `sentence-transformers`
+    (`paraphrase-multilingual-MiniLM-L12-v2`, 384-dim) with an automatic offline
+    deterministic 384-dim N-gram / morphological feature-hashing fallback.
+  - Compile and read both native FAISS (`faiss.IndexFlatIP`) indices and
+    self-contained `GVKRAG01` binary containers with embedded `GVKMETA1` metadata.
+  - Support direct loading from either an extracted persona directory (RAM disk
+    or local repository) or an explicit `memory.faiss` file path.
 
-Приклади запуску:
+Usage:
   python3 core/memory_rag.py self-test
   python3 core/memory_rag.py query -i raw/friend_1_data -q "куди ми їздили минулого літа?"
+  python3 core/memory_rag.py --help
 """
 
 import argparse
@@ -31,7 +32,7 @@ import sys
 import tempfile
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-# Запобігає конфліктам OpenMP/MPS між faiss та PyTorch на macOS ARM64
+# Prevent OpenMP/MPS conflicts between faiss and PyTorch on macOS ARM64
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
@@ -41,7 +42,7 @@ os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
 # =====================================================================
-# КОНСТАНТИ ТА НАЛАШТУВАННЯ
+# CONSTANTS AND CONFIGURATION
 # =====================================================================
 DEFAULT_EMBEDDING_MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 DEFAULT_DIMENSION = 384
@@ -71,7 +72,7 @@ _CONTENT_HEADER_RE = re.compile(r"^\s*(?:содержание|зміст|кон�
 
 _STOPWORDS = frozenset(
     {
-        # Українські службові слова, займенники, вигуки
+        # Ukrainian function words, pronouns, and interjections
         "та", "це", "то", "те", "ті", "той", "така", "таке", "такі",
         "як", "що", "шо", "де", "коли", "куди", "звідки", "чому", "хто", "чий",
         "кого", "кому", "ким", "чого", "чим", "який", "яка", "яке", "які",
@@ -85,7 +86,7 @@ _STOPWORDS = frozenset(
         "було", "бути", "був", "була", "були", "буде", "є", "має", "може",
         "привіт", "хай", "здарова", "справи", "норм", "нормально", "окей", "ага", "угу",
         "робиш", "робити", "сказав", "каже", "типу", "тіпа", "взагалі", "ваще", "розкажи", "скажи",
-        # Російські службові слова, займенники, вигуки
+        # Russian function words, pronouns, and interjections
         "и", "в", "во", "со", "ко", "об", "обо", "не", "ни", "что", "че", "чё", "как", "это", "то",
         "он", "она", "оно", "они", "мы", "вы", "ты", "я", "меня", "мне", "мной", "тебя", "тебе",
         "его", "ее", "её", "их", "нам", "вам", "себя", "себе", "мой", "моя", "мои", "твой", "твоя",
@@ -99,7 +100,7 @@ _STOPWORDS = frozenset(
     }
 )
 
-# Словник крос-мовних синонімів (UA <-> RU), де корені відрізняються більше ніж на і/и/е/є
+# Cross-lingual stem synonym dictionary (UA <-> RU) for roots differing beyond і/и/е/є
 _CANONICAL_STEM_ALIASES: Dict[str, str] = {
     "киив": "киев",
     "киев": "киев",
@@ -180,7 +181,7 @@ _EXACT_STEM_ALIASES: Dict[str, str] = {
     "26": "2026",
 }
 
-# Синонімічне розширення запитів для пошуку UA <-> RU без втрати точності
+# Synonym-based query expansion for UA <-> RU retrieval without sacrificing precision
 _QUERY_EXPANSIONS: Dict[str, Tuple[str, ...]] = {
     "жив": ("перее", "посел", "общеж"),
     "уч": ("посту", "униве", "специ", "факул", "изуча", "лице", "школ"),
@@ -194,9 +195,15 @@ _QUERY_EXPANSIONS: Dict[str, Tuple[str, ...]] = {
 
 
 def register_persona_lexicon(lexicon: Optional[Dict[str, Any]]) -> None:
-    """
-    Підключає приватні синоніми/аліаси з `persona_config.json` (`rag_lexicon`) у RAM
-    під час сесії, щоб персональні імена й локації не зберігалися в публічному коді.
+    """Register private persona synonyms and aliases in RAM for the active session.
+
+    Merges `rag_lexicon` entries from `persona_config.json` into the module-level
+    category prefixes, canonical stem aliases, and query expansion tables so that
+    personal names and locations never live in public source code.
+
+    Args:
+        lexicon: Optional dictionary containing `dossier_cat_prefixes`,
+            `canonical_stem_aliases`, and/or `query_expansions`.
     """
     global _DOSSIER_CAT_PREFIXES
     if not isinstance(lexicon, dict):
@@ -234,20 +241,25 @@ def register_persona_lexicon(lexicon: Optional[Dict[str, Any]]) -> None:
 
 
 # =====================================================================
-# ТЕКСТОВА НОРМАЛІЗАЦІЯ ТА КЛЮЧОВІ СЛОВА
+# TEXT NORMALIZATION AND KEYWORDS
 # =====================================================================
 def normalize_text(text: str) -> str:
-    """Приводить текст до нижнього регістру та уніфікує варіативні літери."""
+    """Lowercase text and unify variant Cyrillic letters (`ё` -> `е`, `ґ` -> `г`)."""
     lowered = text.lower().strip()
     return lowered.replace("ё", "е").replace("ґ", "г")
 
 
 def normalize_slavic_phonetic(text: str) -> str:
-    """
-    Крос-мовна фонетична нормалізація (UA / RU / суржик):
-    уніфікує і/ї/ы -> и, є/ё -> е, ґ -> г та прибирає м'який/твердий знаки всередині слів.
-    Дозволяє українським запитам («Київ», «ліцей», «фізика», «рибалка»)
-    точно знаходити російськомовні записи («Киев», «лицей», «физика», «рыбалка»).
+    """Apply cross-lingual Slavic phonetic normalization (UA / RU / Surzhyk).
+
+    Unifies `і`/`ї`/`ы` -> `и`, `є`/`ё` -> `е`, `ґ` -> `г`, and strips soft/hard
+    signs and apostrophes so Ukrainian queries accurately match Russian records.
+
+    Args:
+        text: Input string to normalize.
+
+    Returns:
+        Phonetically normalized string.
     """
     s = normalize_text(text)
     s = s.replace("і", "и").replace("ї", "и").replace("ы", "и").replace("є", "е")
@@ -256,7 +268,7 @@ def normalize_slavic_phonetic(text: str) -> str:
 
 
 def _stem_token(token: str) -> str:
-    """Морфологічний + крос-мовний стемер для узгодження слов'янських відмінків і UA/RU коренів."""
+    """Stem a token across Slavic inflections and UA/RU canonical root aliases."""
     phon = normalize_slavic_phonetic(token)
     if not phon:
         return token
@@ -277,7 +289,7 @@ def _stem_token(token: str) -> str:
 
 
 def _expand_query_stems(q_stems: set) -> set:
-    """Повертає множину розширених синонімічних основ для запиту."""
+    """Return additional synonym stems expanded from the query stem set."""
     extra = set()
     for st in q_stems:
         if st in _QUERY_EXPANSIONS:
@@ -286,7 +298,14 @@ def _expand_query_stems(q_stems: set) -> set:
 
 
 def extract_keywords(text: str) -> List[str]:
-    """Витягує впорядковані унікальні ключові слова (довжина >= 2, без стоп-слів)."""
+    """Extract ordered unique keywords (length >= 2, excluding stopwords).
+
+    Args:
+        text: Source text to tokenize.
+
+    Returns:
+        List of deduplicated keyword tokens in order of first appearance.
+    """
     norm = normalize_text(text)
     seen = set()
     keywords: List[str] = []
@@ -302,13 +321,15 @@ def extract_keywords(text: str) -> List[str]:
 
 
 def _extract_stems(text: str) -> set:
+    """Extract the set of canonicalized stems for all keywords in `text`."""
     return {_stem_token(kw) for kw in extract_keywords(text)}
 
 
 # =====================================================================
-# ДВОРІВНЕВИЙ ЕНКОДЕР ЕМБЕДІНГІВ
+# TWO-TIER EMBEDDING ENCODER
 # =====================================================================
 def _l2_normalize_vec(vec: List[float]) -> List[float]:
+    """Return the L2-normalized copy of a dense float vector."""
     norm_sq = sum(v * v for v in vec)
     if norm_sq <= 0.0:
         return vec
@@ -317,10 +338,18 @@ def _l2_normalize_vec(vec: List[float]) -> List[float]:
 
 
 def _encode_ngram_vector(text: str, dim: int = DEFAULT_DIMENSION) -> List[float]:
-    """
-    Детермінований L2-нормалізований вектор ознак (слова, префікси, біграми,
-    символьні 3/4-грами) через знаковий feature hashing (BLAKE2b).
-    Забезпечує надійне семантико-морфологічне узгодження офлайн без залежностей.
+    """Encode text into a deterministic L2-normalized feature-hashing vector.
+
+    Combines phonetically normalized words, morphological stems, word prefixes,
+    word bigrams, and character 3/4-grams hashed via signed BLAKE2b projection
+    for zero-dependency offline semantic/morphological matching.
+
+    Args:
+        text: Input string to encode.
+        dim: Output vector dimensionality.
+
+    Returns:
+        L2-normalized embedding vector of length `dim`.
     """
     vec = [0.0] * dim
     norm = normalize_text(text)
@@ -365,16 +394,17 @@ def _encode_ngram_vector(text: str, dim: int = DEFAULT_DIMENSION) -> List[float]
 
 
 def _encode_ngram_vectors(texts: Sequence[str], dim: int = DEFAULT_DIMENSION) -> List[List[float]]:
+    """Encode a batch of strings into L2-normalized N-gram feature vectors."""
     return [_encode_ngram_vector(t, dim=dim) for t in texts]
 
 
 class EmbeddingEngine:
-    """
-    Уніфікований енкодер ембедінгів:
-      - `sentence-transformers`: трансформерні ембедінги (кешуються у пам'яті).
-      - `ngram`: швидкий детермінований фолбек без зовнішніх моделей.
-      - `auto`: використовує `sentence-transformers`, а за їх відсутності чи офлайн-помилки
-        автоматично перемикається на `ngram`.
+    """Unified embedding encoder supporting neural and offline N-gram backends.
+
+    Supported backends:
+      - `sentence-transformers`: cached multilingual transformer embeddings.
+      - `ngram`: fast deterministic feature-hashing fallback without external models.
+      - `auto`: uses `sentence-transformers` and falls back to `ngram` if unavailable.
     """
 
     def __init__(
@@ -383,8 +413,19 @@ class EmbeddingEngine:
         backend: str = "auto",
         dimension: int = DEFAULT_DIMENSION,
     ) -> None:
+        """Initialize the embedding engine with the requested backend.
+
+        Args:
+            model_name: Hugging Face model identifier or local directory name.
+            backend: One of `"auto"`, `"sentence-transformers"`, or `"ngram"`.
+            dimension: Fallback vector dimension when using the `ngram` backend.
+
+        Raises:
+            ValueError: If `backend` is not recognized.
+            RuntimeError: If `backend="sentence-transformers"` fails to load.
+        """
         if backend not in ("auto", "sentence-transformers", "ngram"):
-            raise ValueError(f"Невідомий бекенд ембедінгів: {backend}")
+            raise ValueError(f"Unknown embedding backend: {backend}")
 
         self.requested_backend = backend
         self.model_name = model_name
@@ -405,13 +446,14 @@ class EmbeddingEngine:
             except Exception as exc:
                 if backend == "sentence-transformers":
                     raise RuntimeError(
-                        f"Не вдалося завантажити sentence-transformers ({model_name}): {exc}"
+                        f"Failed to load sentence-transformers ({model_name}): {exc}"
                     ) from exc
                 self._st_model = None
                 self.active_backend = "ngram"
 
     @staticmethod
     def _load_st_model(model_name: str) -> Any:
+        """Load and cache a `SentenceTransformer` model, preferring local files."""
         if model_name in _MODEL_CACHE:
             return _MODEL_CACHE[model_name]
         import torch
@@ -434,6 +476,14 @@ class EmbeddingEngine:
         return model
 
     def encode(self, texts: Sequence[str]) -> List[List[float]]:
+        """Encode a sequence of strings into L2-normalized dense vectors.
+
+        Args:
+            texts: Input texts to embed.
+
+        Returns:
+            List of float vectors matching the active backend dimensionality.
+        """
         if not texts:
             return []
         if self.active_backend == "sentence-transformers" and self._st_model is not None:
@@ -448,9 +498,10 @@ class EmbeddingEngine:
 
 
 # =====================================================================
-# ПАРСИНГ СПОГАДІВ (.txt / .md / .json / .jsonl + [MEMORY_XX])
+# MEMORY PARSING (.txt / .md / .json / .jsonl + [MEMORY_XX])
 # =====================================================================
 def _parse_tags_value(raw_tags: Any) -> List[str]:
+    """Normalize a tag field from a list or delimited string into clean tags."""
     if not raw_tags:
         return []
     if isinstance(raw_tags, list):
@@ -461,9 +512,16 @@ def _parse_tags_value(raw_tags: Any) -> List[str]:
 
 
 def _parse_structured_memory_blocks(lines: Sequence[str]) -> List[Dict[str, Any]]:
-    """
-    Парсить деталізований формат спогадів із блоками `[MEMORY_XX]`,
-    полями `Категория:`, `Теги:` та багаторядковим блоком `Содержание:`.
+    """Parse structured memory blocks delimited by `[MEMORY_XX]` headers.
+
+    Supports localized `Категория:` / `Category:`, `Теги:` / `Tags:`, and
+    multi-line `Содержание:` / `Content:` fields.
+
+    Args:
+        lines: Raw text lines from a structured memory file.
+
+    Returns:
+        List of parsed memory record dictionaries.
     """
     blocks: List[Dict[str, Any]] = []
     current_section = "general"
@@ -540,7 +598,7 @@ def _parse_structured_memory_blocks(lines: Sequence[str]) -> List[Dict[str, Any]
 
 
 def _parse_markdown_memory_lines(lines: Sequence[str]) -> List[Dict[str, Any]]:
-    """Парсить простий построковий або Markdown-формат (`# Розділ` + пункти списку)."""
+    """Parse line-delimited or Markdown-formatted memories (`# Section` + bullets)."""
     items: List[Dict[str, Any]] = []
     current_category = "general"
     last_was_bullet = False
@@ -592,13 +650,23 @@ def _parse_markdown_memory_lines(lines: Sequence[str]) -> List[Dict[str, Any]]:
 
 
 def parse_memories_file(input_path: str) -> List[Dict[str, Any]]:
-    """
-    Зчитує спогади з `.txt`, `.md`, `.json` або `.jsonl`.
-    Автоматично розпізнає як структуровані блоки `[MEMORY_XX]` (`Категория:`, `Теги:`, `Содержание:`),
-    так і звичайні списки з `# Розділ`, видаляє дублікати зі збереженням порядку.
+    """Load and deduplicate memories from `.txt`, `.md`, `.json`, or `.jsonl`.
+
+    Automatically detects structured `[MEMORY_XX]` blocks as well as plain
+    Markdown bullet lists, preserving original order while removing duplicates.
+
+    Args:
+        input_path: Path to the source memories file.
+
+    Returns:
+        List of normalized memory record dictionaries with extracted keywords.
+
+    Raises:
+        FileNotFoundError: If `input_path` does not exist.
+        ValueError: If the JSON structure is invalid or no non-empty memories exist.
     """
     if not os.path.isfile(input_path):
-        raise FileNotFoundError(f"Файл зі спогадами не знайдено: {input_path}")
+        raise FileNotFoundError(f"Memories file not found: {input_path}")
 
     ext = os.path.splitext(input_path)[1].lower()
     raw_items: List[Dict[str, Any]] = []
@@ -609,7 +677,7 @@ def parse_memories_file(input_path: str) -> List[Dict[str, Any]]:
             if isinstance(data, dict):
                 data = data.get("memories") or data.get("items") or []
             if not isinstance(data, list):
-                raise ValueError("JSON-файл спогадів повинен містити список рядків або об'єктів.")
+                raise ValueError("Memories JSON file must contain a list of strings or objects.")
             for entry in data:
                 if isinstance(entry, str):
                     raw_items.append({"memory_id": "", "text": entry, "category": "general", "tags": []})
@@ -678,23 +746,28 @@ def parse_memories_file(input_path: str) -> List[Dict[str, Any]]:
         )
 
     if not records:
-        raise ValueError(f"У файлі '{input_path}' не знайдено жодного непорожнього спогаду.")
+        raise ValueError(f"No non-empty memories found in '{input_path}'.")
 
     return records
 
 
 # =====================================================================
-# ЗАПИС І ЧИТАННЯ ІНДЕКСУ (`memory.faiss` + `memories.json`)
+# INDEX SERIALIZATION AND DESERIALIZATION (memory.faiss + memories.json)
 # =====================================================================
 def _pack_metadata_trailer(meta: Dict[str, Any]) -> bytes:
+    """Serialize metadata JSON into an appendable `GVKMETA1` binary trailer."""
     json_bytes = json.dumps(meta, ensure_ascii=False).encode("utf-8")
     return json_bytes + struct.pack("<Q", len(json_bytes)) + META_TRAILER_MAGIC
 
 
 def _extract_metadata_trailer(faiss_path: str) -> Tuple[Optional[Dict[str, Any]], int]:
-    """
-    Перевіряє, чи містить файл `memory.faiss` вбудований мета-трейлер `GVKMETA1`.
-    Повертає `(metadata_dict_or_None, index_payload_byte_length)`.
+    """Read an embedded `GVKMETA1` trailer from `memory.faiss`, if present.
+
+    Args:
+        faiss_path: Path to the `memory.faiss` file.
+
+    Returns:
+        Tuple of `(metadata_dict_or_None, index_payload_byte_length)`.
     """
     file_size = os.path.getsize(faiss_path)
     footer_size = 8 + len(META_TRAILER_MAGIC)
@@ -726,6 +799,7 @@ def _write_gvk_binary_index(
     dim: int,
     trailer_bytes: bytes,
 ) -> None:
+    """Write dense float32 vectors and a metadata trailer in `GVKRAG01` format."""
     count = len(vectors)
     pack_fmt = f"<{dim}f"
     with open(output_path, "wb") as f:
@@ -737,16 +811,17 @@ def _write_gvk_binary_index(
 
 
 def _read_gvk_binary_index(faiss_path: str, payload_end: int) -> Tuple[int, int, List[List[float]]]:
+    """Read dense vectors from a `GVKRAG01` binary index container."""
     with open(faiss_path, "rb") as f:
         magic = f.read(len(RAG_MAGIC))
         if magic != RAG_MAGIC:
-            raise ValueError("Некоректний заголовок контейнера GVKRAG01.")
+            raise ValueError("Invalid GVKRAG01 container header.")
         version, count, dim = struct.unpack("<III", f.read(12))
         if version != RAG_FORMAT_VERSION:
-            raise ValueError(f"Непідтримувана версія формату GVKRAG: {version}")
+            raise ValueError(f"Unsupported GVKRAG format version: {version}")
         expected_end = len(RAG_MAGIC) + 12 + count * dim * 4
         if expected_end > payload_end:
-            raise ValueError("Файл memory.faiss пошкоджено або обрізано.")
+            raise ValueError("Corrupted or truncated memory.faiss file.")
         unpack_fmt = f"<{dim}f"
         row_bytes = dim * 4
         vectors: List[List[float]] = []
@@ -761,9 +836,19 @@ def build_rag_index(
     model_name: str = DEFAULT_EMBEDDING_MODEL,
     backend: str = "auto",
 ) -> Dict[str, Any]:
-    """
-    Компілює текстовий файл спогадів у `memory.faiss` (+ `memories.json` поруч).
-    Повертає словник із підсумковою статистикою збірки.
+    """Compile a text memories file into `memory.faiss` and a companion `memories.json`.
+
+    Args:
+        input_path: Path to source memories (`.txt`, `.md`, `.json`, or `.jsonl`).
+        output_faiss_path: Destination path for `memory.faiss`.
+        model_name: Embedding model identifier for `sentence-transformers`.
+        backend: Embedding backend (`"auto"`, `"sentence-transformers"`, or `"ngram"`).
+
+    Returns:
+        Dictionary containing index build statistics and output paths.
+
+    Example:
+        >>> build_rag_index("memories.txt", "personas/friend_1/memory.faiss")
     """
     records = parse_memories_file(input_path)
     engine = EmbeddingEngine(model_name=model_name, backend=backend)
@@ -834,13 +919,13 @@ def build_rag_index(
 
 
 # =====================================================================
-# РАНТАЙМ-ПОШУК СПОГАДІВ (MemoryRAG)
+# RUNTIME MEMORY RETRIEVAL (MemoryRAG)
 # =====================================================================
 class MemoryRAG:
-    """
-    Швидкий рушій пошуку спогадів для `core/orchestrator.py`.
-    Приймає або шлях до директорії персонажа (де лежить `memory.faiss`),
-    або безпосередній шлях до `memory.faiss`.
+    """Fast hybrid memory retrieval engine for `core/orchestrator.py`.
+
+    Accepts either a persona directory containing `memory.faiss` or an explicit
+    path to a `memory.faiss` file.
     """
 
     def __init__(
@@ -850,8 +935,20 @@ class MemoryRAG:
         model_name: Optional[str] = None,
         threshold: float = DEFAULT_SIMILARITY_THRESHOLD,
     ) -> None:
+        """Load a compiled RAG memory index and initialize its query encoder.
+
+        Args:
+            path: Persona directory or direct path to `memory.faiss`.
+            memories_json_path: Optional explicit path to `memories.json`.
+            model_name: Optional embedding model override.
+            threshold: Base similarity score threshold for search results.
+
+        Raises:
+            FileNotFoundError: If the index path or metadata cannot be located.
+            RuntimeError: If a native FAISS index is loaded without `faiss-cpu`.
+        """
         if not os.path.exists(path):
-            raise FileNotFoundError(f"Шлях до пам'яті RAG не знайдено: {path}")
+            raise FileNotFoundError(f"RAG memory path not found: {path}")
 
         if os.path.isdir(path):
             self.faiss_path = os.path.join(path, "memory.faiss")
@@ -861,7 +958,7 @@ class MemoryRAG:
             base_dir = os.path.dirname(os.path.abspath(path))
 
         if not os.path.isfile(self.faiss_path):
-            raise FileNotFoundError(f"Файл індексу memory.faiss не знайдено: {self.faiss_path}")
+            raise FileNotFoundError(f"Index file memory.faiss not found: {self.faiss_path}")
 
         self.threshold = float(threshold)
         trailer_meta, payload_end = _extract_metadata_trailer(self.faiss_path)
@@ -874,7 +971,7 @@ class MemoryRAG:
             self.metadata = trailer_meta
         else:
             raise FileNotFoundError(
-                f"Не знайдено метадані спогадів (ні '{json_candidate}', ні вбудованого трейлера GVKMETA1)."
+                f"Memory metadata not found (neither '{json_candidate}' nor embedded GVKMETA1 trailer)."
             )
 
         self.memories: List[Dict[str, Any]] = self.metadata.get("memories", [])
@@ -899,7 +996,7 @@ class MemoryRAG:
             for m in self.memories
         ]
 
-        # Ініціалізуємо енкодер запитів ДО імпорту faiss, щоб уникнути конфлікту OpenMP на macOS
+        # Initialize the query encoder BEFORE importing faiss to prevent OpenMP conflicts on macOS
         requested = self.index_backend if self.index_backend in ("sentence-transformers", "ngram") else "auto"
         try:
             self.engine = EmbeddingEngine(
@@ -908,14 +1005,14 @@ class MemoryRAG:
                 dimension=self.dimension,
             )
         except Exception:
-            # Офлайн-фолбек, якщо індекс побудовано з sentence-transformers, але модель недоступна локально
+            # Offline fallback when the index used sentence-transformers but the model is unavailable locally
             self.engine = EmbeddingEngine(
                 model_name=self.model_name,
                 backend="ngram",
                 dimension=self.dimension,
             )
 
-        # Завантаження індексу (нативний FAISS або GVKRAG01)
+        # Load vector index (native FAISS or GVKRAG01 container)
         self._faiss_index = None
         self._vectors: Optional[List[List[float]]] = None
 
@@ -931,15 +1028,15 @@ class MemoryRAG:
                 import faiss
             except ImportError as exc:
                 raise RuntimeError(
-                    "Індекс створено у нативному форматі FAISS, але пакет 'faiss-cpu' не встановлено. "
-                    "Встановіть залежності: pip install -r requirements.txt"
+                    "Index was built in native FAISS format, but 'faiss-cpu' is not installed. "
+                    "Install dependencies with: pip install -r requirements.txt"
                 ) from exc
 
             if hasattr(faiss, "omp_set_num_threads"):
                 faiss.omp_set_num_threads(1)
 
             if payload_end < os.path.getsize(self.faiss_path):
-                # Відділяємо чистий FAISS-потік без трейлера у тимчасовий файл для стабільності faiss.read_index
+                # Strip the metadata trailer into a temp file so faiss.read_index reads a pure FAISS stream
                 with tempfile.NamedTemporaryFile(suffix=".faiss", delete=False) as tmp:
                     tmp_path = tmp.name
                 try:
@@ -960,6 +1057,7 @@ class MemoryRAG:
                 self._faiss_index = faiss.read_index(self.faiss_path)
 
     def _cosine_candidates(self, q_vec: List[float], candidate_k: int) -> List[Tuple[int, float]]:
+        """Retrieve top `candidate_k` `(index, dot_product)` pairs for a query vector."""
         if not self.memories:
             return []
 
@@ -986,7 +1084,7 @@ class MemoryRAG:
 
     @property
     def effective_threshold(self) -> float:
-        """Ефективний поріг релевантності з урахуванням активного бекенду ембедінгів."""
+        """Effective relevance threshold accounting for the active embedding backend."""
         if (
             self.index_backend == "sentence-transformers"
             and self.engine.active_backend == "sentence-transformers"
@@ -1000,9 +1098,19 @@ class MemoryRAG:
         top_k: int = 2,
         threshold: Optional[float] = None,
     ) -> List[Dict[str, Any]]:
-        """
-        Шукає до `top_k` найрелевантніших спогадів під текстовий запит.
-        Відфільтровує нерелевантні привітання та записи нижче порогу `threshold`.
+        """Retrieve up to `top_k` relevant memories for a text query.
+
+        Filters out content-free greetings and candidates scoring below `threshold`,
+        combining cosine similarity with cross-lingual stem, tag, and dossier boosts.
+
+        Args:
+            query: User query text.
+            top_k: Maximum number of memories to return.
+            threshold: Optional override for `self.effective_threshold`.
+
+        Returns:
+            List of ranked memory hit dictionaries (`id`, `memory_id`, `text`,
+            `score`, `category`).
         """
         if not query or not query.strip() or not self.memories or top_k <= 0:
             return []
@@ -1011,12 +1119,12 @@ class MemoryRAG:
         q_stems = _extract_stems(query)
         extra_stems = _expand_query_stems(q_stems) if q_stems else set()
 
-        # Порожній за змістом запит (напр. "привіт", "ок", "як справи?")
+        # Skip short content-free queries (e.g., greetings or acknowledgments)
         if not q_stems and len(query.strip()) < 24:
             return []
 
-        # Якщо індекс зібрано на sentence-transformers, але зараз доступний лише ngram-фолбек,
-        # векторні простори не збігаються — переводимо оцінку на морфологічний ngram + лексику.
+        # When the index uses sentence-transformers but only the ngram fallback is available,
+        # vector spaces do not align; fall back to morphological and lexical scoring.
         vector_space_mismatch = (
             self.index_backend == "sentence-transformers"
             and self.engine.active_backend != "sentence-transformers"
@@ -1092,7 +1200,7 @@ class MemoryRAG:
         threshold: Optional[float] = None,
         header: str = "[АКТУАЛЬНИЙ СПОГАД З ПАМ'ЯТІ]:",
     ) -> str:
-        """Повертає готовий блок тексту для вставки в системний промпт, або ''."""
+        """Format retrieved memories into a prompt injection block, or return `""`."""
         hits = self.search(query, top_k=top_k, threshold=threshold)
         if not hits:
             return ""
@@ -1103,11 +1211,12 @@ class MemoryRAG:
 
 
 # =====================================================================
-# АВТОНОМНИЙ ТЕСТ (SELF-TEST) ТА CLI
+# STANDALONE SELF-TEST AND CLI
 # =====================================================================
 def run_self_test(backend: str = "ngram") -> None:
+    """Run offline self-tests covering index compilation, retrieval, and cross-lingual search."""
     print("====================================================================")
-    print(" [*] GVK Private AI — Self-Test (core/memory_rag.py)")
+    print(" [*] GVK Private AI - Self-Test (core/memory_rag.py)")
     print("====================================================================")
 
     sample_memories = """# Подорожі
@@ -1130,36 +1239,36 @@ def run_self_test(backend: str = "ngram") -> None:
         faiss_path = os.path.join(tmp_dir, "memory.faiss")
         stats = build_rag_index(mem_txt, faiss_path, backend=backend)
         print(
-            f" [1/4] Індекс зібрано: count={stats['count']}, dim={stats['dimension']}, "
+            f" [1/6] Index built: count={stats['count']}, dim={stats['dimension']}, "
             f"backend={stats['backend']}, format={stats['index_format']}"
         )
-        assert stats["count"] == 5, f"Очікувалось 5 спогадів, отримано {stats['count']}"
+        assert stats["count"] == 5, f"Expected 5 memories, got {stats['count']}"
 
         rag = MemoryRAG(tmp_dir)
 
         hits_mountain = rag.search("шо там було в карпатах?", top_k=1)
-        print(f" [2/4] Запит 'Карпати' -> {hits_mountain}")
+        print(f" [2/6] Query 'Карпати' -> {hits_mountain}")
         assert hits_mountain and "Карпати" in hits_mountain[0]["text"]
 
         hits_geom = rag.search("хто перевіряв задачі з геометрії?", top_k=1)
-        print(f" [3/4] Запит 'геометрія' -> {hits_geom}")
+        print(f" [3/6] Query 'геометрія' -> {hits_geom}")
         assert hits_geom and "геометрії" in hits_geom[0]["text"]
 
         hits_greeting = rag.search("привіт, як справи?", top_k=2)
-        print(f" [4/5] Запит-привітання -> {hits_greeting}")
-        assert hits_greeting == [], f"Привітання не повинно повертати спогади: {hits_greeting}"
+        print(f" [4/6] Greeting query -> {hits_greeting}")
+        assert hits_greeting == [], f"Greeting query should not return memories: {hits_greeting}"
 
         hits_unrelated = rag.search("де купити хліб в магазині?", top_k=2)
-        print(f" [5/5] Нерелевантний запит -> {hits_unrelated}")
-        assert hits_unrelated == [], f"Нерелевантний запит не повинен повертати спогади: {hits_unrelated}"
+        print(f" [5/6] Unrelated query -> {hits_unrelated}")
+        assert hits_unrelated == [], f"Unrelated query should not return memories: {hits_unrelated}"
 
-        # Перевірка автономної роботи без memories.json (лише через трейлер у memory.faiss)
+        # Verify standalone loading without memories.json (using embedded trailer in memory.faiss)
         os.remove(stats["memories_json_path"])
         rag_standalone = MemoryRAG(faiss_path)
         prompt_block = rag_standalone.format_for_prompt("на кому в доті граєш?", top_k=1)
         assert "Джаггернаут" in prompt_block
 
-    # [6/6] Перевірка структурованого формату [MEMORY_XX] та крос-мовного пошуку (UA -> RU)
+    # [6/6] Verify structured [MEMORY_XX] format and cross-lingual retrieval (UA -> RU)
     structured_sample = """================================================================================
 ## РАЗДЕЛ 1. ТЕСТ
 ================================================================================
@@ -1182,42 +1291,43 @@ def run_self_test(backend: str = "ngram") -> None:
             f.write(structured_sample)
         struct_faiss = os.path.join(tmp_dir2, "memory.faiss")
         struct_stats = build_rag_index(struct_txt, struct_faiss, backend=backend)
-        assert struct_stats["count"] == 2, f"Очікувалось 2 блоки [MEMORY_XX], отримано {struct_stats['count']}"
+        assert struct_stats["count"] == 2, f"Expected 2 [MEMORY_XX] blocks, got {struct_stats['count']}"
 
         rag_struct = MemoryRAG(tmp_dir2)
         hits_ua_ru = rag_struct.search("де вчиться friend_2 в університеті?", top_k=1)
-        print(f" [6/6] Структурований [MEMORY_XX] UA->RU -> {hits_ua_ru}")
+        print(f" [6/6] Structured [MEMORY_XX] UA->RU -> {hits_ua_ru}")
         assert hits_ua_ru and hits_ua_ru[0]["memory_id"] == "MEMORY_01"
 
         hits_phys = rag_struct.search("історія зі збірником з фізики на шафі", top_k=1)
         assert hits_phys and hits_phys[0]["memory_id"] == "MEMORY_02"
 
     print("====================================================================")
-    print(" [✓] УСІ ПЕРЕВІРКИ MEMORY_RAG ПРОЙДЕНО УСПІШНО!")
+    print(" [OK] ALL MEMORY_RAG CHECKS PASSED!")
     print("====================================================================")
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="GVK Private AI — Runtime RAG пам'ять")
+    """CLI entry point for running RAG self-tests and querying compiled indices."""
+    parser = argparse.ArgumentParser(description="GVK Private AI - Runtime RAG Memory")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
-    p_test = sub.add_parser("self-test", help="Запустити автономний тест збірки та пошуку RAG")
+    p_test = sub.add_parser("self-test", help="Run standalone RAG index build and search self-test")
     p_test.add_argument(
         "--backend",
         choices=("auto", "sentence-transformers", "ngram"),
         default="ngram",
-        help="Бекенд для тесту (за замовчуванням ngram — працює миттєво й офлайн)",
+        help="Embedding backend for the test (default: ngram, fast and offline)",
     )
 
-    p_query = sub.add_parser("query", help="Виконати пошук у зібраному індексі memory.faiss")
-    p_query.add_argument("-i", "--index", required=True, help="Папка персонажа або шлях до memory.faiss")
-    p_query.add_argument("-q", "--query", required=True, help="Текст запиту")
-    p_query.add_argument("-k", "--top-k", type=int, default=2, help="Скільки спогадів повернути")
+    p_query = sub.add_parser("query", help="Search a compiled memory.faiss index")
+    p_query.add_argument("-i", "--index", required=True, help="Persona directory or path to memory.faiss")
+    p_query.add_argument("-q", "--query", required=True, help="Query text")
+    p_query.add_argument("-k", "--top-k", type=int, default=2, help="Maximum number of memories to return")
     p_query.add_argument(
         "--threshold",
         type=float,
         default=DEFAULT_SIMILARITY_THRESHOLD,
-        help="Мінімальний поріг релевантності",
+        help="Minimum relevance score threshold",
     )
 
     args = parser.parse_args()
@@ -1227,11 +1337,11 @@ def main() -> None:
         rag = MemoryRAG(args.index, threshold=args.threshold)
         results = rag.search(args.query, top_k=args.top_k, threshold=args.threshold)
         if not results:
-            print("Релевантних спогадів не знайдено.")
+            print("No relevant memories found.")
             return
         for idx, hit in enumerate(results, 1):
             print(f"[{idx}] score={hit['score']:.4f} | category={hit['category']} | {hit['text']}")
-        print("\n--- Блок для промпта ---")
+        print("\n--- Prompt Block ---")
         print(rag.format_for_prompt(args.query, top_k=args.top_k, threshold=args.threshold))
 
 

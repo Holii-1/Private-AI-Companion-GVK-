@@ -1,1 +1,1 @@
-"""GVK Private AI — Core Runtime Package."""
+"""GVK Private AI - Core Runtime Package (core/__init__.py)."""

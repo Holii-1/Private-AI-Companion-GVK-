@@ -1,14 +1,21 @@
 #!/usr/bin/env python3
 """
-GVK Private AI — Єдиний завантажувач приватного ростеру (core/roster.py)
+GVK Private AI - Unified Private Roster Loader (core/roster.py)
 
-Уніфікує пошук і парсинг єдиного файлу `personas/roster.json` для всіх модулів
-(`core/menu.py`, `core/orchestrator.py`, `core/main.py`) без зайвих залежностей.
+Centralizes discovery and parsing of the git-ignored `personas/roster.json`
+file across all runtime modules (`core/menu.py`, `core/orchestrator.py`,
+`core/main.py`) with zero extra dependencies.
 
-Порядок пошуку `roster.json`:
-  1. RAM-диск (`<ram_root>/personas/roster.json`, `<ram_root>/personas/<persona_id>/roster.json`, ...)
-  2. Локальний репозиторій (`<repo_root>/personas/roster.json`, `<persona_dir>/roster.json`, ...)
-  3. Домашній кеш (`~/.gvk_ai/personas/roster.json`, ...)
+Key Responsibilities:
+  - Search for `roster.json` in priority order: RAM disk, local repository,
+    and `~/.gvk_ai` home cache.
+  - Extract UA-to-RU name mappings, interlocutor descriptions, and the
+    default `[02]` user display name.
+
+Usage:
+  from core.roster import extract_roster_mappings, load_roster_data
+  roster = load_roster_data(ram_root=ram_root)
+  ua_to_ru, descriptions, default_user = extract_roster_mappings(roster)
 """
 
 import glob
@@ -21,6 +28,9 @@ logger = logging.getLogger("gvk.roster")
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
+# =====================================================================
+# ROSTER DISCOVERY & PARSING
+# =====================================================================
 def load_roster_data(
     ram_root: Optional[str] = None,
     repo_root: str = REPO_ROOT,
@@ -28,10 +38,24 @@ def load_roster_data(
     persona_id: Optional[str] = None,
     persona_dir: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """
-    Знаходить і завантажує єдиний приватний `roster.json` із RAM-диска,
-    локальної папки `personas/` або `~/.gvk_ai/personas/`.
-    Повертає словник JSON або `{}` за відсутності файлу.
+    """Locate and load the private `roster.json` file.
+
+    Searches in priority order across the mounted RAM disk, the local
+    repository `personas/` directory, and the `~/.gvk_ai/personas/` cache.
+
+    Args:
+        ram_root: Optional path to the mounted RAM disk root.
+        repo_root: Path to the repository root directory.
+        gvk_home: Optional override for the `~/.gvk_ai` home cache directory.
+        persona_id: Optional persona identifier to check under `personas/<id>/`.
+        persona_dir: Optional explicit persona directory path.
+
+    Returns:
+        Parsed JSON dictionary from the first readable `roster.json`, or `{}`
+        if no valid roster file is found.
+
+    Example:
+        >>> roster = load_roster_data(persona_id="friend_1")
     """
     home_abs = os.path.abspath(os.path.expanduser(gvk_home or os.environ.get("GVK_HOME") or "~/.gvk_ai"))
     candidates: List[str] = []
@@ -69,18 +93,26 @@ def load_roster_data(
             if isinstance(data, dict):
                 return data
         except (OSError, json.JSONDecodeError) as exc:
-            logger.warning("Не вдалося прочитати roster.json (%s): %s", norm, exc)
+            logger.warning("Failed to read roster.json (%s): %s", norm, exc)
     return {}
 
 
 def extract_roster_mappings(
     roster: Dict[str, Any],
 ) -> Tuple[Dict[str, str], Dict[str, str], Optional[str]]:
-    """
-    Витягує зі словника `roster.json`:
-      - `ua_to_ru_names`: словник перекладу імен UA -> RU
-      - `interlocutor_descriptions`: словник повних описів співрозмовників
-      - `default_user_name`: ім'я користувача `[02]` за замовчуванням (або None)
+    """Extract name translations, interlocutor descriptions, and default user.
+
+    Args:
+        roster: Parsed `roster.json` dictionary.
+
+    Returns:
+        A 3-tuple `(ua_to_ru_names, interlocutor_descriptions, default_user_name)`:
+        - `ua_to_ru_names`: Mapping of Ukrainian names to Russian equivalents.
+        - `interlocutor_descriptions`: Mapping of user names to full prompt descriptions.
+        - `default_user_name`: Display name for default user `[02]`, or `None`.
+
+    Example:
+        >>> ua_to_ru, descriptions, default_user = extract_roster_mappings(roster)
     """
     if not isinstance(roster, dict):
         return {}, {}, None

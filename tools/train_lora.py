@@ -1,21 +1,18 @@
 #!/usr/bin/env python3
 """
-GVK Private AI — Автономний CLI-тренер QLoRA та валідатор датасетів (tools/train_lora.py)
+GVK Private AI - QLoRA Trainer and Dataset Validator (tools/train_lora.py)
 
-Реалізує офлайн-валідацію датасету без витоку даних та 2-стадійне тренування QLoRA
-(відповідно до `notebooks/Qwen2.5_14b_LoRA_trainer.ipynb`) на GPU з підтримкою `--dry-run`.
+Provides leak-free offline ChatML dataset validation and a two-stage QLoRA
+fine-tuning pipeline (matching `notebooks/Qwen2.5_14b_LoRA_trainer.ipynb`) with
+CPU/macOS `--dry-run` verification support.
 
-Особливості:
-  1. ChatML-валідатор: перевіряє структуру `{"messages": [{"role": ..., "content": ...}]}`
-     та наявність коректних пар діалогу.
-  2. Спліт без витоку (Leak-Free Temporal Split): виділяє останні 5% діалогів на валідацію
-     суворо без попереднього перемішування (`shuffle=False`), щоб сусідні часові вікна не перетікали.
-  3. Маскування лоссу (`train_on_responses_only`): позначає токени до `<|im_start|>assistant\n`
-     індексом `-100`, щоб модель вчилася тільки на репліках персонажа.
-  4. Двостадійний пайплайн (Stage 1 -> Stage 2 annealing на топ-30% лаконічних семплів)
-     та автоматична конвертація навчених ваг у формат `GGUF F16`.
+Key Responsibilities:
+  - Validate ChatML JSONL records (`{"messages": [{"role": ..., "content": ...}]}`).
+  - Perform a leak-free temporal train/validation split (holding out the final 5% without shuffling).
+  - Verify response-only loss masking (`-100` for system/user turns before `<|im_start|>assistant\n`).
+  - Run two-stage QLoRA training (Stage 1 full set -> Stage 2 style annealing on the top 30% concise samples).
 
-Приклади запуску:
+Usage:
   python3 tools/train_lora.py self-test
   python3 tools/train_lora.py train --persona friend_1 --dataset datasets/friend_1.jsonl --dry-run
   python3 tools/train_lora.py train --persona friend_1 --dataset datasets/friend_1.jsonl -o adapters/
@@ -53,6 +50,8 @@ IM_END = "<|im_end|>"
 
 @dataclass
 class DatasetStats:
+    """Summary counts produced when inspecting a ChatML JSONL dataset."""
+
     total_lines: int
     valid_samples: int
     invalid_lines: int
@@ -62,38 +61,55 @@ class DatasetStats:
 
 
 # =====================================================================
-# 1. ВАЛІДАЦІЯ CHATML, БЕЗПЕЧНИЙ СПЛІТ ТА МАСКУВАННЯ ЛОССУ
+# 1. CHATML VALIDATION, LEAK-FREE SPLIT, AND LOSS MASKING
 # =====================================================================
 def validate_chatml_sample(sample: Any) -> Tuple[bool, str]:
-    """Перевіряє коректність формату ChatML `{"messages": [...]}`."""
+    """Validate a single ChatML sample object (`{"messages": [...]}`).
+
+    Args:
+        sample: Parsed JSON object representing one conversation sample.
+
+    Returns:
+        Tuple `(is_valid, error_message)` where `error_message` is empty when valid.
+    """
     if not isinstance(sample, dict):
-        return False, "Запис не є JSON-об'єктом"
+        return False, "Record is not a JSON object"
     messages = sample.get("messages")
     if not isinstance(messages, list) or len(messages) < 2:
-        return False, "Поле 'messages' має містити щонайменше 2 повідомлення"
+        return False, "Field 'messages' must contain at least 2 messages"
 
     has_assistant = False
     for idx, msg in enumerate(messages):
         if not isinstance(msg, dict):
-            return False, f"Повідомлення #{idx} не є словником"
+            return False, f"Message #{idx} is not a dictionary"
         role = msg.get("role")
         content = msg.get("content")
         if role not in ("system", "user", "assistant"):
-            return False, f"Некоректна роль '{role}' у повідомленні #{idx}"
+            return False, f"Invalid role '{role}' in message #{idx}"
         if not isinstance(content, str) or not content.strip():
-            return False, f"Порожній 'content' у повідомленні #{idx}"
+            return False, f"Empty 'content' in message #{idx}"
         if role == "assistant":
             has_assistant = True
 
     if not has_assistant:
-        return False, "Відсутня хоча б одна репліка 'assistant'"
+        return False, "Missing at least one 'assistant' turn"
     return True, ""
 
 
 def load_chatml_dataset(dataset_path: str) -> Tuple[List[Dict[str, Any]], int, int]:
-    """Зчитує JSONL-файл, відфільтровує биті рядки й повертає `(valid_samples, total_lines, invalid_lines)`."""
+    """Read a JSONL dataset, discard malformed rows, and return valid ChatML samples.
+
+    Args:
+        dataset_path: Path to the `.jsonl` file.
+
+    Returns:
+        Tuple of `(valid_samples, total_lines, invalid_lines)`.
+
+    Raises:
+        FileNotFoundError: If `dataset_path` does not exist.
+    """
     if not os.path.isfile(dataset_path):
-        raise FileNotFoundError(f"Файл датасету не знайдено: {dataset_path}")
+        raise FileNotFoundError(f"Dataset file not found: {dataset_path}")
 
     valid: List[Dict[str, Any]] = []
     total_lines = 0
@@ -122,9 +138,17 @@ def split_train_val_without_leak(
     samples: Sequence[Dict[str, Any]],
     val_ratio: float = 0.05,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-    """
-    Виділяє валідацію з хвоста хронологічної вибірки без перемішування (`shuffle=False`),
-    щоб запобігти витоку через перекриття ковзних вікон та часове зважування.
+    """Split chronological samples into train and tail validation sets without shuffling.
+
+    Holding out the chronological tail (`shuffle=False`) prevents data leakage across
+    overlapping sliding-window dialogue chunks and temporal weighting.
+
+    Args:
+        samples: Ordered sequence of validated ChatML samples.
+        val_ratio: Fraction of tail samples reserved for validation.
+
+    Returns:
+        Tuple of `(train_samples, val_samples)`.
     """
     n = len(samples)
     if n <= 1:
@@ -142,7 +166,17 @@ def select_stage2_samples(
     min_chars: int = 4,
     max_chars: int = 800,
 ) -> List[Dict[str, Any]]:
-    """Відбирає до `top_fraction` найякісніших лаконічних семплів для Stage 2 відпалу стилю."""
+    """Select up to `top_fraction` concise samples for Stage 2 style annealing.
+
+    Args:
+        samples: Training samples to rank and filter.
+        top_fraction: Target fraction of samples to keep.
+        min_chars: Minimum allowed length per assistant reply.
+        max_chars: Maximum allowed length per assistant reply.
+
+    Returns:
+        Subset of concise samples prioritized around natural short-reply length (~48 chars).
+    """
     filtered: List[Tuple[int, Dict[str, Any]]] = []
     for sample in samples:
         asst_texts = [
@@ -160,13 +194,20 @@ def select_stage2_samples(
         return list(samples[: max(1, int(len(samples) * top_fraction))])
 
     target_k = max(1, int(round(len(samples) * top_fraction)))
-    # Перевага коротким природним діалогам (8..180 символів на репліку)
+    # Prefer natural concise replies (8..180 characters per turn, centered near 48 chars)
     filtered.sort(key=lambda pair: abs(pair[0] - 48))
     return [pair[1] for pair in filtered[:target_k]]
 
 
 def format_chatml_text(messages: Sequence[Dict[str, str]]) -> str:
-    """Рендерить масив повідомлень у стандартний рядок Qwen ChatML."""
+    """Render a list of role/content messages into a Qwen ChatML string.
+
+    Args:
+        messages: Sequence of message dictionaries with `"role"` and `"content"`.
+
+    Returns:
+        Formatted ChatML text block.
+    """
     parts: List[str] = []
     for m in messages:
         parts.append(f"<|im_start|>{m['role']}\n{m['content']}{IM_END}\n")
@@ -174,11 +215,17 @@ def format_chatml_text(messages: Sequence[Dict[str, str]]) -> str:
 
 
 def compute_response_only_labels_mask(chatml_text: str) -> List[Tuple[str, bool]]:
-    """
-    Симулює маскування лоссу (`train_on_responses_only`):
-    повертає сегменти `(segment_text, is_trained)`.
-    Усе до `<|im_start|>assistant\n` включно та `system`/`user` блоки маскуються (`-100`, `is_trained=False`),
-    навчання йде лише на тексті асистента + його `<|im_end|>`.
+    """Simulate response-only loss masking (`train_on_responses_only`).
+
+    Everything up to and including `<|im_start|>assistant\n` plus all `system`/`user`
+    blocks is masked (`-100`, `is_trained=False`); loss is computed only on assistant
+    reply text and its closing `<|im_end|>` token.
+
+    Args:
+        chatml_text: Full ChatML-formatted conversation string.
+
+    Returns:
+        List of `(segment_text, is_trained)` tuples partitioning `chatml_text`.
     """
     segments: List[Tuple[str, bool]] = []
     pos = 0
@@ -207,12 +254,23 @@ def compute_response_only_labels_mask(chatml_text: str) -> List[Tuple[str, bool]
 
 
 # =====================================================================
-# 2. ЛОКАЛЬНИЙ / ХМАРНИЙ ЗАПУСК ТРЕНУВАННЯ QLORA
+# 2. LOCAL / CLOUD QLORA TRAINING PIPELINE
 # =====================================================================
 def inspect_dataset(dataset_path: str) -> Tuple[DatasetStats, List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Load, validate, and split a ChatML dataset into Stage 1, validation, and Stage 2 sets.
+
+    Args:
+        dataset_path: Path to the source `.jsonl` file.
+
+    Returns:
+        Tuple of `(stats, train_data, val_data, stage2_data)`.
+
+    Raises:
+        ValueError: If no valid ChatML samples are found in `dataset_path`.
+    """
     samples, total_lines, invalid_lines = load_chatml_dataset(dataset_path)
     if not samples:
-        raise ValueError(f"У датасеті '{dataset_path}' немає жодного валідного ChatML-семпла.")
+        raise ValueError(f"Dataset '{dataset_path}' contains no valid ChatML samples.")
     train_data, val_data = split_train_val_without_leak(samples, val_ratio=0.05)
     stage2_data = select_stage2_samples(train_data, top_fraction=STAGE2_TOP_FRACTION)
     stats = DatasetStats(
@@ -234,38 +292,53 @@ def train_persona_lora(
     max_seq_length: int = DEFAULT_MAX_SEQ_LEN,
     dry_run: bool = False,
 ) -> Dict[str, Any]:
-    """
-    Виконує 2-стадійне QLoRA навчання для `persona_id`.
-    У режимі `--dry-run` валідує датасет і перевіряє гіперпараметри без GPU.
+    """Run two-stage QLoRA fine-tuning for `persona_id`.
+
+    In `--dry-run` mode, validates the dataset, leak-free split, and response-only loss
+    masking without requiring a CUDA GPU.
+
+    Args:
+        persona_id: Identifier of the target persona (e.g., `"friend_1"`).
+        dataset_path: Path to the persona ChatML `.jsonl` dataset.
+        output_dir: Directory where stage checkpoints and the final PEFT adapter are saved.
+        base_model: Hugging Face model ID for the 4-bit base model.
+        max_seq_length: Maximum context length for SFT training.
+        dry_run: If `True`, skip GPU training and only verify dataset/masking integrity.
+
+    Returns:
+        Summary dictionary containing `persona_id`, `dry_run`, `stats`, and (when trained) `peft_dir`.
+
+    Raises:
+        RuntimeError: If a CUDA GPU or required Unsloth/TRL/PyTorch stack is unavailable during real training.
     """
     stats, train_data, val_data, stage2_data = inspect_dataset(dataset_path)
-    print("====================================================================")
-    print(f" [*] GVK QLoRA Trainer — '{persona_id}'")
-    print("====================================================================")
-    print(f" Датасет        : {os.path.abspath(dataset_path)}")
-    print(f" Базова модель  : {base_model} (ctx={max_seq_length}, LoRA r={LORA_R}/alpha={LORA_ALPHA})")
-    print(f" Валідні семпли : {stats.valid_samples} / {stats.total_lines} (відсіяно: {stats.invalid_lines})")
-    print(f" Спліт без вит. : train={stats.train_count}, val={stats.val_count} (5% tail)")
-    print(f" Stage 2 вибірка: {stats.stage2_count} (~30% лаконічних семплів)")
+    print("=====================================================================")
+    print(f" [*] GVK Private AI - QLoRA Trainer ('{persona_id}')")
+    print("=====================================================================")
+    print(f" Dataset        : {os.path.abspath(dataset_path)}")
+    print(f" Base model     : {base_model} (ctx={max_seq_length}, LoRA r={LORA_R}/alpha={LORA_ALPHA})")
+    print(f" Valid samples  : {stats.valid_samples} / {stats.total_lines} (filtered: {stats.invalid_lines})")
+    print(f" Leak-free split: train={stats.train_count}, val={stats.val_count} (5% tail)")
+    print(f" Stage 2 subset : {stats.stage2_count} (~30% concise samples)")
 
     if dry_run:
         sample_chatml = format_chatml_text(train_data[0]["messages"])
         masked_segments = compute_response_only_labels_mask(sample_chatml)
         trained_chars = sum(len(seg) for seg, active in masked_segments if active)
         masked_chars = sum(len(seg) for seg, active in masked_segments if not active)
-        print(f" [DRY-RUN OK] Маскування перевірено: trained={trained_chars} симв., masked(-100)={masked_chars} симв.")
-        print("====================================================================")
+        print(f" [OK] [DRY-RUN] Loss masking verified: trained={trained_chars} chars, masked(-100)={masked_chars} chars.")
+        print("=====================================================================")
         return {
             "persona_id": persona_id,
             "dry_run": True,
             "stats": stats,
         }
 
-    # Перевірка наявності GPU-стеку для реального тренування
+    # Verify GPU training stack availability before loading weights
     try:
         import torch
         if not torch.cuda.is_available():
-            raise RuntimeError("CUDA GPU не виявлено.")
+            raise RuntimeError("No CUDA GPU detected.")
         from datasets import Dataset
         from transformers import TrainingArguments
         from trl import SFTTrainer
@@ -273,8 +346,8 @@ def train_persona_lora(
         from unsloth.chat_templates import train_on_responses_only
     except Exception as exc:
         raise RuntimeError(
-            f"Для реального навчання QLoRA потрібен CUDA GPU та бібліотеки unsloth/trl/torch ({exc}).\n"
-            f"На CPU/macOS використовуйте --dry-run або ноутбук notebooks/Qwen2.5_14b_LoRA_trainer.ipynb у Google Colab."
+            f"Real QLoRA training requires a CUDA GPU and unsloth/trl/torch ({exc}).\n"
+            f"On CPU/macOS use --dry-run or run notebooks/Qwen2.5_14b_LoRA_trainer.ipynb in Google Colab."
         ) from exc
 
     os.makedirs(output_dir, exist_ok=True)
@@ -366,17 +439,18 @@ def train_persona_lora(
     peft_out = os.path.join(output_dir, f"{persona_id}_lora_final")
     model.save_pretrained(peft_out)
     tokenizer.save_pretrained(peft_out)
-    print(f" [✓] PEFT адаптер збережено у: {peft_out}")
+    print(f" [OK] PEFT adapter saved to: {peft_out}")
     return {"persona_id": persona_id, "dry_run": False, "peft_dir": peft_out, "stats": stats}
 
 
 # =====================================================================
-# 3. АВТОНОМНИЙ SELF-TEST (CPU / MACOS БЕЗ GPU)
+# 3. OFFLINE SELF-TEST (CPU / NO-GPU)
 # =====================================================================
 def run_self_test() -> None:
-    print("====================================================================")
-    print(" [*] GVK Private AI — Офлайн Self-Test тренера (tools/train_lora.py)")
-    print("====================================================================")
+    """Run offline self-tests for ChatML validation, leak-free splitting, masking, and dry-run."""
+    print("=====================================================================")
+    print(" [*] GVK Private AI - Offline Trainer Self-Test (tools/train_lora.py)")
+    print("=====================================================================")
 
     with tempfile.TemporaryDirectory(prefix="gvk_train_test_") as tmpdir:
         ds_path = os.path.join(tmpdir, "friend_test.jsonl")
@@ -394,15 +468,15 @@ def run_self_test() -> None:
         with open(ds_path, "w", encoding="utf-8") as f:
             for s in samples:
                 f.write(json.dumps(s, ensure_ascii=False) + "\n")
-            # Додаємо 1 невалідний рядок для перевірки фільтра
+            # Append 1 invalid record to verify malformed-row filtering
             f.write(json.dumps({"messages": [{"role": "user", "content": "без відповіді"}]}) + "\n")
 
-        print(" [1/4] Перевірка ChatML-валідатора та завантаження JSONL...")
+        print(" [*] [1/4] Checking ChatML validator and JSONL loader...")
         loaded, total_lines, invalid = load_chatml_dataset(ds_path)
         assert total_lines == 41 and len(loaded) == 40 and invalid == 1
-        print(f"       [OK] Валідних={len(loaded)}, відсіяно={invalid}.")
+        print(f"       [OK] valid={len(loaded)}, filtered={invalid}.")
 
-        print(" [2/4] Перевірка спліту train/val без витоку (5% хвіст)...")
+        print(" [*] [2/4] Checking leak-free train/val split (5% tail)...")
         train_set, val_set = split_train_val_without_leak(loaded, val_ratio=0.05)
         assert len(train_set) == 38 and len(val_set) == 2
         assert "питання #38" in val_set[0]["messages"][1]["content"]
@@ -410,46 +484,54 @@ def run_self_test() -> None:
         assert len(stage2) == 11
         print(f"       [OK] train={len(train_set)}, val={len(val_set)}, stage2={len(stage2)}.")
 
-        print(" [3/4] Перевірка маскування лоссу (train_on_responses_only)...")
+        print(" [*] [3/4] Checking response-only loss masking (train_on_responses_only)...")
         chatml = format_chatml_text(loaded[0]["messages"])
         segments = compute_response_only_labels_mask(chatml)
         trained_text = "".join(t for t, ok in segments if ok)
         masked_text = "".join(t for t, ok in segments if not ok)
         assert "відповідь #0" in trained_text and "тестовий асистент" not in trained_text
         assert "привіт, питання #0" in masked_text and "привіт, питання #0" not in trained_text
-        print("       [OK] System і user токени замасковано (-100), навчаються лише токени assistant.")
+        print("       [OK] System and user tokens masked (-100); only assistant tokens trained.")
 
-        print(" [4/4] Перевірка запуску --dry-run...")
+        print(" [*] [4/4] Checking --dry-run execution...")
         res = train_persona_lora("friend_1", ds_path, output_dir=tmpdir, dry_run=True)
         assert res["dry_run"] is True and res["stats"].valid_samples == 40
 
-    print("====================================================================")
-    print(" [✓] УСІ ТЕСТИ TRAIN_LORA.PY ПРОЙДЕНО УСПІШНО!")
-    print("====================================================================")
+    print("=====================================================================")
+    print(" [OK] ALL TRAIN_LORA.PY SELF-TESTS PASSED!")
+    print("=====================================================================")
 
 
 # =====================================================================
-# CLI ІНТЕРФЕЙС
+# 4. CLI INTERFACE
 # =====================================================================
 def main(argv: Optional[List[str]] = None) -> None:
+    """Parse CLI arguments and dispatch `self-test`, `train`, or `train-all`.
+
+    Args:
+        argv: Optional CLI argument list (defaults to `sys.argv[1:]`).
+
+    Raises:
+        FileNotFoundError: If `train-all` finds no `.jsonl` files in `--dataset-dir`.
+    """
     parser = argparse.ArgumentParser(
-        description="GVK Private AI — QLoRA тренер та валідатор ChatML-датасетів"
+        description="GVK Private AI - QLoRA trainer and ChatML dataset validator"
     )
     sub = parser.add_subparsers(dest="cmd", required=True)
 
-    sub.add_parser("self-test", help="Перевірка валідатора ChatML, спліту та маскування лоссу (без GPU)")
+    sub.add_parser("self-test", help="Verify ChatML validation, leak-free split, and loss masking (no GPU required)")
 
-    p_tr = sub.add_parser("train", help="Тренування QLoRA для одного персонажа")
-    p_tr.add_argument("--persona", required=True, help="ID персонажа (напр. friend_1)")
-    p_tr.add_argument("--dataset", required=True, help="Шлях до .jsonl датасету")
-    p_tr.add_argument("-o", "--output", default="adapters", help="Папка збереження адаптера")
-    p_tr.add_argument("--base-model", default=DEFAULT_BASE_MODEL, help="HuggingFace ID базової моделі")
-    p_tr.add_argument("--dry-run", action="store_true", help="Лише перевірка датасету та маскування без GPU")
+    p_tr = sub.add_parser("train", help="Run QLoRA training for a single persona")
+    p_tr.add_argument("--persona", required=True, help="Persona ID (e.g., friend_1)")
+    p_tr.add_argument("--dataset", required=True, help="Path to the .jsonl dataset")
+    p_tr.add_argument("-o", "--output", default="adapters", help="Output directory for adapter artifacts")
+    p_tr.add_argument("--base-model", default=DEFAULT_BASE_MODEL, help="Hugging Face ID of the base model")
+    p_tr.add_argument("--dry-run", action="store_true", help="Validate dataset and loss masking without a GPU")
 
-    p_all = sub.add_parser("train-all", help="Пакетне тренування всіх .jsonl файлів у директорії")
-    p_all.add_argument("--dataset-dir", required=True, help="Папка з JSONL-датасетами")
-    p_all.add_argument("-o", "--output", default="adapters", help="Папка збереження адаптерів")
-    p_all.add_argument("--dry-run", action="store_true", help="Лише перевірка датасетів без GPU")
+    p_all = sub.add_parser("train-all", help="Batch-train all .jsonl datasets in a directory")
+    p_all.add_argument("--dataset-dir", required=True, help="Directory containing JSONL datasets")
+    p_all.add_argument("-o", "--output", default="adapters", help="Output directory for adapter artifacts")
+    p_all.add_argument("--dry-run", action="store_true", help="Validate datasets without a GPU")
 
     args = parser.parse_args(argv)
     if args.cmd == "self-test":
@@ -465,7 +547,7 @@ def main(argv: Optional[List[str]] = None) -> None:
     elif args.cmd == "train-all":
         files = sorted(glob.glob(os.path.join(args.dataset_dir, "*.jsonl")))
         if not files:
-            raise FileNotFoundError(f"У папці {args.dataset_dir} не знайдено жодного .jsonl файлу.")
+            raise FileNotFoundError(f"No .jsonl dataset files found in {args.dataset_dir}.")
         for fp in files:
             pid = os.path.splitext(os.path.basename(fp))[0]
             train_persona_lora(

@@ -1,41 +1,33 @@
 #!/usr/bin/env python3
 """
-GVK Private AI — Генератор ключів, Шифратор контейнерів та Збирач диска (tools/disc_packer.py)
+GVK Private AI - Key Generator, Container Encryptor & Disc Packer (tools/disc_packer.py)
 
-Реалізує криптографічний протокол GVK Private AI (Zero-Plaintext-At-Rest & Zero-Leak Metadata):
-  1. Деривація 256-бітного майстер-ключа через Argon2id:
-     - Сіль домену: GVK_PRIVATE_AI_DOMAIN_SALT_2026
-     - Параметри: time_cost=4, memory_cost=262144 (256 МБ ОЗП), parallelism=4, hash_len=32
-  2. Потокове шифрування та дешифрування великих файлів (AES-256-GCM) чанками по 64 МБ:
-     - 36-байтний бінарний заголовок:
-       [Magic "GVK1" (4B) | Base Nonce (12B) | Header Auth Tag (16B) | Chunk Size (4B)]
-     - Кожен чанк шифрується власним унікальним Nonce (base_nonce XOR chunk_index)
-       із прив'язкою порядкового номера чанка в AAD (Associated Authenticated Data),
-       що унеможливлює повторне використання Nonce або перестановку чанків.
-  3. Генерація апаратного підпису активації диска `origin.sig`:
-     - HMAC-SHA256(persona_id, master_key) -> 32 байти.
-  4. Пакування приватного архіву особистості `payload.tar.enc` напряму в пам'яті (io.BytesIO)
-     та автоматична генерація публічного паспорта `manifest.json` із SHA-256 гешами.
-  5. Збірка повної структури DVD-диска `GVK_VAULT` (DVD-R 4.7 ГБ, ~150–160 МБ,
-     включно з лаунчерами `run.sh` / `run.bat`).
+Implements the GVK Private AI cryptographic protocol (Zero-Plaintext-At-Rest and
+Zero-Leak Metadata) alongside DVD, ISO-9660/Joliet, and offline USB image assembly.
 
-Приклади використання:
-  # 1. Швидка самоперевірка всіх криптографічних функцій в ОЗП:
+Key Responsibilities:
+  - Derive 256-bit master keys via Argon2id (domain salt
+    `GVK_PRIVATE_AI_DOMAIN_SALT_2026`, time_cost=4, memory_cost=262144 KiB,
+    parallelism=4, hash_len=32).
+  - Stream-encrypt and decrypt large files with AES-256-GCM in 64 MB chunks
+    using the 36-byte `GVK1` header (`[Magic 4B | Base Nonce 12B | Header Auth
+    Tag 16B | Chunk Size 4B]`), per-chunk XOR nonces, and chunk-index AAD.
+  - Generate and verify 32-byte HMAC-SHA256 physical activation signatures
+    (`origin.sig`).
+  - Pack persona payloads (`payload.tar.enc`) strictly in memory (`io.BytesIO`)
+    and emit zero-leak public `manifest.json` files with SHA-256 digests.
+  - Assemble `GVK_VAULT` DVD trees, ISO-9660/Joliet `.iso` images, and offline
+    USB distributions with bundled launchers (`run.sh`, `run.command`, `run.bat`).
+
+Usage:
   python3 tools/disc_packer.py self-test
-
-  # 2. Генерація master.key із секретної фрази:
   python3 tools/disc_packer.py keygen -o vault/master.key
-
-  # 3. Шифрування файлу (наприклад, адаптера):
   python3 tools/disc_packer.py encrypt -k vault/master.key -i adapter.gguf -o adapter.gguf.enc
-
-  # 4. Повна збірка папки персонажа (adapter.gguf.enc + payload.tar.enc + manifest.json + origin.sig):
-  python3 tools/disc_packer.py pack-persona -k vault/master.key --id friend_1 \
+  python3 tools/disc_packer.py pack-persona -k vault/master.key --id friend_1 \\
       --adapter raw/friend_1.gguf --payload-dir raw/friend_1_payload/ -o build/friend_1/
-
-  # 5. Збірка готового образу DVD-диска GVK_VAULT (публічна база докачується updater.py з хмари):
-  python3 tools/disc_packer.py build-disc -k vault/master.key --id friend_1 \
+  python3 tools/disc_packer.py build-disc -k vault/master.key --id friend_1 \\
       --persona-dir build/friend_1/ -o dist/GVK_VAULT_DISC_1/
+  python3 tools/disc_packer.py --help
 """
 
 import argparse
@@ -57,41 +49,49 @@ import time
 from typing import Any, BinaryIO, Dict, List, Optional, Tuple
 
 # =====================================================================
-# КОНСТАНТИ КРИПТОГРАФІЧНОГО ПРОТОКОЛУ GVK
+# GVK CRYPTOGRAPHIC PROTOCOL CONSTANTS
 # =====================================================================
 MAGIC_BYTES = b"GVK1"
 HEADER_SIZE = 36  # 4B Magic + 12B Nonce + 16B Tag + 4B ChunkSize
-DEFAULT_CHUNK_SIZE = 64 * 1024 * 1024  # 64 МБ
+DEFAULT_CHUNK_SIZE = 64 * 1024 * 1024  # 64 MB
 GCM_TAG_SIZE = 16
 NONCE_SIZE = 12
-KEY_SIZE = 32  # 256 біт
+KEY_SIZE = 32  # 256 bits
 
 DOMAIN_SALT = b"GVK_PRIVATE_AI_DOMAIN_SALT_2026"
 ARGON2_TIME_COST = 4
-ARGON2_MEMORY_COST = 262144  # 256 МБ у КіБ (262144 KiB)
+ARGON2_MEMORY_COST = 262144  # 256 MB in KiB (262144 KiB)
 ARGON2_PARALLELISM = 4
 MIN_PASSPHRASE_LEN = 24
 
 
 # =====================================================================
-# ЗАВАНТАЖЕННЯ КРИПТОГРАФІЧНИХ ПРИМІТИВІВ
+# CRYPTOGRAPHIC PRIMITIVE LOADER
 # =====================================================================
 def _get_aesgcm_class():
+    """Import and return the AESGCM cipher class from `cryptography`.
+
+    Returns:
+        The `cryptography.hazmat.primitives.ciphers.aead.AESGCM` class.
+
+    Raises:
+        SystemExit: If the `cryptography` package is not installed.
+    """
     try:
         from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
         return AESGCM
     except ImportError:
         print(
-            "\n[!] Помилка: Бібліотеку 'cryptography' не встановлено.\n"
-            "    Встановіть залежності командою: pip3 install -r requirements.txt\n",
+            "\n[!] Error: The 'cryptography' library is not installed.\n"
+            "    Install dependencies with: pip3 install -r requirements.txt\n",
             file=sys.stderr,
         )
         sys.exit(1)
 
 
 # =====================================================================
-# 1. ДЕРИВАЦІЯ КЛЮЧА (Argon2id -> 32-byte master.key)
+# 1. MASTER KEY DERIVATION (ARGON2ID -> 32-BYTE MASTER.KEY)
 # =====================================================================
 def derive_master_key(
     passphrase: str,
@@ -101,20 +101,38 @@ def derive_master_key(
     parallelism: int = ARGON2_PARALLELISM,
     allow_short: bool = False,
 ) -> bytes:
-    """
-    Обчислює 32-байтний (256-бітний) master.key із секретної фрази через Argon2id.
-    Підтримує як `argon2-cffi`, так і вбудований у `cryptography` Argon2id.
+    """Derive a 32-byte (256-bit) `master.key` from a passphrase using Argon2id.
+
+    Uses `argon2-cffi` when available and falls back to the native OpenSSL
+    Argon2id KDF provided by `cryptography>=42.0`.
+
+    Args:
+        passphrase: Secret passphrase string.
+        salt: Domain separation salt bytes.
+        time_cost: Number of Argon2id iterations.
+        memory_cost: Memory cost in KiB (default 262144 KiB = 256 MB).
+        parallelism: Degree of parallelism (lanes).
+        allow_short: If True, bypass the minimum passphrase length check
+            (intended for testing only).
+
+    Returns:
+        Derived 32-byte master key.
+
+    Raises:
+        ValueError: If `passphrase` is shorter than `MIN_PASSPHRASE_LEN` and
+            `allow_short` is False.
+        SystemExit: If neither `argon2-cffi` nor `cryptography>=42.0` is available.
     """
     if not allow_short and len(passphrase.strip()) < MIN_PASSPHRASE_LEN:
         raise ValueError(
-            f"Секретна фраза занадто коротка ({len(passphrase.strip())} симв.). "
-            f"За специфікацією потрібно щонайменше {MIN_PASSPHRASE_LEN} символи "
-            f"(або передайте --allow-short для тестового режиму)."
+            f"Passphrase is too short ({len(passphrase.strip())} chars). "
+            f"At least {MIN_PASSPHRASE_LEN} characters are required by specification "
+            f"(or pass --allow-short for testing)."
         )
 
     secret_bytes = passphrase.encode("utf-8")
 
-    # Спроба 1: Через argon2-cffi (якщо встановлено)
+    # Attempt 1: Use argon2-cffi if installed
     try:
         from argon2.low_level import Type, hash_secret_raw
 
@@ -130,7 +148,7 @@ def derive_master_key(
     except ImportError:
         pass
 
-    # Спроба 2: Через cryptography (>= 42.0 має нативний OpenSSL Argon2id)
+    # Attempt 2: Use cryptography (>= 42.0 provides native OpenSSL Argon2id)
     try:
         from cryptography.hazmat.primitives.kdf.argon2 import Argon2id
 
@@ -144,53 +162,90 @@ def derive_master_key(
         return kdf.derive(secret_bytes)
     except ImportError:
         print(
-            "\n[!] Помилка: Для Argon2id потрібна бібліотека 'argon2-cffi' або 'cryptography>=42.0'.\n"
-            "    Виконайте: pip3 install -r requirements.txt\n",
+            "\n[!] Error: Argon2id requires 'argon2-cffi' or 'cryptography>=42.0'.\n"
+            "    Run: pip3 install -r requirements.txt\n",
             file=sys.stderr,
         )
         sys.exit(1)
 
 
 # =====================================================================
-# 2. АПАРАТНИЙ ПІДПИС АКТИВАЦІЇ (origin.sig)
+# 2. HARDWARE ACTIVATION SIGNATURE (ORIGIN.SIG)
 # =====================================================================
 def generate_origin_sig(persona_id: str, master_key: bytes) -> bytes:
-    """
-    Генерує 32-байтний підпис фізичної активації учасника:
-    origin.sig = HMAC-SHA256(persona_id, master_key)
+    """Generate the 32-byte physical activation signature (`origin.sig`).
+
+    Computes `HMAC-SHA256(key=master_key, msg=persona_id)`.
+
+    Args:
+        persona_id: Persona identifier string (e.g., `"friend_1"`).
+        master_key: 32-byte master key.
+
+    Returns:
+        32-byte HMAC-SHA256 digest.
+
+    Raises:
+        ValueError: If `master_key` is not 32 bytes long.
     """
     if len(master_key) != KEY_SIZE:
-        raise ValueError(f"Невірний розмір master_key: очікується {KEY_SIZE} байтів.")
+        raise ValueError(f"Invalid master_key size: expected {KEY_SIZE} bytes.")
     return hmac.new(master_key, persona_id.strip().encode("utf-8"), hashlib.sha256).digest()
 
 
 def verify_origin_sig(persona_id: str, master_key: bytes, sig_bytes: bytes) -> bool:
-    """Перевіряє валідність підпису origin.sig у захищеному від таймінг-атак режимі."""
+    """Verify an `origin.sig` signature using constant-time comparison.
+
+    Args:
+        persona_id: Persona identifier string.
+        master_key: 32-byte master key.
+        sig_bytes: Candidate signature bytes to validate.
+
+    Returns:
+        True if the signature matches, False otherwise.
+    """
     expected = generate_origin_sig(persona_id, master_key)
     return hmac.compare_digest(expected, sig_bytes)
 
 
 # =====================================================================
-# 3. ПОТОКОВЕ ШИФРУВАННЯ ТА ДЕШИФРУВАННЯ (AES-256-GCM, чанки 64 МБ)
+# 3. STREAMING ENCRYPTION & DECRYPTION (AES-256-GCM, 64 MB CHUNKS)
 # =====================================================================
 def _derive_chunk_nonce(base_nonce: bytes, chunk_index: int) -> bytes:
-    """
-    Безпечно модифікує 12-байтний Nonce для чанка з номером chunk_index:
-    виконує XOR останніх 8 байтів base_nonce із 64-бітним лічильником чанка (NIST SP 800-38D).
-    Гарантує, що жодні два чанки у файлі ніколи не матимуть однаковий Nonce.
+    """Derive a unique 12-byte GCM nonce for a given chunk index.
+
+    XORs the trailing 8 bytes of `base_nonce` with the 64-bit `chunk_index`
+    counter (per NIST SP 800-38D), guaranteeing no two chunks share a nonce.
+
+    Args:
+        base_nonce: 12-byte random base nonce from the container header.
+        chunk_index: Zero-based sequential chunk index.
+
+    Returns:
+        Unique 12-byte nonce for the specified chunk.
+
+    Raises:
+        ValueError: If `base_nonce` is not 12 bytes long.
     """
     if len(base_nonce) != NONCE_SIZE:
-        raise ValueError("Base nonce повинен мати довжину 12 байтів.")
+        raise ValueError("Base nonce must be exactly 12 bytes long.")
     prefix = base_nonce[:4]
     counter_part = struct.unpack("<Q", base_nonce[4:])[0] ^ chunk_index
     return prefix + struct.pack("<Q", counter_part)
 
 
 def _compute_header_tag(base_nonce: bytes, chunk_size: int, master_key: bytes) -> bytes:
-    """
-    Обчислює 16-байтний тег заголовка (Header Auth Tag).
-    Дозволяє миттєво (за 0.001 с) перевірити правильність ключа master.key
-    ще до читання першого 64-мегабайтного блоку моделі!
+    """Compute the 16-byte header authentication tag.
+
+    Enables instant key verification (~1 ms) before reading the first 64 MB
+    ciphertext block.
+
+    Args:
+        base_nonce: 12-byte container base nonce.
+        chunk_size: Plaintext chunk size in bytes.
+        master_key: 32-byte master key.
+
+    Returns:
+        16-byte truncated HMAC-SHA256 authentication tag.
     """
     msg = MAGIC_BYTES + base_nonce + struct.pack("<I", chunk_size)
     return hmac.new(master_key, msg, hashlib.sha256).digest()[:GCM_TAG_SIZE]
@@ -202,14 +257,29 @@ def encrypt_stream(
     master_key: bytes,
     chunk_size: int = DEFAULT_CHUNK_SIZE,
     total_size: Optional[int] = None,
-    label: str = "Шифрування",
+    label: str = "Encrypting",
 ) -> int:
-    """
-    Потоково шифрує дані з src_stream у dst_stream за стандартом GVK1 (.enc).
-    Споживає в ОЗП лише розмір одного чанка (64 МБ), навіть для файлів 5–50 ГБ.
+    """Stream-encrypt data from `src_stream` into `dst_stream` in `GVK1` format.
+
+    Uses bounded memory (one chunk at a time, 64 MB by default), supporting
+    multi-gigabyte model files without exhausting RAM.
+
+    Args:
+        src_stream: Readable binary stream providing plaintext bytes.
+        dst_stream: Writable binary stream receiving the `GVK1` container.
+        master_key: 32-byte AES-256 master key.
+        chunk_size: Maximum plaintext bytes per chunk (default 64 MB).
+        total_size: Optional total input size in bytes for progress reporting.
+        label: Progress bar prefix label printed to stdout.
+
+    Returns:
+        Total number of plaintext bytes encrypted.
+
+    Raises:
+        ValueError: If `master_key` is not 32 bytes long.
     """
     if len(master_key) != KEY_SIZE:
-        raise ValueError(f"master_key має містити рівно {KEY_SIZE} байти.")
+        raise ValueError(f"master_key must be exactly {KEY_SIZE} bytes.")
 
     AESGCM = _get_aesgcm_class()
     aesgcm = AESGCM(master_key)
@@ -217,8 +287,8 @@ def encrypt_stream(
     base_nonce = os.urandom(NONCE_SIZE)
     header_tag = _compute_header_tag(base_nonce, chunk_size, master_key)
 
-    # Записуємо 36-байтний заголовок:
-    # [Magic (4B) | File Nonce (12B) | Header GCM/Auth Tag (16B) | Chunk Size (4B)]
+    # Write 36-byte container header:
+    # [Magic (4B) | File Nonce (12B) | Header Auth Tag (16B) | Chunk Size (4B)]
     header = MAGIC_BYTES + base_nonce + header_tag + struct.pack("<I", chunk_size)
     assert len(header) == HEADER_SIZE
     dst_stream.write(header)
@@ -234,11 +304,11 @@ def encrypt_stream(
 
         c_len = len(plain_chunk)
         chunk_nonce = _derive_chunk_nonce(base_nonce, chunk_index)
-        # Прив'язуємо індекс і розмір чанка до Associated Data (захист від підміни порядку чанків)
+        # Bind chunk index and plaintext length in AAD to prevent chunk reordering
         aad = MAGIC_BYTES + struct.pack("<QI", chunk_index, c_len)
         encrypted_chunk = aesgcm.encrypt(chunk_nonce, plain_chunk, aad)
 
-        # Записуємо: [довжина відкритого чанка (4B uint32)] + [шифротекст + 16B GCM Tag]
+        # Write frame: [plaintext chunk length (4B uint32)] + [ciphertext + 16B GCM tag]
         dst_stream.write(struct.pack("<I", c_len))
         dst_stream.write(encrypted_chunk)
 
@@ -251,7 +321,7 @@ def encrypt_stream(
             speed_mb = (bytes_processed / (1024 * 1024)) / elapsed
             print(
                 f"\r[*] {label}: {pct:5.1f}% ({bytes_processed // (1024 * 1024)} / "
-                f"{total_size // (1024 * 1024)} МБ) [{speed_mb:.1f} МБ/с]",
+                f"{total_size // (1024 * 1024)} MB) [{speed_mb:.1f} MB/s]",
                 end="",
                 flush=True,
             )
@@ -265,34 +335,49 @@ def decrypt_stream(
     src_stream: BinaryIO,
     dst_stream: BinaryIO,
     master_key: bytes,
-    label: str = "Дешифрування",
+    label: str = "Decrypting",
 ) -> int:
-    """
-    Потоково перевіряє та розшифровує контейнер .enc із src_stream у dst_stream.
-    Якщо ключ невірний або пошкоджено хоча б 1 біт — викидає ValueError.
+    """Stream-verify and decrypt a `GVK1` `.enc` container into `dst_stream`.
+
+    Validates the magic header, header authentication tag, and every chunk's
+    AES-256-GCM tag and AAD. Any single-bit corruption or wrong key raises
+    `ValueError`.
+
+    Args:
+        src_stream: Readable binary stream containing a `GVK1` container.
+        dst_stream: Writable binary stream receiving decrypted plaintext.
+        master_key: 32-byte AES-256 master key.
+        label: Optional operation label (reserved for caller compatibility).
+
+    Returns:
+        Total number of decrypted plaintext bytes written.
+
+    Raises:
+        ValueError: If `master_key` is invalid, the header is malformed or
+            unauthenticated, or any chunk fails GCM integrity verification.
     """
     if len(master_key) != KEY_SIZE:
-        raise ValueError(f"master_key має містити рівно {KEY_SIZE} байти.")
+        raise ValueError(f"master_key must be exactly {KEY_SIZE} bytes.")
 
     AESGCM = _get_aesgcm_class()
     aesgcm = AESGCM(master_key)
 
     header = src_stream.read(HEADER_SIZE)
     if len(header) != HEADER_SIZE:
-        raise ValueError("Пошкоджений файл .enc: заголовок менший за 36 байтів.")
+        raise ValueError("Corrupted .enc file: header is shorter than 36 bytes.")
 
     magic = header[:4]
     if magic != MAGIC_BYTES:
-        raise ValueError(f"Невірна сигнатура файлу: очікується {MAGIC_BYTES!r}, отримано {magic!r}.")
+        raise ValueError(f"Invalid file signature: expected {MAGIC_BYTES!r}, got {magic!r}.")
 
     base_nonce = header[4:16]
     header_tag = header[16:32]
     chunk_size = struct.unpack("<I", header[32:36])[0]
 
-    # Миттєва перевірка ключа за тегом заголовка!
+    # Instant key verification via header authentication tag
     expected_hdr_tag = _compute_header_tag(base_nonce, chunk_size, master_key)
     if not hmac.compare_digest(header_tag, expected_hdr_tag):
-        raise ValueError("Помилка автентифікації ключа: невірний master.key або пошкоджений заголовок!")
+        raise ValueError("Key authentication failed: wrong master.key or corrupted header.")
 
     chunk_index = 0
     bytes_out = 0
@@ -302,16 +387,16 @@ def decrypt_stream(
         if not len_bytes:
             break
         if len(len_bytes) != 4:
-            raise ValueError(f"Несподіваний кінець файлу на чанку #{chunk_index}.")
+            raise ValueError(f"Unexpected end of file at chunk #{chunk_index}.")
 
         c_len = struct.unpack("<I", len_bytes)[0]
         if c_len == 0 or c_len > chunk_size:
-            raise ValueError(f"Некоректний розмір чанка #{chunk_index}: {c_len} байтів.")
+            raise ValueError(f"Invalid chunk length at chunk #{chunk_index}: {c_len} bytes.")
 
         expected_enc_len = c_len + GCM_TAG_SIZE
         encrypted_chunk = src_stream.read(expected_enc_len)
         if len(encrypted_chunk) != expected_enc_len:
-            raise ValueError(f"Обрізаний шифротекст на чанку #{chunk_index}.")
+            raise ValueError(f"Truncated ciphertext at chunk #{chunk_index}.")
 
         chunk_nonce = _derive_chunk_nonce(base_nonce, chunk_index)
         aad = MAGIC_BYTES + struct.pack("<QI", chunk_index, c_len)
@@ -320,7 +405,7 @@ def decrypt_stream(
             plain_chunk = aesgcm.decrypt(chunk_nonce, encrypted_chunk, aad)
         except Exception as exc:
             raise ValueError(
-                f"Порушення цілісності AES-GCM у чанку #{chunk_index}! Дані пошкоджено або підмінено."
+                f"AES-GCM integrity violation at chunk #{chunk_index}: data corrupted or tampered."
             ) from exc
 
         dst_stream.write(plain_chunk)
@@ -336,7 +421,17 @@ def encrypt_file(
     master_key: bytes,
     chunk_size: int = DEFAULT_CHUNK_SIZE,
 ) -> str:
-    """Шифрує файл на диску та повертає його SHA-256 геш."""
+    """Encrypt a file on disk into `GVK1` format and return its SHA-256 digest.
+
+    Args:
+        input_path: Path to the plaintext source file.
+        output_path: Destination path for the encrypted `.enc` container.
+        master_key: 32-byte AES-256 master key.
+        chunk_size: Plaintext chunk size in bytes (default 64 MB).
+
+    Returns:
+        Hexadecimal SHA-256 hash of the written `.enc` file.
+    """
     total_size = os.path.getsize(input_path)
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
     with open(input_path, "rb") as f_in, open(output_path, "wb") as f_out:
@@ -346,23 +441,39 @@ def encrypt_file(
             master_key=master_key,
             chunk_size=chunk_size,
             total_size=total_size,
-            label=f"Шифрування {os.path.basename(input_path)}",
+            label=f"Encrypting {os.path.basename(input_path)}",
         )
     return compute_sha256(output_path)
 
 
 def decrypt_file(input_path: str, output_path: str, master_key: bytes) -> int:
-    """Розшифровує .enc файл у вказаний шлях (для тестів або RAM-диска)."""
+    """Decrypt a `.enc` container file to `output_path` (for tests or RAM disk).
+
+    Args:
+        input_path: Path to the encrypted `.enc` file.
+        output_path: Destination path for the decrypted file.
+        master_key: 32-byte AES-256 master key.
+
+    Returns:
+        Total number of decrypted plaintext bytes written.
+    """
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
     with open(input_path, "rb") as f_in, open(output_path, "wb") as f_out:
         return decrypt_stream(f_in, f_out, master_key=master_key)
 
 
 # =====================================================================
-# 4. ПАКУВАННЯ АРХІВУ ОСОБИСТОСТІ (payload.tar.enc) ТА МАНІФЕСТУ
+# 4. PERSONA PAYLOAD PACKAGING (PAYLOAD.TAR.ENC) & MANIFEST
 # =====================================================================
 def compute_sha256(file_path: str) -> str:
-    """Обчислює SHA-256 геш файлу потоково."""
+    """Compute the SHA-256 hex digest of a file using streaming reads.
+
+    Args:
+        file_path: Path to the file to hash.
+
+    Returns:
+        Lowercase hexadecimal SHA-256 digest string.
+    """
     h = hashlib.sha256()
     with open(file_path, "rb") as f:
         while True:
@@ -379,16 +490,29 @@ def pack_payload_encrypted(
     master_key: bytes,
     roster_path: Optional[str] = None,
 ) -> str:
-    """
-    Збирає вміст папки особистості (persona_config.json, prompt.txt, portraits/,
-    memory.faiss, tools.py) у стиснутий TAR.GZ архів прямо в оперативній пам'яті
-    та одразу шифрує його у файл `payload.tar.enc` (Zero-Plaintext-At-Rest).
-    Якщо всередині `source_dir` немає `roster.json`, автоматично підхоплює спільний
-    `roster_path` або `../roster.json` (наприклад `personas/roster.json`).
-    Повертає SHA-256 геш створеного `payload.tar.enc`.
+    """Pack a persona directory into an encrypted `payload.tar.enc` strictly in RAM.
+
+    Archives persona assets (`persona_config.json`, `prompt.txt`, `portraits/`,
+    `memory.faiss`, `tools.py`, etc.) into a gzip-compressed tar buffer in
+    memory (`io.BytesIO`) and encrypts it directly to disk (Zero-Plaintext-At-Rest).
+    Excludes dotfiles, `__pycache__`, `raw/`, and editor source files (`.psd`,
+    `.xcf`, `.pyc`, `.pyo`). If `roster.json` is absent inside `source_dir`,
+    automatically includes `roster_path` or `../roster.json` when present.
+
+    Args:
+        source_dir: Path to the unencrypted persona payload directory.
+        output_enc_path: Destination path for `payload.tar.enc`.
+        master_key: 32-byte AES-256 master key.
+        roster_path: Optional explicit path to a shared `roster.json`.
+
+    Returns:
+        Hexadecimal SHA-256 digest of the generated `payload.tar.enc`.
+
+    Raises:
+        FileNotFoundError: If `source_dir` does not exist.
     """
     if not os.path.isdir(source_dir):
-        raise FileNotFoundError(f"Папку корисного навантаження не знайдено: {source_dir}")
+        raise FileNotFoundError(f"Payload directory not found: {source_dir}")
 
     def _tar_filter(tarinfo: tarfile.TarInfo) -> Optional[tarfile.TarInfo]:
         parts = [p for p in tarinfo.name.replace("\\", "/").split("/") if p and p != "."]
@@ -429,16 +553,25 @@ def pack_payload_encrypted(
             f_out,
             master_key=master_key,
             total_size=len(tar_bytes),
-            label=f"Пакування {os.path.basename(output_enc_path)}",
+            label=f"Packing {os.path.basename(output_enc_path)}",
         )
 
     return compute_sha256(output_enc_path)
 
 
 def unpack_payload_decrypted(input_enc_path: str, target_ram_dir: str, master_key: bytes) -> None:
-    """
-    Розшифровує `payload.tar.enc` у пам'яті (io.BytesIO) і безпечно розпаковує
-    всі файли персонажа в цільову папку (наприклад, на змонтований RAM-диск).
+    """Decrypt `payload.tar.enc` in memory and safely extract it to `target_ram_dir`.
+
+    Decrypts into an in-memory `io.BytesIO` buffer and validates every tar member
+    path against path traversal before extraction (typically into a RAM disk).
+
+    Args:
+        input_enc_path: Path to the encrypted `payload.tar.enc`.
+        target_ram_dir: Destination directory for extracted persona assets.
+        master_key: 32-byte AES-256 master key.
+
+    Raises:
+        ValueError: If decryption fails or an archive entry escapes `target_ram_dir`.
     """
     tar_buffer = io.BytesIO()
     with open(input_enc_path, "rb") as f_in:
@@ -447,11 +580,11 @@ def unpack_payload_decrypted(input_enc_path: str, target_ram_dir: str, master_ke
     tar_buffer.seek(0)
     os.makedirs(target_ram_dir, exist_ok=True)
     with tarfile.open(fileobj=tar_buffer, mode="r:gz") as tar:
-        # Захист від Path Traversal у назвах файлів архіву
+        # Guard against path traversal in archive member names
         for member in tar.getmembers():
             member_path = os.path.abspath(os.path.join(target_ram_dir, member.name))
             if not member_path.startswith(os.path.abspath(target_ram_dir)):
-                raise ValueError(f"Небезпечний шлях в архіві: {member.name}")
+                raise ValueError(f"Unsafe path in archive: {member.name}")
         if "filter" in tar.extractall.__code__.co_varnames:
             tar.extractall(path=target_ram_dir, filter="data")
         else:
@@ -466,8 +599,18 @@ def write_public_manifest(
     version: str = "1.0.0",
     min_core_version: str = "1.0.0",
 ) -> str:
-    """
-    Створює публічний Zero-Leak файл `manifest.json` із SHA-256 гешами зашифрованих контейнерів.
+    """Write a public zero-leak `manifest.json` with encrypted container hashes.
+
+    Args:
+        output_dir: Directory where `manifest.json` will be written.
+        persona_id: Persona identifier string.
+        adapter_sha256: Hex SHA-256 digest of `adapter.gguf.enc`.
+        payload_sha256: Hex SHA-256 digest of `payload.tar.enc`.
+        version: Persona package semantic version.
+        min_core_version: Minimum required GVK core runtime version.
+
+    Returns:
+        Absolute or joined path to the written `manifest.json`.
     """
     manifest = {
         "persona_id": persona_id,
@@ -490,12 +633,19 @@ def write_public_manifest(
 
 
 # =====================================================================
-# 5. ЗБІРКА СТРУКТУРИ DVD-ДИСКА (GVK_VAULT)
+# 5. DVD & USB DISTRIBUTION BUILDER (GVK_VAULT)
 # =====================================================================
 RUN_SH_TEMPLATE = r"""#!/usr/bin/env bash
 # =====================================================================
-# GVK Private AI — Універсальний Zero-Install лаунчер (macOS / Linux)
-# Працює з локального репо або з DVD GVK_VAULT (навіть без Git та Python).
+# GVK Private AI - Universal Zero-Install Launcher (macOS / Linux)
+#
+# Runs from a local clone or a GVK_VAULT DVD/USB (no Git or Python needed).
+#
+# Usage:
+#   ./run.sh
+#   ./run.sh --fast
+#   ./run.sh status
+#   ./run.sh self-test
 # =====================================================================
 set -e
 
@@ -516,7 +666,7 @@ DISC_ARGS=()
 
 has_real_git() {
     if [ "$(uname -s)" = "Darwin" ]; then
-        # На чистій macOS /usr/bin/git — заглушка, що відкриває вікно Xcode CLT
+        # On a fresh macOS install /usr/bin/git is a stub that prompts for Xcode CLT
         xcode-select -p >/dev/null 2>&1 || return 1
     fi
     command -v git >/dev/null 2>&1
@@ -538,7 +688,7 @@ seed_repo_from_disc_bundle() {
         mkdir -p "${target_dir}"
         cp -R "${SCRIPT_DIR}/core_bundle/." "${target_dir}/"
         chmod -R u+w "${target_dir}" 2>/dev/null || true
-        echo " [OK] Локальне ядро з DVD (core_bundle) розгорнуто у: ${target_dir}"
+        echo " [OK] Seeded local GVK core from media (core_bundle) to: ${target_dir}"
         return 0
     fi
     return 1
@@ -549,43 +699,43 @@ sync_repo_via_tarball() {
     local tmp_dir archive extracted
     if ! command -v curl >/dev/null 2>&1 || ! command -v tar >/dev/null 2>&1; then
         if [ -f "${target_dir}/core/main.py" ]; then
-            echo " [!] curl/tar недоступні — використовуємо локальну копію ядра."
+            echo " [!] curl/tar unavailable - using local cached GVK core."
             return 0
         fi
-        echo " [X] Помилка: не знайдено git або curl+tar для завантаження ядра." >&2
+        echo " [!] Error: neither git nor curl+tar found to download GVK core." >&2
         return 1
     fi
 
     tmp_dir="$(mktemp -d "${GVK_HOME}/repo_dl_XXXXXX")"
     archive="${tmp_dir}/repo.tar.gz"
-    echo " [*] Завантаження ядра GVK Private AI (без git)..."
+    echo " [*] Downloading GVK Private AI core archive (no Git required)..."
     if ! curl -fSL --retry 2 --connect-timeout 15 -o "${archive}" "${REPO_TARBALL_URL}"; then
         rm -rf "${tmp_dir}"
         if [ -f "${target_dir}/core/main.py" ]; then
-            echo " [!] Немає мережі — використовуємо кешовану копію ядра."
+            echo " [!] Offline - using cached GVK core."
             return 0
         fi
-        echo " [X] Не вдалося завантажити ядро з GitHub. Перевірте інтернет на 1-й запуск." >&2
+        echo " [!] Failed to download GVK core from GitHub. Internet is required on first launch." >&2
         return 1
     fi
 
     if ! tar -xzf "${archive}" -C "${tmp_dir}"; then
         rm -rf "${tmp_dir}"
-        echo " [X] Помилка розпакування архіву репозиторію." >&2
+        echo " [!] Error extracting repository archive." >&2
         return 1
     fi
 
     extracted="$(find "${tmp_dir}" -mindepth 1 -maxdepth 1 -type d | head -n 1)"
     if [ -z "${extracted}" ] || [ ! -f "${extracted}/updater.py" ]; then
         rm -rf "${tmp_dir}"
-        echo " [X] Некоректний архів репозиторію (відсутній updater.py)." >&2
+        echo " [!] Invalid repository archive (missing updater.py)." >&2
         return 1
     fi
 
     mkdir -p "${target_dir}"
     cp -R "${extracted}/." "${target_dir}/"
     rm -rf "${tmp_dir}"
-    echo " [✓] Ядро GVK Private AI оновлено у: ${target_dir}"
+    echo " [OK] GVK Private AI core synced to: ${target_dir}"
     return 0
 }
 
@@ -617,11 +767,11 @@ bootstrap_portable_python() {
     fi
 
     if [ -z "${triple}" ]; then
-        echo " [X] Непідтримувана архітектура (${os_name}/${arch_name}) для автозавантаження Python. Встановіть Python 3.12 вручну." >&2
+        echo " [!] Unsupported architecture (${os_name}/${arch_name}) for portable Python download. Please install Python 3.12 manually." >&2
         return 1
     fi
     if ! command -v curl >/dev/null 2>&1 || ! command -v tar >/dev/null 2>&1; then
-        echo " [X] Потрібен curl + tar для автозавантаження портативного Python 3.12." >&2
+        echo " [!] curl and tar are required to download portable Python 3.12." >&2
         return 1
     fi
 
@@ -639,20 +789,20 @@ bootstrap_portable_python() {
     done
 
     if [ -n "${usb_py_cand}" ]; then
-        echo " [*] [USB-РЕЖИМ] Встановлення портативного Python ${PORTABLE_PY_VER} із носія: $(basename "${usb_py_cand}")..." >&2
+        echo " [*] [USB-MODE] Installing portable Python ${PORTABLE_PY_VER} from media: $(basename "${usb_py_cand}")..." >&2
         cp "${usb_py_cand}" "${archive}"
     else
-        echo " [*] Python 3.10+ (з Tk >= 8.6) не знайдено — завантажуємо портативний Python ${PORTABLE_PY_VER} (~35 МБ)..." >&2
+        echo " [*] Python 3.10+ (with Tk >= 8.6) not found - downloading portable Python ${PORTABLE_PY_VER} (~35 MB)..." >&2
         if ! curl -fSL --retry 2 --connect-timeout 15 -o "${archive}" "${py_url}"; then
             rm -rf "${tmp_dir}"
-            echo " [X] Не вдалося завантажити портативний Python. Перевірте інтернет або встановіть Python 3.12 вручну." >&2
+            echo " [!] Failed to download portable Python. Check internet or install Python 3.12 manually." >&2
             return 1
         fi
     fi
 
     if ! tar -xzf "${archive}" -C "${tmp_dir}" || [ ! -x "${tmp_dir}/python/bin/python3" ]; then
         rm -rf "${tmp_dir}"
-        echo " [X] Помилка розпакування портативного Python." >&2
+        echo " [!] Error extracting portable Python archive." >&2
         return 1
     fi
 
@@ -660,7 +810,7 @@ bootstrap_portable_python() {
     mv "${tmp_dir}/python" "${GVK_HOME}/python"
     rm -rf "${tmp_dir}"
     export_portable_tk_env
-    echo " [✓] Портативний Python ${PORTABLE_PY_VER} встановлено у: ${GVK_HOME}/python" >&2
+    echo " [OK] Portable Python ${PORTABLE_PY_VER} installed to: ${GVK_HOME}/python" >&2
     printf '%s\n' "${GVK_HOME}/python/bin/python3"
     return 0
 }
@@ -728,7 +878,7 @@ resolve_venv_python() {
 if [ -f "${SCRIPT_DIR}/core/main.py" ] && [ -f "${SCRIPT_DIR}/updater.py" ]; then
     REPO_DIR="${SCRIPT_DIR}"
     echo "===================================================================="
-    echo " [*] GVK Private AI — Локальний запуск: ${REPO_DIR}"
+    echo " [*] GVK Private AI - Local Launch: ${REPO_DIR}"
     echo "===================================================================="
     if [ -f "${SCRIPT_DIR}/persona/manifest.json" ]; then
         DISC_ARGS=(--disc-path "${SCRIPT_DIR}")
@@ -736,8 +886,8 @@ if [ -f "${SCRIPT_DIR}/core/main.py" ] && [ -f "${SCRIPT_DIR}/updater.py" ]; the
     if [ "${CMD_NAME}" != "self-test" ] && [ "${CMD_NAME}" != "--self-test" ] && [ "${CMD_NAME}" != "status" ]; then
         if [ -d "${REPO_DIR}/.git" ] && has_real_git; then
             if [ -z "$(git -C "${REPO_DIR}" status --porcelain 2>/dev/null || true)" ]; then
-                echo " [*] Перевірка оновлень коду..."
-                git -C "${REPO_DIR}" pull --ff-only || echo " [!] Не вдалося виконати git pull (офлайн), продовжуємо..."
+                echo " [*] Checking repository updates via git pull..."
+                git -C "${REPO_DIR}" pull --ff-only || echo " [!] git pull skipped (offline), continuing..."
             fi
         fi
     fi
@@ -749,7 +899,7 @@ else
         MEDIA_MODE="USB"
     fi
     echo "===================================================================="
-    echo " [*] GVK_VAULT Виявлено: ${SCRIPT_DIR} [Режим: ${MEDIA_MODE}]"
+    echo " [*] GVK_VAULT Media Detected: ${SCRIPT_DIR} [Mode: ${MEDIA_MODE}]"
     echo "===================================================================="
     mkdir -p "${GVK_HOME}"
     if [ ! -f "${REPO_DIR}/core/main.py" ]; then
@@ -759,16 +909,16 @@ else
         seed_repo_from_disc_bundle "${REPO_DIR}" || true
     elif has_real_git && { [ -d "${REPO_DIR}/.git" ] || [ ! -f "${REPO_DIR}/core/main.py" ]; }; then
         if [ ! -d "${REPO_DIR}/.git" ]; then
-            echo " [*] Перший запуск: клонування ядра GVK Private AI..."
+            echo " [*] First launch: cloning GVK Private AI core..."
             git clone "${REPO_URL}" "${REPO_DIR}" || sync_repo_via_tarball "${REPO_DIR}"
         else
-            echo " [*] Перевірка оновлень ядра та personas_encrypted/..."
-            git -C "${REPO_DIR}" pull --ff-only || echo " [!] Не вдалося виконати git pull (офлайн або локальні зміни), продовжуємо..."
+            echo " [*] Checking repository updates and personas_encrypted/..."
+            git -C "${REPO_DIR}" pull --ff-only || echo " [!] git pull skipped (offline or local changes), continuing..."
         fi
     else
         sync_repo_via_tarball "${REPO_DIR}"
     fi
-    # Якщо на носії core_bundle свіжіший за завантажене з GitHub репо — поверх накладаємо файли з носія
+    # Overlay core_bundle from media when newer than the GitHub copy
     if [ -f "${SCRIPT_DIR}/core_bundle/core/main.py" ] && { [ ! -f "${REPO_DIR}/core/main.py" ] || [ "${SCRIPT_DIR}/core_bundle/core/main.py" -nt "${REPO_DIR}/core/main.py" ]; }; then
         seed_repo_from_disc_bundle "${REPO_DIR}" || true
     fi
@@ -777,14 +927,14 @@ fi
 if [ "${CMD_NAME}" = "status" ]; then
     shift
     STAT_PY="$(resolve_any_python)" || {
-        echo " [!] Python ще не встановлено (буде завантажено автоматично при першому запуску ./run.sh)." >&2
+        echo " [!] Python is not installed yet (will be downloaded automatically on first ./run.sh launch)." >&2
         exit 1
     }
     exec "${STAT_PY}" "${REPO_DIR}/updater.py" status --repo-root "${REPO_DIR}" "$@"
 fi
 
 SYS_PY="$(resolve_system_python)" || {
-    echo " [X] Помилка: не вдалося знайти або завантажити Python 3.10+ (Tk >= 8.6)." >&2
+    echo " [!] Error: failed to locate or download Python 3.10+ (Tk >= 8.6)." >&2
     exit 1
 }
 export_portable_tk_env
@@ -810,7 +960,7 @@ if [ -f "${REPO_DIR}/core/main.py" ]; then
         exec "${VENV_PY}" "${REPO_DIR}/core/main.py" "$@"
     fi
 else
-    echo " [!] Модуль core/main.py ще не створено. Статус кешу:"
+    echo " [!] Module core/main.py not found yet. Cache status:"
     exec "${SYS_PY}" "${REPO_DIR}/updater.py" status --repo-root "${REPO_DIR}"
 fi
 """
@@ -822,8 +972,15 @@ exec bash ./run.sh "$@"
 
 RUN_BAT_TEMPLATE = r"""@echo off
 REM =====================================================================
-REM GVK Private AI — Універсальний Zero-Install лаунчер (Windows)
-REM Працює з локального репо або з DVD GVK_VAULT (навіть без Git та Python).
+REM GVK Private AI - Universal Zero-Install Launcher (Windows)
+REM
+REM Runs from a local clone or a GVK_VAULT DVD/USB (no Git or Python needed).
+REM
+REM Usage:
+REM   run.bat
+REM   run.bat --fast
+REM   run.bat status
+REM   run.bat self-test
 REM =====================================================================
 chcp 65001 >nul 2>&1
 setlocal EnableExtensions
@@ -848,7 +1005,7 @@ if not exist "%SCRIPT_DIR%\updater.py" goto :dvd_mode
 
 set "REPO_DIR=%SCRIPT_DIR%"
 echo ====================================================================
-echo  [*] GVK Private AI — Local Launch: %REPO_DIR%
+echo  [*] GVK Private AI - Local Launch: %REPO_DIR%
 echo ====================================================================
 if exist "%SCRIPT_DIR%\persona\manifest.json" set "DISC_PATH=%SCRIPT_DIR%"
 if /I "%CMD_NAME%"=="self-test" goto :resolve_py
@@ -937,19 +1094,19 @@ goto :resolve_py
 if exist "%REPO_TMP%" rmdir /S /Q "%REPO_TMP%" >nul 2>&1
 if exist "%REPO_ARCHIVE%" del /F /Q "%REPO_ARCHIVE%" >nul 2>&1
 if exist "%REPO_DIR%\core\main.py" (
-    echo  [!] Offline — using cached GVK core: %REPO_DIR%
+    echo  [!] Offline - using cached GVK core: %REPO_DIR%
     goto :resolve_py
 )
-echo  [X] Error: failed to download GVK core from GitHub. Internet is required on first launch.
+echo  [!] Error: failed to download GVK core from GitHub. Internet is required on first launch.
 call :fail 1
 exit /b 1
 
 :repo_no_tools
 if exist "%REPO_DIR%\core\main.py" (
-    echo  [!] Offline / no git or curl — using cached GVK core.
+    echo  [!] Offline / no git or curl - using cached GVK core.
     goto :resolve_py
 )
-echo  [X] Error: neither git nor curl.exe/tar.exe found. Install Git for Windows and retry.
+echo  [!] Error: neither git nor curl.exe/tar.exe found. Install Git for Windows and retry.
 call :fail 1
 exit /b 1
 
@@ -1014,7 +1171,7 @@ if defined USB_PY_ARCHIVE (
 where curl.exe >nul 2>&1
 if errorlevel 1 goto :py_missing
 
-echo  [*] Python 3.10+ ^(with Tkinter^) not found — downloading portable Python 3.12 ^(~35 MB^)...
+echo  [*] Python 3.10+ ^(with Tkinter^) not found - downloading portable Python 3.12 ^(~35 MB^)...
 curl.exe -fSL --retry 2 --connect-timeout 15 -o "%PY_ARCHIVE%" "%PORTABLE_PY_URL%"
 if errorlevel 1 goto :py_dl_failed
 
@@ -1043,7 +1200,7 @@ if exist "%PY_TMP%" rmdir /S /Q "%PY_TMP%" >nul 2>&1
 if exist "%PY_ARCHIVE%" del /F /Q "%PY_ARCHIVE%" >nul 2>&1
 
 :py_missing
-echo  [X] Error: Python 3.10+ not found and portable download failed. Check internet or install Python 3.12 from python.org.
+echo  [!] Error: Python 3.10+ not found and portable download failed. Check internet or install Python 3.12 from python.org.
 call :fail 1
 exit /b 1
 
@@ -1115,6 +1272,7 @@ if not defined GVK_NO_PAUSE pause
 exit /b %~1
 """
 
+
 def build_disc_tree(
     output_disc_dir: str,
     master_key: bytes,
@@ -1122,11 +1280,26 @@ def build_disc_tree(
     persona_build_dir: str,
     base_model_enc_path: Optional[str] = None,
 ) -> None:
-    """
-    Формує повну структуру оптичного DVD-диска [DVD Disc: GVK_VAULT],
-    готову до запису на DVD-R 4.7 ГБ (~150–160 МБ).
-    За замовчуванням базова модель на диск не копіюється (вона докачується з хмари),
-    але якщо передано `base_model_enc_path`, підтримується опційне додавання `base/`.
+    """Assemble a complete `GVK_VAULT` optical DVD directory tree (~150-160 MB).
+
+    Writes `vault/master.key`, `persona/origin.sig`, encrypted persona assets,
+    an offline `core_bundle/` copy of the Python runtime, and cross-platform
+    launchers (`run.sh`, `run.command`, `run.bat`). By default the public base
+    model is omitted so it downloads from the cloud on first launch, unless
+    `base_model_enc_path` is explicitly provided.
+
+    Args:
+        output_disc_dir: Destination directory for the DVD image tree.
+        master_key: 32-byte AES-256 master key.
+        persona_id: Persona identifier bound to this disc.
+        persona_build_dir: Directory containing `manifest.json`,
+            `adapter.gguf.enc`, and `payload.tar.enc`.
+        base_model_enc_path: Optional path to an encrypted `base_model.gguf.enc`
+            to include under `base/`.
+
+    Raises:
+        FileNotFoundError: If any required persona artifact or specified base
+            model file is missing.
     """
     vault_dir = os.path.join(output_disc_dir, "vault")
     persona_dir = os.path.join(output_disc_dir, "persona")
@@ -1134,33 +1307,33 @@ def build_disc_tree(
     os.makedirs(vault_dir, exist_ok=True)
     os.makedirs(persona_dir, exist_ok=True)
 
-    # 1. Запис 32-байтного ключа master.key
+    # 1. Write 32-byte master.key
     key_path = os.path.join(vault_dir, "master.key")
     with open(key_path, "wb") as f:
         f.write(master_key)
 
-    # 2. Запис origin.sig
+    # 2. Write origin.sig
     sig_bytes = generate_origin_sig(persona_id, master_key)
     with open(os.path.join(persona_dir, "origin.sig"), "wb") as f:
         f.write(sig_bytes)
 
-    # 3. Копіювання manifest.json, adapter.gguf.enc, payload.tar.enc
+    # 3. Copy manifest.json, adapter.gguf.enc, payload.tar.enc
     for fname in ("manifest.json", "adapter.gguf.enc", "payload.tar.enc"):
         src = os.path.join(persona_build_dir, fname)
         if not os.path.isfile(src):
-            raise FileNotFoundError(f"Відсутній обов'язковий файл персонажа: {src}")
+            raise FileNotFoundError(f"Missing required persona file: {src}")
         shutil.copy2(src, os.path.join(persona_dir, fname))
 
-    # 4. Опційне копіювання base_model.gguf.enc (лише якщо явно передано --base-enc)
+    # 4. Optionally copy base_model.gguf.enc (only when --base-enc is passed)
     if base_model_enc_path:
         if not os.path.isfile(base_model_enc_path):
-            raise FileNotFoundError(f"Зашифровану базову модель не знайдено: {base_model_enc_path}")
+            raise FileNotFoundError(f"Encrypted base model not found: {base_model_enc_path}")
         base_dir = os.path.join(output_disc_dir, "base")
         os.makedirs(base_dir, exist_ok=True)
         shutil.copy2(base_model_enc_path, os.path.join(base_dir, "base_model.gguf.enc"))
 
-    # 4b. Вбудовування автономної копії ядра (core_bundle/, ~350 КБ) на DVD,
-    # щоб запуск із диска працював навіть без доступу до GitHub або до git push
+    # 4b. Embed an offline copy of the core runtime (core_bundle/, ~350 KB) on the DVD
+    # so disc launches work even without GitHub access or before pushing changes
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     bundle_dir = os.path.join(output_disc_dir, "core_bundle")
     os.makedirs(os.path.join(bundle_dir, "core"), exist_ok=True)
@@ -1178,7 +1351,7 @@ def build_disc_tree(
     if os.path.isfile(packer_src):
         shutil.copy2(packer_src, os.path.join(bundle_dir, "tools", "disc_packer.py"))
 
-    # 5. Створення стартових скриптів run.sh та run.bat
+    # 5. Write launcher scripts run.sh, run.command, and run.bat
     run_sh_path = os.path.join(output_disc_dir, "run.sh")
     with open(run_sh_path, "w", encoding="utf-8", newline="\n") as f:
         f.write(RUN_SH_TEMPLATE)
@@ -1193,18 +1366,23 @@ def build_disc_tree(
     with open(run_bat_path, "w", encoding="utf-8", newline="\r\n") as f:
         f.write(RUN_BAT_TEMPLATE)
 
-    print(f"[✓] Образ DVD-диска GVK_VAULT для '{persona_id}' успішно зібрано у: {output_disc_dir}")
+    print(f"[OK] Built GVK_VAULT DVD image for '{persona_id}' at: {output_disc_dir}")
 
 
 def fetch_usb_llama_bins(output_bins_dir: str, include_cuda_zip: bool = False) -> List[str]:
-    """
-    Автоматично завантажує кросплатформний набір релізних архівів `llama.cpp`
-    для офлайн USB-дистрибутиву:
-      - Windows Vulkan x64 (працює на AMD Radeon, Intel Arc/iGPU та NVIDIA)
-      - Windows CPU x64 (універсальний фолбек)
-      - macOS Apple Silicon ARM64 (Metal)
-      - macOS Intel x64
-      - Опційно (--include-cuda-zip): Windows CUDA 12.4 x64 + cudart DLLs
+    """Download cross-platform `llama.cpp` release archives for offline USB media.
+
+    Fetches Windows Vulkan x64 (AMD/Intel/NVIDIA), Windows CPU x64 fallback,
+    macOS Apple Silicon ARM64 (Metal), and macOS Intel x64 archives. Optionally
+    includes official Windows CUDA 12.4 x64 and `cudart` archives.
+
+    Args:
+        output_bins_dir: Directory where downloaded archives will be stored.
+        include_cuda_zip: If True, also download Windows CUDA 12.4 and `cudart`
+            release archives.
+
+    Returns:
+        List of local file paths for all downloaded or already-present archives.
     """
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     if repo_root not in sys.path:
@@ -1215,7 +1393,7 @@ def fetch_usb_llama_bins(output_bins_dir: str, include_cuda_zip: bool = False) -
     release = _fetch_latest_llama_release_with_assets()
     tag = release.get("tag_name", "latest")
     assets = release.get("assets") or []
-    print(f" [*] Отримано реліз llama.cpp: {tag} ({len(assets)} файлів)")
+    print(f" [*] Fetched llama.cpp release: {tag} ({len(assets)} assets)")
 
     wanted_predicates = [
         ("win-vulkan-x64", lambda n: n.startswith("llama-") and "win-vulkan-x64.zip" in n),
@@ -1235,14 +1413,14 @@ def fetch_usb_llama_bins(output_bins_dir: str, include_cuda_zip: bool = False) -
     for label, pred in wanted_predicates:
         matched = next((a for a in assets if pred(str(a.get("name", "")).lower())), None)
         if not matched:
-            print(f" [!] Не знайдено асет для '{label}' у релізі {tag}")
+            print(f" [!] Asset not found for '{label}' in release {tag}")
             continue
         fname = matched["name"]
         url = matched["browser_download_url"]
         dst = os.path.join(output_bins_dir, fname)
         expected_size = int(matched.get("size") or 0)
         if os.path.isfile(dst) and (expected_size <= 0 or os.path.getsize(dst) == expected_size):
-            print(f" [OK] Уже завантажено: {fname} ({os.path.getsize(dst) // (1024 * 1024)} МБ)")
+            print(f" [OK] Already downloaded: {fname} ({os.path.getsize(dst) // (1024 * 1024)} MB)")
             downloaded_paths.append(dst)
             continue
         _download_with_resume(url, dst, label=fname)
@@ -1262,16 +1440,26 @@ def build_usb_tree(
     fetch_bins: bool = False,
     include_cuda_zip: bool = False,
 ) -> None:
-    """
-    Формує повний офлайн USB-дистрибутив `GVK_VAULT [Mode: USB]` (під флешку 16–64 ГБ):
-      1. Базова структура `vault/`, `persona/`, `core_bundle/`, `run.bat`, `run.sh`, `run.command`.
-      2. Маркер `vault/media_mode.json` (`{"mode": "USB"}`).
-      3. Публічна базова модель `base/Qwen2.5-14B-Instruct-Q4_K_M.gguf` (~9.0 ГБ), яка при першому
-         запуску автоматично копіюється у `~/.gvk_ai/base/` без звернення до Hugging Face.
-      4. Кросплатформні бінарники `bin/`:
-         - Архівні релізи для Windows (Vulkan AMD/Intel/NVIDIA + CPU x64) та macOS (ARM64 + Intel x64).
-         - Готовий CUDA 12 / Pascal рантайм `bin/win-cuda-pascal/` із `cublas64_12.dll`, `cudart64_12.dll`, `ggml-cuda.dll`.
-      5. Опційно: офлайн RAG-модель `embeddings/paraphrase-multilingual-MiniLM-L12-v2/`.
+    """Assemble a full offline `GVK_VAULT [Mode: USB]` distribution (16-64 GB).
+
+    Builds the base `GVK_VAULT` layout (`vault/`, `persona/`, `core_bundle/`,
+    launchers), writes `vault/media_mode.json`, and bundles the public 14B base
+    model (`base/Qwen2.5-14B-Instruct-Q4_K_M.gguf`), cross-platform `llama.cpp`
+    binary archives under `bin/`, optional Windows CUDA 12 / Pascal runtime DLLs
+    (`bin/win-cuda-pascal/`), and optional offline RAG embeddings.
+
+    Args:
+        output_usb_dir: Destination directory or mounted USB drive root.
+        master_key: 32-byte AES-256 master key.
+        persona_id: Persona identifier bound to this USB drive.
+        persona_build_dir: Directory containing built encrypted persona artifacts.
+        base_model_path: Optional path to the public base GGUF model.
+        llama_bins_dir: Optional directory containing `llama.cpp` archives.
+        pascal_runtime_dir: Optional directory containing Windows CUDA 12 DLLs
+            and `llama-server.exe`.
+        embeddings_dir: Optional path to offline RAG embedding model directory.
+        fetch_bins: If True, download missing `llama.cpp` release archives first.
+        include_cuda_zip: If True with `fetch_bins`, also fetch CUDA 12.4 zips.
     """
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     if repo_root not in sys.path:
@@ -1285,7 +1473,7 @@ def build_usb_tree(
         persona_build_dir=persona_build_dir,
     )
 
-    # 1. Записуємо явний маркер USB-режиму
+    # 1. Write explicit USB mode marker
     mode_meta = {
         "mode": "USB",
         "persona_id": persona_id,
@@ -1295,7 +1483,7 @@ def build_usb_tree(
         json.dump(mode_meta, f, indent=2, ensure_ascii=False)
         f.write("\n")
 
-    # 2. Базова модель 14B -> <USB>/base/Qwen2.5-14B-Instruct-Q4_K_M.gguf
+    # 2. Copy 14B base model -> <USB>/base/Qwen2.5-14B-Instruct-Q4_K_M.gguf
     resolved_base = base_model_path
     if not resolved_base:
         default_repo_base = os.path.join(repo_root, "base", DEFAULT_BASE_MODEL_FILENAME)
@@ -1310,17 +1498,17 @@ def build_usb_tree(
             os.path.isfile(dst_gguf)
             and os.path.getsize(dst_gguf) == os.path.getsize(resolved_base)
         ):
-            print(f" [OK] Базова модель вже присутня на USB: {dst_gguf}")
+            print(f" [OK] Base model already present on USB: {dst_gguf}")
         else:
             _copy_file_with_progress(
                 resolved_base,
                 dst_gguf,
-                label=f"Запис {os.path.basename(resolved_base)} у USB-образ",
+                label=f"Copying {os.path.basename(resolved_base)} to USB image",
             )
     else:
-        print(" [!] УВАГА: Базову модель не знайдено для копіювання в USB-образ (передайте --base-model).")
+        print(" [!] Warning: Base model not found for USB image (pass --base-model).")
 
-    # 3. Бінарники llama-server (Windows Vulkan/CPU + macOS ARM64/x64 + CUDA DLLs)
+    # 3. Copy llama-server binaries (Windows Vulkan/CPU + macOS ARM64/x64 + CUDA DLLs)
     usb_bin_dir = os.path.join(output_usb_dir, "bin")
     os.makedirs(usb_bin_dir, exist_ok=True)
 
@@ -1335,9 +1523,9 @@ def build_usb_tree(
                 dst_f = os.path.join(usb_bin_dir, fname)
                 if not (os.path.isfile(dst_f) and os.path.getsize(dst_f) == os.path.getsize(src_f)):
                     shutil.copy2(src_f, dst_f)
-                print(f" [✓] Додано архів llama-server у USB bin/: {fname}")
+                print(f" [OK] Added llama-server archive to USB bin/: {fname}")
 
-    # 3b. Копіювання готового CUDA 12 / Pascal рантайму (з cublas64_12.dll, cudart64_12.dll, ggml-cuda.dll)
+    # 3b. Copy pre-packaged CUDA 12 / Pascal runtime (cublas64_12.dll, cudart64_12.dll, ggml-cuda.dll)
     resolved_pascal = pascal_runtime_dir
     if not resolved_pascal:
         default_pascal = os.path.join(repo_root, "base", "llama-pascal-runtime")
@@ -1356,9 +1544,9 @@ def build_usb_tree(
             if fl == "llama-server.exe" or fl.endswith(".dll") or fl.startswith("license"):
                 shutil.copy2(src_f, os.path.join(usb_cuda_dir, fname))
                 copied_cuda += 1
-        print(f" [✓] Додано Windows NVIDIA CUDA 12 рантайм у USB bin/win-cuda-pascal/ ({copied_cuda} файлів)")
+        print(f" [OK] Added Windows NVIDIA CUDA 12 runtime to USB bin/win-cuda-pascal/ ({copied_cuda} files)")
 
-    # 4. Опційна офлайн RAG-модель embeddings/paraphrase-multilingual-MiniLM-L12-v2
+    # 4. Optionally copy offline RAG embedding model (embeddings/paraphrase-multilingual-MiniLM-L12-v2)
     resolved_emb = embeddings_dir
     if not resolved_emb:
         for cand_emb in (
@@ -1372,27 +1560,38 @@ def build_usb_tree(
     if resolved_emb and os.path.isdir(resolved_emb):
         usb_emb_dst = os.path.join(output_usb_dir, "embeddings", DEFAULT_EMBEDDING_SHORT_NAME)
         shutil.copytree(resolved_emb, usb_emb_dst, dirs_exist_ok=True)
-        print(f" [✓] Додано офлайн RAG-модель у USB embeddings/: {usb_emb_dst}")
+        print(f" [OK] Added offline RAG model to USB embeddings/: {usb_emb_dst}")
 
-    print(f"[✓] Повний USB-дистрибутив GVK_VAULT [Mode: USB] зібрано у: {output_usb_dir}")
+    print(f"[OK] Built full USB distribution GVK_VAULT [Mode: USB] at: {output_usb_dir}")
 
 
 # =====================================================================
-# 5b. ГЕНЕРАЦІЯ ISO-9660 / JOLIET ОБРАЗУ (.ISO)
+# 5B. ISO-9660 / JOLIET IMAGE GENERATOR (.ISO)
 # =====================================================================
 ISO_SECTOR_SIZE = 2048
 
 
 def _both16(val: int) -> bytes:
+    """Encode a 16-bit integer in ISO-9660 both-byte-order (LSB + MSB) format."""
     return struct.pack("<H", val & 0xFFFF) + struct.pack(">H", val & 0xFFFF)
 
 
 def _both32(val: int) -> bytes:
+    """Encode a 32-bit integer in ISO-9660 both-byte-order (LSB + MSB) format."""
     return struct.pack("<I", val & 0xFFFFFFFF) + struct.pack(">I", val & 0xFFFFFFFF)
 
 
 def _sanitize_iso_name(name: str, is_dir: bool, used: set) -> bytes:
-    """Формує валідне ECMA-119 ім'я файлу/каталогу без колізій."""
+    """Generate a collision-free ECMA-119 compliant ASCII filename or directory name.
+
+    Args:
+        name: Original entry filename.
+        is_dir: Whether the entry is a directory.
+        used: Set of already-allocated sanitized names within the parent directory.
+
+    Returns:
+        Encoded ASCII identifier bytes (with `;1` version suffix for files).
+    """
     if is_dir:
         base = "".join(ch if (ch.isascii() and (ch.isalnum() or ch == "_")) else "_" for ch in name.upper())
         stem = (base or "DIR")[:28]
@@ -1426,7 +1625,7 @@ def _sanitize_iso_name(name: str, is_dir: bool, used: set) -> bytes:
 
 
 def _encode_joliet_name(name: str, is_dir: bool) -> bytes:
-    """Кодує ім'я в UCS-2 / UTF-16BE для Joliet SVD (макс. 64 символи)."""
+    """Encode an entry name in UCS-2 / UTF-16BE for Joliet SVD (max 64 chars)."""
     trimmed = name[:64]
     return trimmed.encode("utf-16-be")
 
@@ -1438,6 +1637,7 @@ def _iso_dir_record(
     is_dir: bool,
     rec_date_7: bytes,
 ) -> bytes:
+    """Serialize a single ISO-9660 directory record entry."""
     pad = b"\x00" if (len(file_id) % 2 == 0) else b""
     rec_len = 33 + len(file_id) + len(pad)
     flags = 0x02 if is_dir else 0x00
@@ -1455,6 +1655,7 @@ def _iso_dir_record(
 
 
 def _pack_dir_records_into_sectors(records: List[bytes]) -> bytes:
+    """Pack directory records into 2048-byte sectors without crossing boundaries."""
     out = bytearray()
     for rec in records:
         pos = len(out) % ISO_SECTOR_SIZE
@@ -1475,6 +1676,7 @@ def _build_path_tables(
     lba_key: str,
     name_key: str,
 ) -> Tuple[bytes, bytes]:
+    """Build Type-L (little-endian) and Type-M (big-endian) ISO-9660 path tables."""
     tbl_l = bytearray()
     tbl_m = bytearray()
     for idx, d in enumerate(dirs_info):
@@ -1490,6 +1692,7 @@ def _build_path_tables(
 
 
 def _pad_to_sector(data: bytes) -> bytes:
+    """Zero-pad a byte buffer to a non-empty multiple of `ISO_SECTOR_SIZE`."""
     rem = len(data) % ISO_SECTOR_SIZE
     if rem == 0:
         return data if data else (b"\x00" * ISO_SECTOR_SIZE)
@@ -1507,6 +1710,7 @@ def _build_volume_descriptor(
     dec_time_17: bytes,
     is_joliet: bool = False,
 ) -> bytes:
+    """Build a 2048-byte Primary or Joliet Supplementary Volume Descriptor."""
     vd = bytearray(ISO_SECTOR_SIZE)
     vd[0] = vd_type
     vd[1:6] = b"CD001"
@@ -1537,7 +1741,16 @@ def _build_volume_descriptor(
 
 
 def _write_iso9660_image(disc_dir: str, output_iso_path: str, volume_name: str = "GVK_VAULT") -> str:
-    """Кросплатформний pure-Python збирач ISO-9660 + Joliet образу (.iso)."""
+    """Build an ISO-9660 + Joliet (`.iso`) image using pure Python.
+
+    Args:
+        disc_dir: Root directory of the disc tree to package.
+        output_iso_path: Destination `.iso` file path.
+        volume_name: ISO volume label (default `"GVK_VAULT"`).
+
+    Returns:
+        Absolute path to the generated `.iso` image.
+    """
     now = datetime.datetime.now(datetime.timezone.utc)
     dec_time_17 = now.strftime("%Y%m%d%H%M%S00").encode("ascii") + b"\x00"
     rec_date_7 = bytes(
@@ -1592,7 +1805,7 @@ def _write_iso9660_image(disc_dir: str, output_iso_path: str, volume_name: str =
                 )
         idx += 1
 
-    # Перший прохід: рахуємо точні розміри кожного каталогу у секторах (LBA у записах не впливає на розмір)
+    # Pass 1: compute exact sector sizes for each directory (LBA values do not affect record lengths)
     for d in dirs_info:
         dummy_iso = [_iso_dir_record(b"\x00", 0, 0, True, rec_date_7), _iso_dir_record(b"\x01", 0, 0, True, rec_date_7)]
         dummy_jol = [_iso_dir_record(b"\x00", 0, 0, True, rec_date_7), _iso_dir_record(b"\x01", 0, 0, True, rec_date_7)]
@@ -1613,7 +1826,7 @@ def _write_iso9660_image(disc_dir: str, output_iso_path: str, volume_name: str =
     iso_pt_sectors = len(_pad_to_sector(pt_l_dummy)) // ISO_SECTOR_SIZE
     jol_pt_sectors = len(_pad_to_sector(jpt_l_dummy)) // ISO_SECTOR_SIZE
 
-    cursor = 19  # 0..15 System, 16 PVD, 17 SVD, 18 Terminator
+    cursor = 19  # 0..15 System Area, 16 PVD, 17 SVD, 18 Volume Descriptor Set Terminator
     iso_pt_l_lba = cursor
     cursor += iso_pt_sectors
     iso_pt_m_lba = cursor
@@ -1640,7 +1853,7 @@ def _write_iso9660_image(disc_dir: str, output_iso_path: str, volume_name: str =
 
     total_sectors = cursor
 
-    # Другий прохід: формуємо фінальні таблиці шляхів та сектори каталогів із реальними LBA
+    # Pass 2: serialize final path tables and directory sectors with resolved LBAs
     iso_pt_l_raw, iso_pt_m_raw = _build_path_tables(dirs_info, "iso_lba", "iso_name")
     jol_pt_l_raw, jol_pt_m_raw = _build_path_tables(dirs_info, "jol_lba", "jol_name")
 
@@ -1713,10 +1926,25 @@ def _write_iso9660_image(disc_dir: str, output_iso_path: str, volume_name: str =
 
 
 def build_disc_iso(disc_dir: str, output_iso_path: str, volume_name: str = "GVK_VAULT") -> str:
-    """Створює готовий ISO-образ DVD-диска з каталогу `disc_dir`."""
+    """Create a burnable DVD ISO image from `disc_dir`.
+
+    Uses `hdiutil` on macOS or `xorrisofs`/`genisoimage`/`mkisofs` when
+    available, falling back to the built-in pure-Python ISO-9660/Joliet writer.
+
+    Args:
+        disc_dir: Directory containing the assembled `GVK_VAULT` disc tree.
+        output_iso_path: Destination path for the `.iso` file.
+        volume_name: DVD volume label (default `"GVK_VAULT"`).
+
+    Returns:
+        Absolute path to the created `.iso` file.
+
+    Raises:
+        FileNotFoundError: If `disc_dir` does not exist.
+    """
     disc_abs = os.path.abspath(disc_dir)
     if not os.path.isdir(disc_abs):
-        raise FileNotFoundError(f"Папку диска не знайдено: {disc_dir}")
+        raise FileNotFoundError(f"Disc directory not found: {disc_dir}")
 
     out_abs = os.path.abspath(output_iso_path)
     os.makedirs(os.path.dirname(out_abs), exist_ok=True)
@@ -1740,7 +1968,7 @@ def build_disc_iso(disc_dir: str, output_iso_path: str, volume_name: str = "GVK_
                 stderr=subprocess.PIPE,
             )
             if os.path.isfile(out_abs):
-                print(f"[✓] ISO-образ (hdiutil) створено: {out_abs}")
+                print(f"[OK] ISO image (hdiutil) created: {out_abs}")
                 return out_abs
         except Exception:
             pass
@@ -1755,33 +1983,40 @@ def build_disc_iso(disc_dir: str, output_iso_path: str, volume_name: str = "GVK_
                     stderr=subprocess.PIPE,
                 )
                 if os.path.isfile(out_abs):
-                    print(f"[✓] ISO-образ ({tool}) створено: {out_abs}")
+                    print(f"[OK] ISO image ({tool}) created: {out_abs}")
                     return out_abs
             except Exception:
                 pass
 
     _write_iso9660_image(disc_abs, out_abs, volume_name=volume_name)
-    print(f"[✓] ISO-образ (ISO-9660/Joliet) створено: {out_abs}")
+    print(f"[OK] ISO image (ISO-9660/Joliet) created: {out_abs}")
     return out_abs
 
 
 # =====================================================================
-# 6. АВТОМАТИЧНИЙ SELF-TEST (ПЕРЕВІРКА MILESTONE 1)
+# 6. AUTOMATED SELF-TEST
 # =====================================================================
 def run_self_test() -> None:
+    """Run an end-to-end in-memory verification of all cryptographic and disc tools.
+
+    Validates Argon2id key derivation, `origin.sig` HMAC signing/verification,
+    multi-chunk AES-256-GCM streaming + bit-flip tamper detection, in-memory
+    `payload.tar.enc` packaging/unpacking, `GVK_VAULT` DVD tree assembly, and
+    ISO-9660/Joliet `.iso` image generation.
+    """
     print("====================================================================")
-    print(" [*] GVK Private AI — Криптографічний Self-Test (disc_packer.py)")
+    print(" [*] GVK Private AI - Cryptographic Self-Test (tools/disc_packer.py)")
     print("====================================================================")
 
     test_phrase = "GVK_Secret_Lore_Passphrase_2026_Test!"
-    print(f" [1/5] Деривація майстер-ключа Argon2id (256 МБ RAM, time_cost=4)...")
+    print(f" [1/5] Deriving master key via Argon2id (256 MB RAM, time_cost=4)...")
     t0 = time.time()
     master_key = derive_master_key(test_phrase)
     dt = time.time() - t0
     assert len(master_key) == 32
-    print(f"       [OK] Отримано 32-байтний master.key за {dt:.2f} с: {master_key.hex()[:24]}...")
+    print(f"       [OK] Derived 32-byte master.key in {dt:.2f}s: {master_key.hex()[:24]}...")
 
-    print(" [2/5] Перевірка генерації та верифікації HMAC підпису origin.sig...")
+    print(" [2/5] Verifying HMAC signature generation and validation (origin.sig)...")
     sig_f1 = generate_origin_sig("friend_1", master_key)
     sig_f2 = generate_origin_sig("friend_2", master_key)
     assert len(sig_f1) == 32
@@ -1790,11 +2025,11 @@ def run_self_test() -> None:
     assert verify_origin_sig("friend_2", master_key, sig_f1) is False
     print(f"       [OK] origin.sig (friend_1): {sig_f1.hex()[:24]}...")
 
-    print(" [3/5] Перевірка потокового шифрування та дешифрування AES-256-GCM...")
-    sample_data = os.urandom(3 * 1024 * 1024)  # 3 МБ випадкових даних
+    print(" [3/5] Verifying streaming AES-256-GCM encryption and decryption...")
+    sample_data = os.urandom(3 * 1024 * 1024)  # 3 MB random payload
     src_buf = io.BytesIO(sample_data)
     enc_buf = io.BytesIO()
-    # Використовуємо чанки по 1 МБ, щоб протестувати мульти-чанковий потік (3 чанки)
+    # Use 1 MB chunks to exercise multi-chunk streaming (3 chunks)
     encrypt_stream(src_buf, enc_buf, master_key=master_key, chunk_size=1024 * 1024)
 
     enc_bytes = enc_buf.getvalue()
@@ -1802,18 +2037,18 @@ def run_self_test() -> None:
     dec_buf = io.BytesIO()
     decrypt_stream(io.BytesIO(enc_bytes), dec_buf, master_key=master_key)
     assert dec_buf.getvalue() == sample_data
-    print("       [OK] Мульти-чанковий потік зашифровано та розшифровано в ОЗП без втрат!")
+    print("       [OK] Multi-chunk stream encrypted and decrypted in RAM losslessly.")
 
-    # Перевірка захисту від пошкодження (1 змінений біт повинен викликати помилку)
+    # Verify tamper detection (flipping 1 bit must raise ValueError)
     corrupted = bytearray(enc_bytes)
     corrupted[-10] ^= 0x01
     try:
         decrypt_stream(io.BytesIO(bytes(corrupted)), io.BytesIO(), master_key=master_key)
-        raise AssertionError("Пошкоджений шифротекст не викликав помилку!")
+        raise AssertionError("Corrupted ciphertext did not raise an error!")
     except ValueError:
-        print("       [OK] Захист цілісності GCM спрацював: зміну 1 біта миттєво виявлено.")
+        print("       [OK] GCM integrity protection active: 1-bit flip immediately detected.")
 
-    print(" [4/5] Перевірка пакування та розпакування payload.tar.enc у пам'яті...")
+    print(" [4/5] Verifying in-memory packaging and extraction of payload.tar.enc...")
     with tempfile.TemporaryDirectory() as tmpdir:
         shared_roster_src = os.path.join(tmpdir, "roster.json")
         with open(shared_roster_src, "w", encoding="utf-8") as rf:
@@ -1836,13 +2071,13 @@ def run_self_test() -> None:
         ram_extract_dir = os.path.join(tmpdir, "ram_extracted")
         unpack_payload_decrypted(enc_payload_path, ram_extract_dir, master_key)
         assert os.path.isfile(os.path.join(ram_extract_dir, "prompt.txt"))
-        assert os.path.isfile(os.path.join(ram_extract_dir, "roster.json")), "Спільний ../roster.json має пакуватися автоматично!"
+        assert os.path.isfile(os.path.join(ram_extract_dir, "roster.json")), "Shared ../roster.json must be packed automatically!"
         assert os.path.isfile(os.path.join(ram_extract_dir, "portraits", "мовчить.txt"))
-        assert not os.path.exists(os.path.join(ram_extract_dir, "portraits", ".DS_Store")), ".DS_Store не має пакуватися!"
-        assert not os.path.exists(os.path.join(ram_extract_dir, "portraits", "raw")), "portraits/raw/ не має пакуватися!"
-        print(f"       [OK] payload.tar.enc (SHA-256: {sha[:16]}...) розпаковано в ОЗП!")
+        assert not os.path.exists(os.path.join(ram_extract_dir, "portraits", ".DS_Store")), ".DS_Store must be excluded from payload!"
+        assert not os.path.exists(os.path.join(ram_extract_dir, "portraits", "raw")), "portraits/raw/ must be excluded from payload!"
+        print(f"       [OK] payload.tar.enc (SHA-256: {sha[:16]}...) unpacked in RAM.")
 
-        print(" [5/5] Перевірка збірки образу DVD-диска GVK_VAULT (без base_model.gguf.enc)...")
+        print(" [5/5] Verifying GVK_VAULT DVD tree assembly (without base_model.gguf.enc)...")
         persona_build = os.path.join(tmpdir, "persona_build")
         os.makedirs(persona_build, exist_ok=True)
         raw_adapter = os.path.join(tmpdir, "adapter.gguf")
@@ -1874,134 +2109,147 @@ def run_self_test() -> None:
             "run.sh",
             "run.bat",
         ):
-            assert os.path.isfile(os.path.join(disc_out, rel)), f"Відсутній файл DVD: {rel}"
-        assert not os.path.exists(os.path.join(disc_out, "base")), "Папка base/ не має створюватися на DVD за замовчуванням"
+            assert os.path.isfile(os.path.join(disc_out, rel)), f"Missing DVD file: {rel}"
+        assert not os.path.exists(os.path.join(disc_out, "base")), "base/ must not be created on DVD by default"
         iso_out = os.path.join(tmpdir, "GVK_VAULT_DISC_1.iso")
         built_iso = build_disc_iso(disc_out, iso_out, volume_name="GVK_VAULT")
         assert os.path.isfile(built_iso) and os.path.getsize(built_iso) >= 20 * ISO_SECTOR_SIZE
         with open(built_iso, "rb") as iso_f:
             iso_f.seek(0x8001)
-            assert iso_f.read(5) == b"CD001", "Не знайдено сигнатуру CD001 у Primary Volume Descriptor!"
-        print("       [OK] Образ DVD GVK_VAULT + ISO-9660 (.iso) зібрано коректно!")
+            assert iso_f.read(5) == b"CD001", "CD001 signature not found in Primary Volume Descriptor!"
+        print("       [OK] GVK_VAULT DVD tree + ISO-9660 (.iso) assembled cleanly.")
 
     print("====================================================================")
-    print(" [✓] УСІ ТЕСТИ ПРОЙДЕНО УСПІШНО!")
+    print(" [OK] ALL SELF-TESTS PASSED!")
     print("====================================================================")
 
 
 # =====================================================================
-# CLI ІНТЕРФЕЙС
+# CLI INTERFACE
 # =====================================================================
 def _load_or_prompt_key(key_file: Optional[str], allow_short: bool = False) -> bytes:
+    """Load a 32-byte `master.key` from disk or derive it from an interactive passphrase.
+
+    Args:
+        key_file: Optional path to an existing `master.key` file.
+        allow_short: If True, allow passphrases shorter than 24 characters.
+
+    Returns:
+        32-byte master key.
+
+    Raises:
+        ValueError: If `key_file` does not contain exactly 32 bytes.
+    """
     if key_file and os.path.isfile(key_file):
         with open(key_file, "rb") as f:
             key = f.read()
         if len(key) != KEY_SIZE:
-            raise ValueError(f"Файл ключа {key_file} має розмір {len(key)} Б (очікується {KEY_SIZE} Б).")
+            raise ValueError(f"Key file {key_file} is {len(key)} bytes (expected {KEY_SIZE} bytes).")
         return key
-    phrase = getpass.getpass(" [?] Введіть секретну майстер-фразу (від 24 символів): ")
+    phrase = getpass.getpass(" [?] Enter secret master passphrase (min 24 characters): ")
     return derive_master_key(phrase, allow_short=allow_short)
 
 
 def main() -> None:
+    """Parse CLI arguments and dispatch the requested cryptographic or disc command."""
     parser = argparse.ArgumentParser(
-        description="GVK Private AI — Пакувальник дисків та криптографічний інструмент (disc_packer.py)"
+        description="GVK Private AI - Disc Packer & Cryptographic Tool (tools/disc_packer.py)"
     )
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     # 1. self-test
-    sub.add_parser("self-test", help="Запустити повну самоперевірку Argon2id + AES-256-GCM у пам'яті")
+    sub.add_parser("self-test", help="Run full in-memory Argon2id + AES-256-GCM self-test")
 
     # 2. keygen
-    p_key = sub.add_parser("keygen", help="Згенерувати 32-байтний master.key із секретної фрази")
-    p_key.add_argument("-o", "--output", required=True, help="Шлях збереження файлу master.key")
-    p_key.add_argument("--passphrase", help="Секретна фраза (якщо не вказано — запитає приховано)")
-    p_key.add_argument("--allow-short", action="store_true", help="Дозволити фразу коротшу за 24 символи (для тестів)")
+    p_key = sub.add_parser("keygen", help="Derive a 32-byte master.key from a passphrase")
+    p_key.add_argument("-o", "--output", required=True, help="Output path for master.key")
+    p_key.add_argument("--passphrase", help="Secret passphrase (prompted securely if omitted)")
+    p_key.add_argument("--allow-short", action="store_true", help="Allow passphrases shorter than 24 chars (for testing)")
 
     # 3. sign
-    p_sig = sub.add_parser("sign", help="Згенерувати підпис фізичної активації origin.sig")
-    p_sig.add_argument("-k", "--key-file", help="Шлях до файлу master.key")
-    p_sig.add_argument("--id", required=True, help="ID персонажа (наприклад: friend_1)")
-    p_sig.add_argument("-o", "--output", required=True, help="Шлях збереження origin.sig")
+    p_sig = sub.add_parser("sign", help="Generate physical activation signature origin.sig")
+    p_sig.add_argument("-k", "--key-file", help="Path to master.key")
+    p_sig.add_argument("--id", required=True, help="Persona ID (e.g., friend_1)")
+    p_sig.add_argument("-o", "--output", required=True, help="Output path for origin.sig")
 
     # 4. encrypt
-    p_enc = sub.add_parser("encrypt", help="Зашифрувати файл у формат .enc (потоково по 64 МБ)")
-    p_enc.add_argument("-k", "--key-file", help="Шлях до файлу master.key")
-    p_enc.add_argument("-i", "--input", required=True, help="Вхідний відкритий файл")
-    p_enc.add_argument("-o", "--output", required=True, help="Вихідний зашифрований .enc файл")
-    p_enc.add_argument("--allow-short", action="store_true", help="Дозволити коротку фразу для тестів")
+    p_enc = sub.add_parser("encrypt", help="Encrypt a file into GVK1 .enc format (64 MB streaming chunks)")
+    p_enc.add_argument("-k", "--key-file", help="Path to master.key")
+    p_enc.add_argument("-i", "--input", required=True, help="Input plaintext file path")
+    p_enc.add_argument("-o", "--output", required=True, help="Output encrypted .enc file path")
+    p_enc.add_argument("--allow-short", action="store_true", help="Allow short passphrase for testing")
 
     # 5. decrypt
-    p_dec = sub.add_parser("decrypt", help="Розшифрувати .enc файл та перевірити цілісність GCM")
-    p_dec.add_argument("-k", "--key-file", help="Шлях до файлу master.key")
-    p_dec.add_argument("-i", "--input", required=True, help="Вхідний .enc файл")
-    p_dec.add_argument("-o", "--output", required=True, help="Вихідний розшифрований файл")
-    p_dec.add_argument("--allow-short", action="store_true", help="Дозволити коротку фразу для тестів")
+    p_dec = sub.add_parser("decrypt", help="Decrypt a .enc file and verify AES-256-GCM integrity")
+    p_dec.add_argument("-k", "--key-file", help="Path to master.key")
+    p_dec.add_argument("-i", "--input", required=True, help="Input encrypted .enc file path")
+    p_dec.add_argument("-o", "--output", required=True, help="Output decrypted file path")
+    p_dec.add_argument("--allow-short", action="store_true", help="Allow short passphrase for testing")
 
     # 6. pack-persona
     p_pack = sub.add_parser(
         "pack-persona",
-        help="Зашифрувати адаптер та папку скілів/портретів учасника + створити manifest.json і origin.sig",
+        help="Encrypt persona adapter and payload directory, then emit manifest.json and origin.sig",
     )
-    p_pack.add_argument("-k", "--key-file", help="Шлях до файлу master.key")
-    p_pack.add_argument("--id", required=True, help="ID персонажа (friend_1, friend_2, friend_3)")
-    p_pack.add_argument("--adapter", required=True, help="Шлях до відкритого файлу adapter.gguf")
-    p_pack.add_argument("--payload-dir", required=True, help="Шлях до папки з prompt.txt, portraits/, memory.faiss")
-    p_pack.add_argument("--roster", default=None, help="Опційно: шлях до спільного roster.json (за замовч. ../roster.json)")
-    p_pack.add_argument("-o", "--output-dir", required=True, help="Вихідна папка для зашифрованих файлів")
-    p_pack.add_argument("--version", default="1.0.0", help="Версія пакета (за замовч. 1.0.0)")
+    p_pack.add_argument("-k", "--key-file", help="Path to master.key")
+    p_pack.add_argument("--id", required=True, help="Persona ID (e.g., friend_1, friend_2, friend_3)")
+    p_pack.add_argument("--adapter", required=True, help="Path to plaintext adapter.gguf")
+    p_pack.add_argument("--payload-dir", required=True, help="Path to directory with prompt.txt, portraits/, memory.faiss")
+    p_pack.add_argument("--roster", default=None, help="Optional path to shared roster.json (default: ../roster.json)")
+    p_pack.add_argument("-o", "--output-dir", required=True, help="Output directory for encrypted persona artifacts")
+    p_pack.add_argument("--version", default="1.0.0", help="Persona package version (default: 1.0.0)")
 
     # 7. build-disc
-    p_disc = sub.add_parser("build-disc", help="Зібрати повну структуру DVD-диска GVK_VAULT (DVD-R 4.7 ГБ)")
-    p_disc.add_argument("-k", "--key-file", required=True, help="Шлях до файлу master.key")
-    p_disc.add_argument("--id", required=True, help="ID персонажа на цьому диску (напр. friend_1)")
+    p_disc = sub.add_parser("build-disc", help="Assemble a complete GVK_VAULT DVD tree (DVD-R 4.7 GB)")
+    p_disc.add_argument("-k", "--key-file", required=True, help="Path to master.key")
+    p_disc.add_argument("--id", required=True, help="Persona ID bound to this disc (e.g., friend_1)")
     p_disc.add_argument(
         "--base-enc",
         required=False,
         default=None,
-        help="Опційно: шлях до base_model.gguf.enc (для DVD не потрібно — базова модель качається з хмари)",
+        help="Optional path to base_model.gguf.enc (not required for DVD - base model downloads from cloud)",
     )
-    p_disc.add_argument("--persona-dir", required=True, help="Папка зібраного персонажа (з pack-persona)")
-    p_disc.add_argument("-o", "--output-dir", required=True, help="Вихідна папка образу диска GVK_VAULT")
-    p_disc.add_argument("--iso", default=None, help="Опційно: шлях вихідного .iso файлу (напр. dist/GVK_DISC_1.iso)")
+    p_disc.add_argument("--persona-dir", required=True, help="Built persona directory (from pack-persona)")
+    p_disc.add_argument("-o", "--output-dir", required=True, help="Output directory for the GVK_VAULT disc tree")
+    p_disc.add_argument("--iso", default=None, help="Optional output .iso file path (e.g., dist/GVK_DISC_1.iso)")
 
     # 8. build-iso
-    p_iso = sub.add_parser("build-iso", help="Зібрати ISO-9660/Joliet файл (.iso) із готової папки диска")
-    p_iso.add_argument("-i", "--input-dir", required=True, help="Папка зібраного диска GVK_VAULT")
-    p_iso.add_argument("-o", "--output", required=True, help="Вихідний шлях до файлу .iso")
-    p_iso.add_argument("--volume-name", default="GVK_VAULT", help="Мітка тому DVD (за замовч. GVK_VAULT)")
+    p_iso = sub.add_parser("build-iso", help="Build an ISO-9660/Joliet (.iso) image from a disc directory")
+    p_iso.add_argument("-i", "--input-dir", required=True, help="Built GVK_VAULT disc directory")
+    p_iso.add_argument("-o", "--output", required=True, help="Output .iso file path")
+    p_iso.add_argument("--volume-name", default="GVK_VAULT", help="DVD volume label (default: GVK_VAULT)")
 
     # 9. fetch-usb-bins
     p_fbins = sub.add_parser(
         "fetch-usb-bins",
-        help="Завантажити релізні архіви llama.cpp (Windows Vulkan/CPU + macOS ARM64/Intel) для офлайн USB",
+        help="Download llama.cpp release archives (Windows Vulkan/CPU + macOS ARM64/Intel) for offline USB",
     )
-    p_fbins.add_argument("-o", "--output-dir", default="base/llama_bins", help="Папка збереження архівів")
+    p_fbins.add_argument("-o", "--output-dir", default="base/llama_bins", help="Directory to store downloaded archives")
     p_fbins.add_argument(
         "--include-cuda-zip",
         action="store_true",
-        help="Додатково скачати офіційні архіви win-cuda-12.4-x64.zip + cudart-llama-*.zip (~720 МБ)",
+        help="Also download official win-cuda-12.4-x64.zip + cudart-llama-*.zip (~720 MB)",
     )
 
     # 10. build-usb
     p_usb = sub.add_parser(
         "build-usb",
-        help="Зібрати повний офлайн USB-дистрибутив GVK_VAULT [Mode: USB] з моделлю 14B та бінарниками Win/macOS/CUDA",
+        help="Assemble a full offline GVK_VAULT [Mode: USB] distribution with 14B base model and Win/macOS/CUDA binaries",
     )
-    p_usb.add_argument("-k", "--key-file", required=True, help="Шлях до файлу master.key")
-    p_usb.add_argument("--id", default="friend_1", help="ID персонажа (за замовч. friend_1)")
+    p_usb.add_argument("-k", "--key-file", required=True, help="Path to master.key")
+    p_usb.add_argument("--id", default="friend_1", help="Persona ID (default: friend_1)")
     p_usb.add_argument(
         "--persona-dir",
         default="personas_encrypted/friend_1",
-        help="Папка зібраного персонажа (за замовч. personas_encrypted/friend_1)",
+        help="Built persona directory (default: personas_encrypted/friend_1)",
     )
-    p_usb.add_argument("-o", "--output-dir", required=True, help="Вихідна папка або буква USB-диска (напр. dist/GVK_VAULT_USB або E:\\)")
-    p_usb.add_argument("--base-model", default=None, help="Шлях до Qwen2.5-14B-Instruct-Q4_K_M.gguf (за замовч. base/Qwen2.5-14B-Instruct-Q4_K_M.gguf)")
-    p_usb.add_argument("--llama-bins-dir", default=None, help="Папка з архівами llama.cpp (за замовч. base/llama_bins)")
-    p_usb.add_argument("--pascal-runtime-dir", default=None, help="Папка з CUDA DLL рантаймом (за замовч. base/llama-pascal-runtime)")
-    p_usb.add_argument("--embeddings-dir", default=None, help="Опційно: папка з офлайн моделлю paraphrase-multilingual-MiniLM-L12-v2")
-    p_usb.add_argument("--fetch-bins", action="store_true", help="Автоматично докачати відсутні архіви Win/macOS llama.cpp з GitHub")
-    p_usb.add_argument("--include-cuda-zip", action="store_true", help="При --fetch-bins також скачати офіційні CUDA 12.4 zip-архіви")
+    p_usb.add_argument("-o", "--output-dir", required=True, help="Output directory or USB drive root (e.g., dist/GVK_VAULT_USB or E:\\)")
+    p_usb.add_argument("--base-model", default=None, help="Path to Qwen2.5-14B-Instruct-Q4_K_M.gguf (default: base/Qwen2.5-14B-Instruct-Q4_K_M.gguf)")
+    p_usb.add_argument("--llama-bins-dir", default=None, help="Directory with llama.cpp archives (default: base/llama_bins)")
+    p_usb.add_argument("--pascal-runtime-dir", default=None, help="Directory with Windows CUDA DLL runtime (default: base/llama-pascal-runtime)")
+    p_usb.add_argument("--embeddings-dir", default=None, help="Optional directory with offline paraphrase-multilingual-MiniLM-L12-v2 model")
+    p_usb.add_argument("--fetch-bins", action="store_true", help="Automatically download missing Win/macOS llama.cpp archives from GitHub")
+    p_usb.add_argument("--include-cuda-zip", action="store_true", help="With --fetch-bins, also download official CUDA 12.4 zip archives")
 
     args = parser.parse_args()
 
@@ -2009,13 +2257,13 @@ def main() -> None:
         run_self_test()
 
     elif args.cmd == "keygen":
-        phrase = args.passphrase or getpass.getpass(" [?] Введіть секретну майстер-фразу (від 24 символів): ")
-        print(" [*] Обчислення ключа через Argon2id (256 МБ RAM)...")
+        phrase = args.passphrase or getpass.getpass(" [?] Enter secret master passphrase (min 24 characters): ")
+        print(" [*] Deriving master key via Argon2id (256 MB RAM)...")
         key = derive_master_key(phrase, allow_short=args.allow_short)
         os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
         with open(args.output, "wb") as f:
             f.write(key)
-        print(f" [✓] 32-байтний ключ збережено у: {args.output}")
+        print(f" [OK] Saved 32-byte master key to: {args.output}")
 
     elif args.cmd == "sign":
         key = _load_or_prompt_key(args.key_file)
@@ -2023,17 +2271,17 @@ def main() -> None:
         os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
         with open(args.output, "wb") as f:
             f.write(sig)
-        print(f" [✓] Підпис origin.sig для '{args.id}' збережено у: {args.output}")
+        print(f" [OK] Saved origin.sig for '{args.id}' to: {args.output}")
 
     elif args.cmd == "encrypt":
         key = _load_or_prompt_key(args.key_file, allow_short=args.allow_short)
         sha = encrypt_file(args.input, args.output, key)
-        print(f" [✓] Зашифровано у: {args.output} (SHA-256: {sha})")
+        print(f" [OK] Encrypted to: {args.output} (SHA-256: {sha})")
 
     elif args.cmd == "decrypt":
         key = _load_or_prompt_key(args.key_file, allow_short=args.allow_short)
         size = decrypt_file(args.input, args.output, key)
-        print(f" [✓] Розшифровано {size} байтів у: {args.output}")
+        print(f" [OK] Decrypted {size} bytes to: {args.output}")
 
     elif args.cmd == "pack-persona":
         key = _load_or_prompt_key(args.key_file)
@@ -2055,11 +2303,11 @@ def main() -> None:
         with open(sig_path, "wb") as f:
             f.write(generate_origin_sig(args.id, key))
 
-        print(f" [✓] Пакет персонажа '{args.id}' зібрано в: {args.output_dir}")
+        print(f" [OK] Packed persona '{args.id}' into: {args.output_dir}")
         print(f"     - adapter.gguf.enc (SHA-256: {adapter_sha[:16]}...)")
         print(f"     - payload.tar.enc  (SHA-256: {payload_sha[:16]}...)")
         print(f"     - manifest.json    ({manifest_path})")
-        print(f"     - origin.sig       (УВАГА: тільки для DVD-диска, не комітити в GitHub!)")
+        print(f"     - origin.sig       (WARNING: for physical DVD/USB only - do NOT commit to GitHub!)")
 
     elif args.cmd == "build-disc":
         key = _load_or_prompt_key(args.key_file)

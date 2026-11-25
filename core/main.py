@@ -1,18 +1,25 @@
 #!/usr/bin/env python3
 """
-GVK Private AI — Головна точка входу (core/main.py)
+GVK Private AI - Main Entry Point (core/main.py)
 
-Поєднує:
-  - Живе логування в термінал та у папку `logs/` (`logs/gvk_session_*.log`).
-  - Автоматичне визначення шляхів для локального тестування (`personas/friend_1/`, `adapters/friend_1.gguf`)
-    та продакшн-середовища користувача (`~/.gvk_ai/` + RAM-диск).
-  - Ініціалізацію `GVKOrchestrator` (`core/orchestrator.py`) та термінального GUI (`core/menu.py`).
+Bootstraps the GVK Private AI runtime by initializing real-time logging,
+mounting the encrypted RAM-disk vault when running from optical/USB media or
+local encrypted cache, starting `GVKOrchestrator`, and launching the desktop
+terminal GUI (`GVKMenuApp`).
 
-Приклади запуску:
+Key Responsibilities:
+  - Configure real-time stdout logging and session log files under `logs/`.
+  - Auto-detect paths for local development (`personas/friend_1/`, `adapters/friend_1.gguf`)
+    and production environments (`~/.gvk_ai/` + RAM disk).
+  - Discover and unpack activated encrypted personas into the RAM disk.
+  - Initialize `GVKOrchestrator` (`core/orchestrator.py`) and `GVKMenuApp` (`core/menu.py`).
+
+Usage:
   python3 core/main.py
   python3 core/main.py --fast
   python3 core/main.py --fast --start-server
   python3 core/main.py self-test
+  python3 core/main.py --help
 """
 
 import argparse
@@ -48,12 +55,24 @@ from updater import DEFAULT_GVK_HOME, detect_media_mode
 
 
 # =====================================================================
-# НАЛАШТУВАННЯ РЕАЛТАЙМ-ЛОГУВАННЯ (ТЕРМІНАЛ + ПАПКА LOGS/)
+# REAL-TIME LOGGING SETUP (TERMINAL + LOGS/ DIRECTORY)
 # =====================================================================
 def setup_logging(repo_root: str = REPO_ROOT, gvk_home: str = DEFAULT_GVK_HOME) -> str:
-    """
-    Налаштовує одночасний вивід логів у реальному часі в термінал (stdout)
-    та збереження у файл `logs/gvk_session_<timestamp>.log`.
+    """Configure real-time terminal logging and persistent session log files.
+
+    Writes formatted logs simultaneously to stdout, a timestamped session file
+    under `logs/gvk_session_<timestamp>.log`, `logs/gvk_latest.log`, and
+    optionally `~/.gvk_ai/logs/` when that directory already exists.
+
+    Args:
+        repo_root: Path to the repository root where `logs/` is created.
+        gvk_home: Path to the user home cache directory (`~/.gvk_ai`).
+
+    Returns:
+        Absolute path to the created timestamped session log file.
+
+    Example:
+        >>> log_file = setup_logging()
     """
     logs_dir = os.path.join(repo_root, "logs")
     os.makedirs(logs_dir, exist_ok=True)
@@ -71,22 +90,22 @@ def setup_logging(repo_root: str = REPO_ROOT, gvk_home: str = DEFAULT_GVK_HOME) 
         datefmt="%H:%M:%S",
     )
 
-    # 1. Реалтайм-вивід у термінал
+    # 1. Real-time console output
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setFormatter(fmt)
     root_logger.addHandler(console_handler)
 
-    # 2. Запис у файл сесії в папці logs/
+    # 2. Timestamped session log file under logs/
     file_handler = logging.FileHandler(session_log_path, encoding="utf-8")
     file_handler.setFormatter(fmt)
     root_logger.addHandler(file_handler)
 
-    # 3. Дублювання в logs/gvk_latest.log
+    # 3. Mirror to logs/gvk_latest.log
     latest_handler = logging.FileHandler(latest_log_path, mode="w", encoding="utf-8")
     latest_handler.setFormatter(fmt)
     root_logger.addHandler(latest_handler)
 
-    # Якщо у користувача вже створено ~/.gvk_ai/logs, дублюємо лог і туди
+    # Mirror into ~/.gvk_ai/logs if that user log directory already exists
     user_logs_dir = os.path.join(os.path.abspath(os.path.expanduser(gvk_home)), "logs")
     if os.path.isdir(user_logs_dir) and os.path.abspath(user_logs_dir) != os.path.abspath(logs_dir):
         try:
@@ -97,19 +116,25 @@ def setup_logging(repo_root: str = REPO_ROOT, gvk_home: str = DEFAULT_GVK_HOME) 
         except OSError:
             pass
 
-    root_logger.info("Логування ініціалізовано. Файл логу: %s", session_log_path)
+    root_logger.info("Logging initialized. Session log file: %s", session_log_path)
     return session_log_path
 
 
 # =====================================================================
-# АВТОМАТИЧНА САМОПЕРЕВІРКА (SELF-TEST)
+# AUTOMATED SELF-TEST SUITE
 # =====================================================================
 def run_self_test() -> None:
+    """Run integrated offline self-tests across main, orchestrator, vault, and menu.
+
+    Verifies system prompt assembly, ephemeral 2-turn RAG injection, headless
+    Tkinter UI flows (persona selector, loading screen, chat emotion states,
+    CTRL+N reset), multi-persona vault unpacking, and Kill-Switch PID tracking.
+    """
     log_path = setup_logging()
     logger = logging.getLogger("gvk.main")
-    logger.info("Запуск комплексного self-test (main.py + orchestrator.py + menu.py)...")
+    logger.info("Running integrated self-test (main.py + orchestrator.py + menu.py)...")
 
-    # 1. Перевірка оркестратора та побудови системного промпту для friend_1
+    # 1. Verify orchestrator configuration and system prompt compilation for friend_1
     orch = GVKOrchestrator(persona_id="friend_1")
     assert orch.config.get("persona_id") == "friend_1"
     assert orch.config.get("color") == "#78b068"
@@ -122,22 +147,22 @@ def run_self_test() -> None:
     assert "talking2.txt" in (orch.config.get("emotion_sprites", {}).get("talking") or [])
 
     cmd = orch.get_llama_server_command()
-    assert "-ngl" not in cmd, f"Не повинно бути аргументу -ngl у команді: {cmd}"
-    assert "--lora-scaled" in cmd, f"Очікувався аргумент --lora-scaled у команді: {cmd}"
+    assert "-ngl" not in cmd, f"Unexpected -ngl argument in command: {cmd}"
+    assert "--lora-scaled" in cmd, f"Expected --lora-scaled argument in command: {cmd}"
     lora_idx = cmd.index("--lora-scaled")
     expected_scale = str(orch.config.get("lora_scaled", 1.0))
     assert cmd[lora_idx + 1].endswith(
         f":{expected_scale}"
-    ), f"Очікувався масштаб :{expected_scale} для friend_1, отримано: {cmd[lora_idx + 1]}"
+    ), f"Expected LoRA scale :{expected_scale} for friend_1, got: {cmd[lora_idx + 1]}"
 
     warmup_payload = orch.build_warmup_payload(orch.get_warmup_questions()[0])
     assert warmup_payload.get("chat_template_kwargs") == {"enable_thinking": False}
 
     test_date = datetime.date(2026, 11, 17)
     age_on_test_date = calculate_age("01.01.2000", today=test_date)
-    assert age_on_test_date == 26, f"Очікувався вік 26 на 17.11.2026, отримано {age_on_test_date}"
+    assert age_on_test_date == 26, f"Expected age 26 on 17.11.2026, got {age_on_test_date}"
 
-    # Неекспериментальний користувач [03] -> повний опис (якщо заданий у ростері/конфігу)
+    # Non-experimental user [03] -> full description (if defined in roster/config)
     u3_name = str(USERS_DICT[3]["name"])
     expected_u3_desc = orch.resolve_interlocutor_string(user_name_ua=u3_name, is_experimental=False)
     orch.set_interlocutor(user_id=3, user_name_ua=u3_name, is_experimental=False)
@@ -147,14 +172,14 @@ def run_self_test() -> None:
     assert f"Собеседник в этом диалоге: {expected_u3_desc}." in sys_prompt_main
     assert orch.resolve_interlocutor_string(user_name_ua=u3_name, is_experimental=True) == orch.translate_name_to_ru(u3_name)
 
-    # Експериментальний користувач [07] -> лише перекладене ім'я
+    # Experimental user [07] -> translated Russian name only
     u7_name = str(USERS_DICT[7]["name"])
     expected_u7_ru = orch.translate_name_to_ru(u7_name)
     orch.set_interlocutor(user_id=7, user_name_ua=u7_name, is_experimental=True)
     sys_prompt_exp = orch.build_system_prompt(today=test_date)
     assert f"Собеседник в этом диалоге: {expected_u7_ru}." in sys_prompt_exp
 
-    # Перевірка додавання історії повідомлень та ефемерної RAG-ін'єкції (2-turn window)
+    # Verify conversation history assembly and ephemeral 2-turn RAG injection
     orch.history.append({"role": "user", "content": "привет бро"})
     orch.history.append({"role": "assistant", "content": "здарова шо ты"})
     assert orch.build_rag_query("го в рл") == "привет бро го в рл"
@@ -166,7 +191,7 @@ def run_self_test() -> None:
     assert payload_no_rag[2]["content"] == "здарова шо ты"
     assert payload_no_rag[3]["content"] == "го в рл"
 
-    # Перевірка ефемерної ін'єкції спогадів (з реальним memory.faiss або тимчасовим індексом, якщо faiss-cpu ще не встановлено)
+    # Verify ephemeral memory injection (uses real memory.faiss or a temp index when faiss-cpu is absent)
     import tempfile
 
     with tempfile.TemporaryDirectory(prefix="gvk_orch_rag_") as tmp_rag_dir:
@@ -185,22 +210,22 @@ def run_self_test() -> None:
             build_rag_index(sample_mem_path, sample_faiss_path, backend="ngram")
             orch.rag = MemoryRAG(sample_faiss_path)
 
-        # 1) Привітання не ін'єктує спогадів
+        # 1) Plain greeting must not inject RAG memories
         orch.history.clear()
         greeting_msgs = orch.build_messages_payload(new_user_message="привет, как дела?", today=test_date)
-        assert len(greeting_msgs) == 2, f"Привітання не повинно додавати RAG-блок: {greeting_msgs}"
+        assert len(greeting_msgs) == 2, f"Greeting should not inject a RAG block: {greeting_msgs}"
 
-        # 2) Тематичний запит ін'єктує ефемерний system-блок перед повідомленням користувача, не засмічуючи history
+        # 2) Topical query injects an ephemeral system block before the user turn without polluting history
         orch.history.append({"role": "user", "content": "привет бро"})
         orch.history.append({"role": "assistant", "content": "здарова шо ты"})
         rag_msgs = orch.build_messages_payload(new_user_message="го в рокет лигу", today=test_date)
-        assert len(rag_msgs) == 5, f"Очікувалось 5 повідомлень (з ефемерним RAG-блоком), отримано {len(rag_msgs)}"
+        assert len(rag_msgs) == 5, f"Expected 5 messages (with ephemeral RAG block), got {len(rag_msgs)}"
         assert rag_msgs[3]["role"] == "system"
         assert DEFAULT_RAG_HEADER in rag_msgs[3]["content"]
         assert rag_msgs[4] == {"role": "user", "content": "го в рокет лигу"}
-        assert len(orch.history) == 2, "self.history не повинна містити ефемерних RAG-блоків"
+        assert len(orch.history) == 2, "self.history must not contain ephemeral RAG blocks"
 
-        # 3) Уточнююче питання на наступному кроці підтягує спогад завдяки 2-turn window
+        # 3) Follow-up question retrieves the same memory via the 2-turn RAG window
         orch.history.append(rag_msgs[-1])
         orch.history.append({"role": "assistant", "content": "та го через 10 мин"})
         followup_msgs = orch.build_messages_payload(new_user_message="а как часто вы катаете?", today=test_date)
@@ -211,7 +236,7 @@ def run_self_test() -> None:
 
         orch.rag = active_rag
 
-    # 2. Перевірка середньої колонки вибору персонажа та екрана завантаження в menu.py
+    # 2. Verify persona selector column and loading screen in menu.py
     u2_name = str(USERS_DICT[2]["name"])
     p1_label = str(PERSONA_SELECT_ITEMS[0]["label"])
     test_colors = {str(orch.config.get("persona_id") or "friend_1"): str(orch.config.get("color") or "#78b068")}
@@ -265,7 +290,7 @@ def run_self_test() -> None:
     assert detect_reply_emotion("ок [MOOD:smiling]") == ("ок", "smiling")
     assert detect_reply_emotion("хз похуй") == ("хз похуй", "idle")
 
-    # Перевірка talking -> smiling -> idle і AFK -> sleeping -> wake up (+ живий індикатор під портретом)
+    # Verify talking -> smiling -> idle and AFK -> sleeping -> wake-up transitions + live dossier status
     chat.is_waiting_reply = True
     chat._start_talking_anim()
     assert chat.current_emotion == "talking"
@@ -295,7 +320,7 @@ def run_self_test() -> None:
     assert chat.current_emotion == "idle"
     assert chat.portrait_canvas.portrait_text == all_portraits["idle"][0]
 
-    # Перевірка CTRL+N = Новий чат у зв'язці з оркестратором
+    # Verify CTRL+N new-chat reset together with orchestrator history
     orch.history.append({"role": "user", "content": "тест"})
     orch.history.append({"role": "assistant", "content": "відповідь"})
     chat.append_message(u2_name, "тест", "#ffffff", is_user=True)
@@ -308,7 +333,7 @@ def run_self_test() -> None:
 
     app.root.destroy()
 
-    # 2b. Перевірка розпакування кількох активованих персонажів та реєстрації PID у Kill-Switch
+    # 2b. Verify unpacking multiple activated personas and registering llama-server PID with Kill-Switch
     from unittest.mock import MagicMock, patch
     from tools.disc_packer import derive_master_key, encrypt_file, generate_origin_sig, pack_payload_encrypted, write_public_manifest
 
@@ -355,7 +380,7 @@ def run_self_test() -> None:
         sim_ram = sim_vault.initialize()
         try:
             unpacked = unpack_activated_personas_to_ram(sim_vault, home_root, disc_root)
-            assert unpacked == ["friend_1", "friend_2"], f"Очікувались обидва персонажі: {unpacked}"
+            assert unpacked == ["friend_1", "friend_2"], f"Expected both personas to be unpacked: {unpacked}"
             for pid in ("friend_1", "friend_2"):
                 assert os.path.isfile(os.path.join(sim_ram, "adapters", f"{pid}.gguf"))
                 assert os.path.isfile(os.path.join(sim_ram, "personas", pid, "prompt.txt"))
@@ -370,19 +395,28 @@ def run_self_test() -> None:
                 "core.orchestrator.subprocess.Popen", return_value=mock_proc
             ):
                 assert orch_v.ensure_server_running(wait_timeout=1.0) is True
-            assert 424242 in sim_vault._protected_pids, "PID llama-server не зареєстровано у Kill-Switch!"
+            assert 424242 in sim_vault._protected_pids, "llama-server PID was not registered with Kill-Switch!"
         finally:
             sim_vault.cleanup()
 
-    # 3. Базовий self-test menu.py
+    # 3. Core menu.py self-test
     run_menu_self_test()
-    logger.info("Комплексний self-test пройдено успішно! Лог збережено у: %s", log_path)
+    logger.info("Integrated self-test passed successfully! Log saved to: %s", log_path)
 
 
 # =====================================================================
-# РОЗПАКУВАННЯ АКТИВОВАНИХ ОСОБИСТОСТЕЙ У RAM-ДИСК
+# UNPACKING ACTIVATED PERSONAS TO RAM DISK
 # =====================================================================
 def _read_disc_manifest_persona_id(detected_disc: Optional[str]) -> Optional[str]:
+    """Read `persona_id` from a mounted GVK_VAULT disc manifest, if present.
+
+    Args:
+        detected_disc: Path to the mounted `GVK_VAULT` media root, or `None`.
+
+    Returns:
+        Persona ID string, `"friend_1"` as legacy fallback when an encrypted
+        adapter is present without a manifest, or `None`.
+    """
     if not detected_disc:
         return None
     manifest_path = os.path.join(detected_disc, "persona", "manifest.json")
@@ -401,6 +435,14 @@ def _read_disc_manifest_persona_id(detected_disc: Optional[str]) -> Optional[str
 
 
 def _has_encrypted_persona_cache(gvk_home_abs: str) -> bool:
+    """Return True if `~/.gvk_ai` contains any registered or cached encrypted personas.
+
+    Args:
+        gvk_home_abs: Absolute path to the `~/.gvk_ai` home directory.
+
+    Returns:
+        `True` when at least one `.sig` file or encrypted persona cache exists.
+    """
     reg_dir = os.path.join(gvk_home_abs, "registry")
     if os.path.isdir(reg_dir) and any(fname.endswith(".sig") for fname in os.listdir(reg_dir)):
         return True
@@ -420,9 +462,19 @@ def unpack_activated_personas_to_ram(
     gvk_home_abs: str,
     detected_disc: Optional[str] = None,
 ) -> List[str]:
-    """
-    Виявляє всі активовані зашифровані особистості (`~/.gvk_ai/registry/*.sig`,
-    `~/.gvk_ai/personas/<id>/` та вставлений DVD) і розпаковує їх у RAM-диск.
+    """Discover and unpack all activated encrypted personas into the RAM disk.
+
+    Scans `~/.gvk_ai/registry/*.sig`, `~/.gvk_ai/personas/<id>/`, and any
+    inserted `GVK_VAULT` media, verifies each persona's `origin.sig` when
+    available, and decrypts its LoRA adapter and payload directly into RAM.
+
+    Args:
+        vault: Initialized `CryptoVault` instance with a mounted RAM disk.
+        gvk_home_abs: Absolute path to the `~/.gvk_ai` home directory.
+        detected_disc: Optional path to a mounted `GVK_VAULT` disc or USB drive.
+
+    Returns:
+        Ordered list of persona IDs successfully unpacked into the RAM disk.
     """
     log = logging.getLogger("gvk.main")
     candidate_ids: List[str] = []
@@ -474,7 +526,7 @@ def unpack_activated_personas_to_ram(
 
         sig_path = next((p for p in sig_candidates if os.path.isfile(p)), None)
         if sig_path is not None and not vault.verify_persona_signature(pid, sig_path):
-            log.warning("Невалідний origin.sig для '%s' (%s), пропускаємо розпакування.", pid, sig_path)
+            log.warning("Invalid origin.sig for '%s' (%s); skipping unpack.", pid, sig_path)
             continue
 
         vault.unpack_persona_to_ram(
@@ -485,36 +537,37 @@ def unpack_activated_personas_to_ram(
         unpacked.append(pid)
 
     if unpacked:
-        log.info("Розпаковано у RAM-диск (%d): %s", len(unpacked), ", ".join(unpacked))
+        log.info("Unpacked %d persona(s) to RAM disk: %s", len(unpacked), ", ".join(unpacked))
     return unpacked
 
 
 # =====================================================================
-# ТОЧКА ВХОДУ
+# CLI ENTRY POINT
 # =====================================================================
 def main() -> None:
-    parser = argparse.ArgumentParser(description="GVK Private AI — Головна точка входу (core/main.py)")
+    """Parse CLI arguments and launch GVK Private AI or its self-test suite."""
+    parser = argparse.ArgumentParser(description="GVK Private AI - Main Entry Point (core/main.py)")
     parser.add_argument(
         "cmd",
         nargs="?",
         choices=["run", "self-test"],
         default="run",
-        help="Режим запуску: 'run' (за замовчуванням) або 'self-test'",
+        help="Execution mode: 'run' (default) or 'self-test'",
     )
     parser.add_argument(
         "--fast",
         action="store_true",
-        help="Швидкий режим (передає --fast у menu.py: таймери по 1–2 с)",
+        help="Fast mode (passes --fast behavior to menu.py: 1-2 s splash timers)",
     )
     parser.add_argument(
         "--start-server",
         action="store_true",
-        help="Автоматично запустити локальний llama-server під час старту",
+        help="Automatically start the local llama-server on launch",
     )
     parser.add_argument(
         "--disc-path",
         default=None,
-        help="Опційний шлях до змонтованого DVD-диска GVK_VAULT",
+        help="Optional path to a mounted GVK_VAULT DVD or USB drive",
     )
     args = parser.parse_args()
 
@@ -524,7 +577,7 @@ def main() -> None:
 
     setup_logging()
     logger = logging.getLogger("gvk.main")
-    logger.info("Запуск GVK Private AI (fast=%s, start_server=%s)...", args.fast, args.start_server)
+    logger.info("Starting GVK Private AI (fast=%s, start_server=%s)...", args.fast, args.start_server)
 
     vault: Optional[CryptoVault] = None
     ram_root: Optional[str] = None
@@ -534,7 +587,7 @@ def main() -> None:
     media_info = detect_media_mode(detected_disc)
     if detected_disc:
         logger.info(
-            "Виявлено носій GVK_VAULT: %s [Режим: %s, base_gguf=%s, bins=%s]",
+            "Detected GVK_VAULT media: %s [mode=%s, base_gguf=%s, bins=%s]",
             detected_disc,
             media_info["mode"],
             media_info["has_base_model"],
@@ -554,7 +607,7 @@ def main() -> None:
             unpacked_personas = unpack_activated_personas_to_ram(vault, gvk_home_abs, detected_disc)
             vault.start_kill_switch()
         except Exception as exc:
-            logger.exception("Помилка ініціалізації CryptoVault / RAM-диска: %s", exc)
+            logger.exception("Failed to initialize CryptoVault / RAM disk: %s", exc)
             if vault is not None:
                 vault.cleanup()
                 vault = None
@@ -572,7 +625,7 @@ def main() -> None:
         if args.start_server:
             orchestrator.ensure_server_running()
     except Exception as exc:
-        logger.exception("Попередження під час ініціалізації GVKOrchestrator: %s", exc)
+        logger.exception("Warning during GVKOrchestrator initialization: %s", exc)
 
     wait_sec = 1.0 if args.fast else float(DEFAULT_WAIT_SECONDS)
     last_warn_sec = 2.0 if args.fast else float(LAST_WARNING_WAIT_SECONDS)
@@ -597,7 +650,7 @@ def main() -> None:
             orchestrator.shutdown()
         if vault is not None:
             vault.cleanup()
-        logger.info("Сесію GVK Private AI завершено.")
+        logger.info("GVK Private AI session finished.")
 
 
 if __name__ == "__main__":

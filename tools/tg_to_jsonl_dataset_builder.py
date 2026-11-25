@@ -1,39 +1,32 @@
 #!/usr/bin/env python3
 """
-tg_to_jsonl_dataset_builder.py
+GVK Private AI - Telegram to JSONL Dataset Builder (tools/tg_to_jsonl_dataset_builder.py)
 
-Standalone pipeline to process raw Telegram chat export JSON files into an
-instruction/chat JSONL dataset for LoRA / full fine-tuning of conversational models.
+Standalone data-preparation pipeline that converts raw Telegram chat export JSON
+files (personal 1-on-1 and group chats) into chronologically ordered ChatML
+JSONL datasets for LoRA or full fine-tuning of conversational persona models.
 
-Key Pipeline Features:
-1. Strict chat isolation: each chat file (personal or group) is segmented and processed independently.
-2. Dual-mode support (Combined pipeline):
-   - Personal chats (1-on-1): Clean dialogue without speaker prefixes.
-   - Group chats: Senders mapped via USER_ID_MAP and prefixed as '[Имя Фамилия]: текст'
-     while assistant turns remain pure, without prefix.
-3. Telegram User ID mapping: Maps raw Telegram user IDs to full names and skips unmapped
-   accounts (bots, strangers) with a console warning.
-4. Assistant Text Integrity (Golden Rules):
-   - Rule 1: If the assistant sent voice/media + text in the same assistant turn, naked placeholders
-     are stripped, preserving the actual text.
-   - Rule 2: If the assistant sent ONLY voice/media without text for the entire turn (a 'black hole'),
-     the entire (User + Assistant) pair is dropped. If in the middle of a dialogue, the session
-     is cleanly cut into two sub-sessions at that point to avoid any context leap.
-   - User turns retain media placeholders ([Голосовое сообщение], [Фотография], etc.) as context.
-5. Dynamic system prompt injection:
-   - Personal: 'Собеседник в этом диалоге: {description}.'
-   - Group: 'Ты сейчас в групе с: {description}. Сообщения участников подписаны в формате 'Имя: текст'. Отвечай от своего лица без префикса.'
-6. Media placeholders: Converts raw Telegram media (photos, voice messages, video circles,
-   stickers, files, forwarded messages) into structured textual placeholders instead of dropping them.
-7. Orphan media reaction pruning: Strips useless assistant turns that react solely to invisible media
-   (e.g., "не грузит", "покажи", "че за хуйня").
-8. Discord / VoIP meta-talk filtering: Removes technical voice chat coordination sessions
-   (e.g., "го в дс", "микро включи", "не слышу тебя").
-9. Sliding window with overlap (chunking): Retains 2-4 preceding context turns across window cuts.
-10. Global chronological ordering: All samples across all chats are strictly sorted earliest-first.
-11. Temporal weighting: Replicates samples by epoch (pre-2022, 2022-2024, post-2024).
-12. Externalized private config: Reads Telegram IDs and chat maps from a git-ignored JSON config
-    (`--config data/builder_config_<persona>.json` or `--persona friend_2`).
+Key Responsibilities:
+  - Isolate each exported chat file during session segmentation, turn merging,
+    and dialogue hygiene filtering so unrelated chats never bleed context.
+  - Support personal chats (clean turns) and group chats (senders mapped via
+    `USER_ID_MAP` with `[Name]: text` prefixes while assistant turns stay bare).
+  - Enforce assistant text integrity rules: strip naked media placeholders when
+    paired with text (Rule 1), and drop media-only assistant exchanges while
+    splitting the session cleanly to avoid context leaps (Rule 2).
+  - Convert raw Telegram media into textual placeholders, prune orphan media
+    reactions and Discord/VoIP coordination noise, and chunk long sessions with
+    a sliding context overlap window.
+  - Inject dynamic per-chat system prompt directives, sort all samples globally
+    earliest-first, and apply epoch-based temporal weighting.
+  - Load private persona configs (`--config` or auto-discovered JSON) so real
+    Telegram user IDs and names remain outside version control.
+
+Usage:
+  python3 tools/tg_to_jsonl_dataset_builder.py self-test
+  python3 tools/tg_to_jsonl_dataset_builder.py --persona friend_1
+  python3 tools/tg_to_jsonl_dataset_builder.py --config data/builder_config_friend_2.json
+  python3 tools/tg_to_jsonl_dataset_builder.py --help
 """
 
 import argparse
@@ -44,9 +37,9 @@ import tempfile
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
-# ==============================================================================
-# 1. Configuration & Global Variables (Anonymized defaults; override via --config)
-# ==============================================================================
+# =====================================================================
+# 1. CONFIGURATION & GLOBAL DEFAULTS (OVERRIDE VIA --CONFIG)
+# =====================================================================
 REPO_ROOT: str = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ASSISTANT_FROM_ID: str = "user000000001"
 
@@ -109,10 +102,24 @@ def load_builder_config(
     config_path: Optional[str] = None,
     persona_id: str = "friend_1",
 ) -> Tuple[Dict[str, Any], Optional[str]]:
-    """
-    Loads persona-specific dataset builder config (Telegram IDs, chats map, weights).
-    Resolves explicit `--config`, or auto-discovers `data/builder_config_<persona>.json` /
-    `raw_chats_and_prompts/<persona>/builder_config.json`.
+    """Load persona-specific dataset builder configuration from JSON or defaults.
+
+    Resolves an explicit `config_path`, or auto-discovers
+    `data/builder_config_<persona>.json`,
+    `raw_chats_and_prompts/<persona>/builder_config.json`, or
+    `personas/<persona>/builder_config.json`.
+
+    Args:
+        config_path: Optional explicit path to a JSON configuration file.
+        persona_id: Persona identifier used for default paths and config lookup.
+
+    Returns:
+        Tuple of `(config_dict, resolved_config_path)` where
+        `resolved_config_path` is None if only built-in defaults were used.
+
+    Raises:
+        FileNotFoundError: If an explicit `config_path` does not exist.
+        ValueError: If the loaded JSON file does not contain a JSON object.
     """
     resolved_cfg: Optional[str] = None
     if config_path:
@@ -161,9 +168,10 @@ def load_builder_config(
 
     return cfg, resolved_cfg
 
-# ==============================================================================
-# 2. Heuristic Regex Patterns for Data Cleaning
-# ==============================================================================
+
+# =====================================================================
+# 2. HEURISTIC REGEX PATTERNS FOR DATA CLEANING
+# =====================================================================
 # Media reaction heuristics: assistant turns that are uninformative without visual media
 ORPHAN_MEDIA_REACTIONS = re.compile(
     r"^(бля\s+|а\s+|ну\s+|да\s+)?"
@@ -202,11 +210,13 @@ VOICE_METATALK_PATTERNS = re.compile(
 )
 
 
-# ==============================================================================
-# 3. Data Structures
-# ==============================================================================
+# =====================================================================
+# 3. DATA STRUCTURES
+# =====================================================================
 @dataclass
 class CleanMessage:
+    """Normalized single Telegram message extracted from a chat export."""
+
     from_id: str
     timestamp: int
     text: str
@@ -215,6 +225,8 @@ class CleanMessage:
 
 @dataclass
 class Turn:
+    """Consolidated dialogue turn combining consecutive messages from one role."""
+
     role: str
     content: str
     timestamp: int
@@ -222,6 +234,8 @@ class Turn:
 
 @dataclass
 class DatasetSample:
+    """Single ChatML training sample with chronological metadata."""
+
     messages: List[Dict[str, str]]
     timestamp: int
     interlocutor: str
@@ -231,6 +245,8 @@ class DatasetSample:
 
 @dataclass
 class ChatStats:
+    """Per-chat extraction, filtering, and sampling counters."""
+
     filename: str
     chat_type: str
     friend_info: str
@@ -248,13 +264,20 @@ class ChatStats:
     unmapped_ids_count: int = 0
 
 
-# ==============================================================================
-# 4. Message Extraction & Media Placeholder Conversion
-# ==============================================================================
+# =====================================================================
+# 4. MESSAGE EXTRACTION & MEDIA PLACEHOLDER CONVERSION
+# =====================================================================
 def normalize_telegram_text(raw_text: Any) -> str:
-    """
-    Extract and concatenate text whether 'text' is a plain string or a list
-    containing strings and rich-text dicts ([{"type": "...", "text": "..."}]).
+    """Flatten a Telegram `text` field into a plain trimmed string.
+
+    Handles both plain string values and rich-text entity lists containing
+    strings and `{"type": "...", "text": "..."}` dictionaries.
+
+    Args:
+        raw_text: Raw `text` field value from a Telegram message object.
+
+    Returns:
+        Concatenated and whitespace-trimmed message text.
     """
     if isinstance(raw_text, str):
         return raw_text.strip()
@@ -272,9 +295,13 @@ def normalize_telegram_text(raw_text: Any) -> str:
 
 
 def extract_message_content(entry: dict) -> Tuple[str, bool]:
-    """
-    Extract text or construct informative semantic placeholders for media.
-    Returns (content_string, is_media_placeholder).
+    """Extract human text or build a structured semantic media placeholder.
+
+    Args:
+        entry: Single Telegram export message dictionary.
+
+    Returns:
+        Tuple of `(content_string, is_media_placeholder)`.
     """
     raw_text = normalize_telegram_text(entry.get("text", ""))
 
@@ -317,7 +344,14 @@ def extract_message_content(entry: dict) -> Tuple[str, bool]:
 
 
 def normalize_user_id(from_id: Any) -> str:
-    """Normalize raw user ID representation to canonical 'user<numeric_id>' format."""
+    """Normalize a raw Telegram sender ID into canonical `user<numeric_id>` form.
+
+    Args:
+        from_id: Raw `from_id` value (int, numeric string, or `user...` string).
+
+    Returns:
+        Canonical user ID string, or empty string if `from_id` is None.
+    """
     if from_id is None:
         return ""
     s = str(from_id).strip()
@@ -329,19 +363,31 @@ def normalize_user_id(from_id: Any) -> str:
 
 
 def is_assistant_sender(from_id: Any, target_assistant_id: str) -> bool:
-    """Check if message sender ID corresponds to the target assistant ID."""
+    """Return True if `from_id` matches the target persona's Telegram user ID.
+
+    Args:
+        from_id: Message sender identifier from Telegram export.
+        target_assistant_id: Configured Telegram ID of the target assistant.
+
+    Returns:
+        True if both normalized IDs match, False otherwise.
+    """
     if from_id is None:
         return False
     return normalize_user_id(from_id) == normalize_user_id(target_assistant_id)
 
 
-# ==============================================================================
-# 5. Dialogue Hygiene & Filtering (Golden Rules for Assistant)
-# ==============================================================================
+# =====================================================================
+# 5. DIALOGUE HYGIENE & FILTERING (GOLDEN RULES FOR ASSISTANT)
+# =====================================================================
 def strip_naked_media_placeholders(text: str) -> str:
-    """
-    Remove lines that are purely naked media placeholders
-    (voice message, photo without caption, sticker, etc.), preserving all real human text.
+    """Remove lines consisting solely of bare media placeholders while keeping text.
+
+    Args:
+        text: Assistant turn text potentially containing media placeholder lines.
+
+    Returns:
+        Cleaned text containing only human-written lines.
     """
     if not text:
         return ""
@@ -363,14 +409,20 @@ def strip_naked_media_placeholders(text: str) -> str:
 def split_session_on_empty_assistant(
     turns: List[Turn],
 ) -> Tuple[List[List[Turn]], int, int]:
-    """
-    Enforce Golden Rules on Assistant turns:
-    - Rule 1: If assistant had voice/media + text in the same turn, strip naked placeholders
-      and keep only the real human text.
-    - Rule 2: If assistant had ONLY voice/media without text for the entire turn (a 'black hole'),
-      drop the entire (User + Assistant) pair. If in the middle of a dialogue, cut the session
-      into distinct sub-sessions at this point so there is no context leap.
-    Returns (list_of_valid_sub_sessions, media_stripped_count, empty_pairs_dropped_count).
+    """Enforce Golden Rules 1 and 2 on alternating user/assistant turns.
+
+    - Rule 1: When an assistant turn contains media placeholders plus real text,
+      strip the naked placeholders and preserve the text.
+    - Rule 2: When an assistant turn contains only naked media/voice with no
+      text, drop the `(user, assistant)` pair and split the session cleanly at
+      that boundary to prevent context leaps.
+
+    Args:
+        turns: Alternating list of `Turn` objects starting with `user` and
+            ending with `assistant`.
+
+    Returns:
+        Tuple of `(valid_sub_sessions, media_stripped_count, empty_pairs_dropped_count)`.
     """
     valid_segments: List[List[Turn]] = []
     current_segment: List[Turn] = []
@@ -408,12 +460,18 @@ def split_session_on_empty_assistant(
 
 
 def is_useless_media_reaction(assistant_text: str, prev_user_text: str) -> bool:
-    """
-    Determine if an assistant turn is an orphan reaction to invisible media
-    (e.g., user sent [Фотография] or [Имя]: [Фотография] and assistant answered 'не грузит').
+    """Check whether an assistant reply is an orphan reaction to unseen media.
+
+    Args:
+        assistant_text: Assistant reply text.
+        prev_user_text: Immediately preceding user turn text.
+
+    Returns:
+        True if the user turn starts with a media placeholder and the assistant
+        reply matches `ORPHAN_MEDIA_REACTIONS`.
     """
     clean_user = prev_user_text.strip()
-    # Strip sender prefix like '[Имя Фамилия]: ' if present
+    # Strip group speaker prefix like '[Name]: ' if present
     stripped_user = re.sub(r"^\[[^\]]+\]:\s*", "", clean_user)
     if stripped_user.startswith(MEDIA_PLACEHOLDER_PREFIXES):
         if ORPHAN_MEDIA_REACTIONS.search(assistant_text.strip()):
@@ -422,10 +480,15 @@ def is_useless_media_reaction(assistant_text: str, prev_user_text: str) -> bool:
 
 
 def prune_useless_media_exchanges(turns: List[Turn]) -> Tuple[List[Turn], int]:
-    """
-    Remove turn pairs where the assistant responds with an orphan media reaction.
-    Because turns strictly alternate (user, assistant, user, assistant),
-    removing user-assistant pairs guarantees alternating role order is preserved.
+    """Remove `(user, assistant)` pairs where the assistant reacts to unseen media.
+
+    Removing complete user-assistant pairs preserves strict alternating roles.
+
+    Args:
+        turns: Alternating list of `Turn` objects.
+
+    Returns:
+        Tuple of `(cleaned_turns, removed_pair_count)`.
     """
     if len(turns) < 2:
         return turns, 0
@@ -452,10 +515,17 @@ def prune_useless_media_exchanges(turns: List[Turn]) -> Tuple[List[Turn], int]:
 
 
 def is_voice_garbage_session(turns: List[Turn]) -> bool:
-    """
-    Identify sessions consisting purely of technical voice chat / Discord coordination.
-    - If a short session (<= 4 turns) contains any voice metatalk pattern, prune it.
-    - If a longer session has >= 50% turns matching voice metatalk, prune it.
+    """Detect dialogue sessions dominated by Discord/VoIP audio troubleshooting.
+
+    Short sessions (`<= 4` turns) are dropped if any turn matches
+    `VOICE_METATALK_PATTERNS`; longer sessions are dropped if at least 50% of
+    turns match.
+
+    Args:
+        turns: List of dialogue `Turn` objects in a session.
+
+    Returns:
+        True if the session should be discarded as VoIP noise.
     """
     if not turns:
         return True
@@ -465,9 +535,9 @@ def is_voice_garbage_session(turns: List[Turn]) -> bool:
     return (voice_matches / len(turns)) >= 0.5
 
 
-# ==============================================================================
-# 6. Sliding Window Chunking with Overlap
-# ==============================================================================
+# =====================================================================
+# 6. SLIDING WINDOW CHUNKING WITH OVERLAP
+# =====================================================================
 def chunk_turns_into_samples(
     turns: List[Turn],
     max_turns: int,
@@ -477,11 +547,23 @@ def chunk_turns_into_samples(
     session_index: int,
     chat_type: str,
 ) -> List[DatasetSample]:
-    """
-    Segment consolidated session turns into training samples using a sliding window.
-    - Every sample begins at either the session start or with 2-4 preceding context turns.
-    - Every sample strictly starts with 'user' and ends with 'assistant'.
-    - An even number of turns is maintained for all samples.
+    """Segment session turns into ChatML samples using a sliding context window.
+
+    Every emitted sample starts on a `user` turn, ends on an `assistant` turn,
+    contains an even number of dialogue turns, and carries up to `overlap_turns`
+    context turns across window boundaries.
+
+    Args:
+        turns: Validated alternating session turns.
+        max_turns: Maximum number of dialogue turns per sample.
+        overlap_turns: Number of preceding turns repeated across consecutive chunks.
+        system_prompt: Final system prompt prepended to every sample.
+        interlocutor: Chat interlocutor or group description.
+        session_index: Zero-based session index within the source chat.
+        chat_type: Either `"personal"` or `"group"`.
+
+    Returns:
+        List of `DatasetSample` instances created from `turns`.
     """
     if not turns or len(turns) < 2:
         return []
@@ -527,13 +609,20 @@ def chunk_turns_into_samples(
     return samples
 
 
-# ==============================================================================
-# 7. System Prompt Loading & Construction
-# ==============================================================================
+# =====================================================================
+# 7. SYSTEM PROMPT LOADING & CONSTRUCTION
+# =====================================================================
 def load_base_system_prompt(candidate_paths: List[str]) -> Tuple[str, List[str]]:
-    """
-    Read the base system prompt from candidate text files and return (prompt, warnings).
-    Handles plain text files as well as JSON-string encoded files.
+    """Read the base persona system prompt from the first existing candidate file.
+
+    Handles plain text files as well as JSON-quoted string files with escaped
+    newlines.
+
+    Args:
+        candidate_paths: Ordered list of file paths to search.
+
+    Returns:
+        Tuple of `(prompt_text, warnings_list)`.
     """
     warnings: List[str] = []
     resolved_path: Optional[str] = None
@@ -544,7 +633,7 @@ def load_base_system_prompt(candidate_paths: List[str]) -> Tuple[str, List[str]]
             break
 
     if not resolved_path:
-        msg = f"[Warning] Base system prompt file not found in candidates: {candidate_paths}. Using empty prompt."
+        msg = f"[!] Base system prompt file not found in candidates: {candidate_paths}. Using empty prompt."
         print(msg)
         warnings.append(msg)
         return "", warnings
@@ -564,21 +653,26 @@ def load_base_system_prompt(candidate_paths: List[str]) -> Tuple[str, List[str]]
         elif r"\n" in content and "\n" not in content:
             content = content.replace(r"\n", "\n")
 
-        print(f"[Info] Loaded base system prompt from: {resolved_path} ({len(content)} chars)")
+        print(f"[*] Loaded base system prompt from: {resolved_path} ({len(content)} chars)")
         return content, warnings
 
     except Exception as e:
-        msg = f"[Warning] Failed to read system prompt from {resolved_path}: {e}"
+        msg = f"[!] Failed to read system prompt from {resolved_path}: {e}"
         print(msg)
         warnings.append(msg)
         return "", warnings
 
 
 def build_system_prompt(base_prompt: str, chat_type: str, description: str) -> str:
-    """
-    Construct the final system prompt with dynamic interlocutor / group injection.
-    - Personal: appends 'Собеседник в этом диалоге: {description}.'
-    - Group: appends 'Ты сейчас в групе с: {description}. Сообщения участников подписаны в формате 'Имя: текст'. Отвечай от своего лица без префикса.'
+    """Append the personal or group interlocutor directive to the base system prompt.
+
+    Args:
+        base_prompt: Core persona system prompt text.
+        chat_type: Chat mode (`"personal"` or `"group"`).
+        description: Human-readable interlocutor or participant list description.
+
+    Returns:
+        Combined system prompt string ready for ChatML records.
     """
     if chat_type == "group":
         directive = GROUP_PROMPT_TEMPLATE.format(description=description)
@@ -590,11 +684,19 @@ def build_system_prompt(base_prompt: str, chat_type: str, description: str) -> s
     return directive
 
 
-# ==============================================================================
-# 8. Chat File Resolution & Strict Isolated Processing
-# ==============================================================================
+# =====================================================================
+# 8. CHAT FILE RESOLUTION & STRICT ISOLATED PROCESSING
+# =====================================================================
 def resolve_chat_file_path(filename: str, base_dirs: List[str]) -> Optional[str]:
-    """Find the existing path for a given chat filename."""
+    """Locate an existing chat export file across candidate base directories.
+
+    Args:
+        filename: Relative or absolute chat export filename.
+        base_dirs: Ordered list of directories to search.
+
+    Returns:
+        Resolved file path if found, otherwise None.
+    """
     if os.path.exists(filename):
         return filename
     for bdir in base_dirs:
@@ -618,23 +720,28 @@ def process_single_chat_file(
     max_turns_per_sample: int = MAX_TURNS_PER_SAMPLE,
     chunk_overlap_turns: int = CHUNK_OVERLAP_TURNS,
 ) -> Tuple[List[DatasetSample], ChatStats, Dict[str, str], List[str]]:
-    """
-    Process one Telegram JSON export file in complete isolation:
-    1. Parse raw messages and extract content with media placeholders.
-    2. Check sender roles:
-       - Assistant is always role='assistant' and has no prefix.
-       - In personal chats: user messages are role='user' without prefix.
-       - In group chats: user IDs are resolved against user_id_map to produce '[Имя Фамилия]: text'.
-         Unmapped IDs are excluded and tracked for terminal warnings.
-    3. Sort messages strictly within this chat file by timestamp.
-    4. Segment dialogue sessions using session_idle_timeout_minutes.
-    5. Consolidate consecutive messages from the same role.
-    6. Enforce Golden Rules for Assistant:
-       - Rule 1: Strip naked media placeholders when assistant turn has real text.
-       - Rule 2: Drop pair and cut session when assistant turn has ONLY naked media / voice.
-    7. Prune useless orphan media reactions and VoIP coordination sessions.
-    8. Chunk sessions using sliding window with overlap.
-    9. Attach friend-specific / group-specific context to system prompt.
+    """Process one Telegram JSON export file in complete isolation.
+
+    Parses messages, maps sender roles (adding `[Name]: ` prefixes in group
+    mode), sorts chronologically within the chat, segments sessions by idle
+    timeout, merges consecutive same-role messages, enforces Golden Rules 1 & 2,
+    prunes orphan media reactions and VoIP sessions, chunks into sliding windows,
+    and attaches chat-specific system prompt directives.
+
+    Args:
+        filename: Chat JSON filename from `chats_config`.
+        chat_config: Dictionary with `"type"` (`"personal"` or `"group"`) and
+            `"description"`.
+        base_system_prompt: Base persona system prompt text.
+        base_dirs: Candidate directories for locating `filename`.
+        assistant_from_id: Optional override for the assistant Telegram ID.
+        user_id_map: Optional override mapping Telegram IDs to display names.
+        session_idle_timeout_minutes: Idle gap threshold splitting sessions.
+        max_turns_per_sample: Maximum turns per sliding-window sample.
+        chunk_overlap_turns: Turn overlap between adjacent window chunks.
+
+    Returns:
+        Tuple of `(samples, stats, unmapped_senders, warnings)`.
     """
     eff_assistant_id = assistant_from_id or ASSISTANT_FROM_ID
     eff_user_map = user_id_map if user_id_map is not None else USER_ID_MAP
@@ -647,7 +754,7 @@ def process_single_chat_file(
 
     resolved_path = resolve_chat_file_path(filename, base_dirs)
     if not resolved_path:
-        msg = f"[Warning] Chat file not found: {filename} in {base_dirs}"
+        msg = f"[!] Chat file not found: {filename} in {base_dirs}"
         print(msg)
         warnings.append(msg)
         return [], stats, unmapped_senders, warnings
@@ -656,14 +763,14 @@ def process_single_chat_file(
         with open(resolved_path, "r", encoding="utf-8") as f:
             data = json.load(f)
     except Exception as e:
-        msg = f"[Warning] Failed to load JSON from {resolved_path}: {e}"
+        msg = f"[!] Failed to load JSON from {resolved_path}: {e}"
         print(msg)
         warnings.append(msg)
         return [], stats, unmapped_senders, warnings
 
     raw_messages = data.get("messages", []) if isinstance(data, dict) else data
     if not isinstance(raw_messages, list) or len(raw_messages) == 0:
-        msg = f"[Warning] File contains no messages: {resolved_path}"
+        msg = f"[!] File contains no messages: {resolved_path}"
         print(msg)
         warnings.append(msg)
         return [], stats, unmapped_senders, warnings
@@ -700,7 +807,7 @@ def process_single_chat_file(
                 norm_fid = normalize_user_id(fid)
                 if norm_fid in eff_user_map:
                     sender_name = eff_user_map[norm_fid]
-                    # Format user messages with [Имя Фамилия]: prefix in group mode
+                    # Format user messages with [Name]: prefix in group mode
                     text = f"[{sender_name}]: {content}"
                 else:
                     # Unmapped user in group chat: exclude message and record warning info
@@ -726,7 +833,7 @@ def process_single_chat_file(
 
     stats.valid_extracted_messages = len(extracted_msgs)
     if stats.valid_extracted_messages == 0:
-        msg = f"[Warning] 0 valid messages extracted from: {resolved_path}"
+        msg = f"[!] 0 valid messages extracted from: {resolved_path}"
         print(msg)
         warnings.append(msg)
         return [], stats, unmapped_senders, warnings
@@ -819,11 +926,18 @@ def process_single_chat_file(
     return samples, stats, unmapped_senders, warnings
 
 
-# ==============================================================================
-# 9. Temporal Weighting & Epoch Categorization
-# ==============================================================================
+# =====================================================================
+# 9. TEMPORAL WEIGHTING & EPOCH CATEGORIZATION
+# =====================================================================
 def get_epoch_label(timestamp: int) -> str:
-    """Categorize a UNIX timestamp into its temporal weighting bucket."""
+    """Categorize a UNIX timestamp into its temporal weighting bucket.
+
+    Args:
+        timestamp: UNIX epoch timestamp in seconds.
+
+    Returns:
+        One of `"pre_2022"`, `"2022_2024"`, or `"post_2024"`.
+    """
     if timestamp < EPOCH_2022_START:
         return "pre_2022"
     elif timestamp < EPOCH_2024_START:
@@ -838,9 +952,16 @@ def apply_temporal_weighting(
     weight_2022_2024: int = WEIGHT_2022_2024,
     weight_post_2024: int = WEIGHT_POST_2024,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
-    """
-    Apply epoch replication weights to samples while strictly preserving
-    the chronological (monotonic non-decreasing timestamp) order.
+    """Replicate samples by epoch multiplier while preserving chronological order.
+
+    Args:
+        samples: Chronologically sorted list of `DatasetSample` objects.
+        weight_pre_2022: Replication factor for pre-2022 samples (`0` excludes).
+        weight_2022_2024: Replication factor for 2022-2024 samples.
+        weight_post_2024: Replication factor for post-2024 samples.
+
+    Returns:
+        Tuple of `(weighted_chatml_records, epoch_counts_dict)`.
     """
     weighted_records: List[Dict[str, Any]] = []
     epoch_counts: Dict[str, int] = {
@@ -869,9 +990,9 @@ def apply_temporal_weighting(
     return weighted_records, epoch_counts
 
 
-# ==============================================================================
-# 10. Main Pipeline Execution (Combined Personal + Group)
-# ==============================================================================
+# =====================================================================
+# 10. MAIN PIPELINE EXECUTION (COMBINED PERSONAL + GROUP)
+# =====================================================================
 def run_build(
     config_path: Optional[str] = None,
     persona_id: str = "friend_1",
@@ -879,9 +1000,26 @@ def run_build(
     prompt_file: Optional[str] = None,
     output_file: Optional[str] = None,
 ) -> Dict[str, Any]:
+    """Execute the full Telegram-to-ChatML JSONL dataset build pipeline.
+
+    Loads persona configuration and base system prompt, processes each exported
+    chat file in strict isolation, sorts all resulting samples chronologically,
+    applies epoch weighting, writes the output JSONL file, and prints a summary.
+
+    Args:
+        config_path: Optional explicit path to a persona builder JSON config.
+        persona_id: Persona identifier (default `"friend_1"`).
+        raw_dir: Optional override for the directory containing raw chat JSONs.
+        prompt_file: Optional override path for the base system prompt file.
+        output_file: Optional override path for the generated `.jsonl` dataset.
+
+    Returns:
+        Summary dictionary with `"output_file"`, `"records"`, `"epoch_counts"`,
+        and `"stats"`.
+    """
     cfg, resolved_cfg_path = load_builder_config(config_path=config_path, persona_id=persona_id)
     if resolved_cfg_path:
-        print(f"[Info] Loaded builder config: {resolved_cfg_path}")
+        print(f"[*] Loaded builder config: {resolved_cfg_path}")
 
     assistant_from_id = str(cfg.get("assistant_from_id") or ASSISTANT_FROM_ID)
     user_id_map = dict(cfg.get("user_id_map") or USER_ID_MAP)
@@ -1000,7 +1138,7 @@ def run_build(
     print("-" * 75)
     print("Chat Isolation Breakdown:")
     for s in chat_statistics:
-        print(f"  • {s.filename} [{s.chat_type}]:")
+        print(f"  - {s.filename} [{s.chat_type}]:")
         print(f"      Context     : {s.friend_info}")
         print(f"      Extracted   : {s.valid_extracted_messages} msgs (Media placeholders: {s.media_placeholders_created})")
         print(f"      Sessions    : {s.active_sessions_count} active (Voice dropped: {s.voice_sessions_dropped}, Media pruned: {s.media_pairs_pruned})")
@@ -1035,9 +1173,17 @@ def run_build(
     }
 
 
+# =====================================================================
+# 11. AUTOMATED SELF-TEST & CLI INTERFACE
+# =====================================================================
 def run_self_test() -> None:
+    """Run an offline end-to-end self-test using synthetic personal and group chats.
+
+    Verifies Golden Rules 1 & 2, VoIP session filtering, unmapped group-sender
+    exclusion, external JSON config loading, and epoch temporal weighting.
+    """
     print("====================================================================")
-    print(" [*] GVK Private AI — Self-Test (tools/tg_to_jsonl_dataset_builder.py)")
+    print(" [*] GVK Private AI - Self-Test (tools/tg_to_jsonl_dataset_builder.py)")
     print("====================================================================")
 
     with tempfile.TemporaryDirectory(prefix="gvk_tg_builder_test_") as tmp_dir:
@@ -1101,35 +1247,36 @@ def run_self_test() -> None:
             lines = [json.loads(line) for line in f if line.strip()]
 
         # Group (2023, weight 1 -> 1 sample) + 2 personal sub-sessions (2024, weight 2 -> 4 samples) = 5
-        assert len(lines) == 5, f"Очікувалось 5 ChatML-записів, отримано {len(lines)}"
+        assert len(lines) == 5, f"Expected 5 ChatML records, got {len(lines)}"
         assert lines[0]["messages"][1]["content"].startswith("[Friend 2]: "), lines[0]
         assert "норм сиджу" in lines[1]["messages"][2]["content"] and "[Фотография]" not in lines[1]["messages"][2]["content"]
         assert res["stats"][0].empty_assistant_pairs_dropped == 1
         assert res["stats"][0].assistant_media_stripped == 1
         assert res["stats"][0].voice_sessions_dropped == 1
         assert res["stats"][1].unmapped_ids_count == 1
-        print(" [✓] Golden Rules 1 & 2, VoIP/Group фільтрація, конфіг і часове зважування OK!")
+        print(" [OK] Golden Rules 1 & 2, VoIP/Group filtering, config, and temporal weighting passed.")
     print("====================================================================")
-    print(" [✓] SELF-TEST DATASET BUILDER ПРОЙДЕНО УСПІШНО!")
+    print(" [OK] DATASET BUILDER SELF-TEST PASSED!")
     print("====================================================================")
 
 
 def main() -> None:
+    """Parse CLI arguments and run dataset building or the offline self-test."""
     parser = argparse.ArgumentParser(
-        description="GVK Private AI — Генератор ChatML-датасету з експортів Telegram"
+        description="GVK Private AI - Telegram Chat Export to ChatML JSONL Dataset Builder"
     )
     parser.add_argument(
         "cmd",
         nargs="?",
         choices=["build", "self-test"],
         default="build",
-        help="Режим: 'build' (за замовчуванням) або 'self-test'",
+        help="Execution mode: 'build' (default) or 'self-test'",
     )
-    parser.add_argument("-c", "--config", default=None, help="Шлях до JSON-конфіга персони")
-    parser.add_argument("-p", "--persona", default="friend_1", help="ID персони (friend_1, friend_2, friend_3)")
-    parser.add_argument("--raw-dir", default=None, help="Папка з сирими експортами Telegram")
-    parser.add_argument("--prompt-file", default=None, help="Шлях до системного промпту (.txt)")
-    parser.add_argument("-o", "--output", default=None, help="Вихідний шлях до .jsonl датасету")
+    parser.add_argument("-c", "--config", default=None, help="Path to persona builder JSON config file")
+    parser.add_argument("-p", "--persona", default="friend_1", help="Persona ID (e.g., friend_1, friend_2, friend_3)")
+    parser.add_argument("--raw-dir", default=None, help="Directory containing raw Telegram chat JSON exports")
+    parser.add_argument("--prompt-file", default=None, help="Path to base system prompt text file (.txt)")
+    parser.add_argument("-o", "--output", default=None, help="Output path for the generated .jsonl dataset")
     args = parser.parse_args()
 
     if args.cmd == "self-test":

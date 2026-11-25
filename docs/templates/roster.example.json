@@ -1,0 +1,70 @@
+{
+  "_comment": "GVK Private AI - Example shared roster template. Copy to personas/roster.json (git-ignored) and replace all bogus placeholder values with your private group roster.",
+
+  "_comment_users_dict": "Profiles shown on the user selection screen in core/menu.py. Keys are numeric slot IDs ('1'..'17'). Set 'locked': true for restricted slots (e.g., the persona's own slot) and 'experimental': true for optional/secondary contacts.",
+  "users_dict": {
+    "1": { "name": "Alex Mercer", "locked": true, "experimental": false },
+    "2": { "name": "Sam Rivera", "locked": false, "experimental": false },
+    "3": { "name": "Jordan Blake", "locked": false, "experimental": false },
+    "4": { "name": "Casey Lin", "locked": false, "experimental": true },
+    "17": { "name": "Enter custom name...", "locked": false, "experimental": true }
+  },
+
+  "_comment_persona_select_items": "Personas listed in the main persona picker. 'persona_id' must match personas/<persona_id>/ and adapters/<persona_id>.gguf. Set 'available': false for unbuilt future slots.",
+  "persona_select_items": [
+    {
+      "id": 1,
+      "persona_id": "friend_1",
+      "label": "Alex Mercer",
+      "genitive_name": "Alex Mercer",
+      "loading_tips": [
+        "Brewing questionable late-night espresso...",
+        "Loading shared road-trip memories...",
+        "Calibrating sarcasm threshold..."
+      ],
+      "available": true,
+      "color": "#78b068"
+    },
+    {
+      "id": 2,
+      "persona_id": "friend_2",
+      "label": "Sam Rivera (unavailable)",
+      "genitive_name": "Sam Rivera",
+      "loading_tips": [
+        "Placeholder loading tip 1...",
+        "Placeholder loading tip 2..."
+      ],
+      "available": false,
+      "color": "#58a6c4"
+    }
+  ],
+
+  "_comment_ua_to_ru_names": "Optional map converting UI display names (e.g., Ukrainian spelling) into the exact name form used in the model's training prompts/chats.",
+  "ua_to_ru_names": {
+    "Sam Rivera": "Sam Rivera",
+    "Jordan Blake": "Jordan Blake",
+    "Casey Lin": "Casey Lin"
+  },
+
+  "_comment_interlocutor_descriptions": "Short relationship context injected into the system prompt when that user is selected in the UI. Keep descriptions factual and consistent with your training dataset.",
+  "interlocutor_descriptions": {
+    "Sam Rivera": "Sam Rivera (close college friend, co-op gaming partner, lives in Berlin)",
+    "Jordan Blake": "Jordan Blake (high school friend, amateur photographer, always late to meetups)",
+    "Casey Lin": "Casey Lin (mutual friend from the weekend hiking group)"
+  },
+
+  "_comment_splash_message": "Optional custom splash text shown on startup in core/menu.py.",
+  "splash_message": "GVK PRIVATE AI // PRIVATE ARCHIVE SESSION\nPress any key to continue...",
+
+  "_comment_warning_screens": "Optional list of [title, body] disclaimer screens shown before entering the user selector.",
+  "warning_screens": [
+    [
+      "NOTICE 01",
+      "This is a local AI simulation trained on archived conversations, not the real person."
+    ],
+    [
+      "NOTICE 02",
+      "All private persona weights and memories remain strictly in RAM for the duration of this session."
+    ]
+  ]
+}

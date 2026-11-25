@@ -1,33 +1,32 @@
 #!/usr/bin/env python3
 """
-GVK Private AI — Крипто-сховище, RAM-диск та Демон Kill-Switch (core/crypto_vault.py)
+GVK Private AI - Crypto Vault, RAM Disk & Kill-Switch Daemon (core/crypto_vault.py)
 
-Runtime-модуль безпеки, що забезпечує принцип Zero-Plaintext-At-Rest:
-  1. Здобуття ключа доступу (32 байти):
-     - Автоматичний пошук оптичного DVD-диска `GVK_VAULT` (macOS / Linux / Windows)
-       і миттєве зчитування `vault/master.key` за 0.01 с.
-     - Fallback-режим (якщо диска немає): консольний запит секретної майстер-фрази
-       та деривація того самого 32-байтного ключа через Argon2id (256 МБ RAM).
-  2. Кросплатформне монтування ізольованого RAM-диска (512–1024 МБ під 16 ГБ ОЗП):
-     - macOS: блоковий пристрій у пам'яті (`hdiutil attach -nomount ram://...`) з HFS+,
-       правами 0700 та примусовим вимкненням індексації Spotlight (`.metadata_never_index`).
-     - Linux: вбудований розділ ядра `tmpfs` у `/dev/shm/gvk_runtime_<pid>` (`chmod 700`).
-     - Windows: віртуальний RAM-диск (ImDisk) або ізольований тимчасовий буфер у пам'яті
-       з примусовим зануленням (`0x00`) перед закриттям.
-  3. Потокове дешифрування `.enc` контейнерів (AES-256-GCM чанками по 64 МБ) напряму в RAM-диск:
-     - Персональні LoRA-адаптери (`adapter.gguf.enc` -> `<ram>/adapters/<friend_id>.gguf`).
-     - Приватні архіви (`payload.tar.enc` -> `<ram>/personas/<friend_id>/` з промптами,
-       ASCII-портретами емоцій `portraits/`, базою `memory.faiss` та `tools.py`).
-     - Публічна базова модель (`Qwen2.5-14B-Instruct-Q4_K_M.gguf`, ~9.0 ГБ) підключається
-       напряму з SSD (`~/.gvk_ai/base/`) через `--mmap` без подвійного копіювання в RAM-диск.
-  4. Апаратний демон Kill-Switch (Heartbeat 3.0 с):
-     - Окремий фоновий потік кожні 3 секунди перевіряє присутність `vault/master.key` на диску.
-     - Якщо диск вийнято або спрацював апаратний тумблер на станції `GVK-DOCK // MK.I`:
-       надсилає `SIGKILL` процесу `llama-server`, затирає ключі в ОЗП нулями,
-       примусово демонтує RAM-диск і миттєво завершує процес.
+Runtime security module enforcing the Zero-Plaintext-At-Rest principle by
+keeping decrypted LoRA adapters, persona archives, and cryptographic keys
+strictly in volatile memory.
 
-Приклад запуску самоперевірки (Milestone 1 — шифрування + реальний RAM-диск + розпакування):
+Key Responsibilities:
+  - Master Key Acquisition (32 bytes): auto-detect mounted `GVK_VAULT` optical
+    or USB media (`vault/master.key`, ~0.01 s) or derive the key from a secret
+    passphrase via Argon2id (256 MB RAM).
+  - Cross-Platform RAM Disk Mounting (512-1024 MB for 16 GB RAM hosts):
+    macOS (`hdiutil attach -nomount ram://...`, HFS+, mode 0700, Spotlight
+    disabled), Linux (`tmpfs` under `/dev/shm/gvk_runtime_<pid>`, chmod 700),
+    and Windows (ImDisk virtual RAM disk or isolated session directory with
+    0x00 zero-wipe on exit).
+  - Streaming AES-256-GCM Decryption (64 MB chunks) directly into the RAM disk
+    for personal LoRA adapters (`adapter.gguf.enc`) and private persona archives
+    (`payload.tar.enc`), while the public base model (`Qwen2.5-14B-Instruct-Q4_K_M.gguf`)
+    is memory-mapped directly from SSD (`~/.gvk_ai/base/`) via `--mmap`.
+  - Hardware Kill-Switch Daemon (3.0 s heartbeat): monitors `vault/master.key`
+    on the physical media and triggers an emergency `SIGKILL` of `llama-server`,
+    zero-wipes keys in RAM, detaches the RAM disk, and exits immediately if the
+    disc is removed or the `GVK-DOCK // MK.I` kill switch is tripped.
+
+Usage:
   python3 core/crypto_vault.py self-test
+  python3 core/crypto_vault.py --help
 """
 
 import argparse
@@ -51,7 +50,7 @@ import threading
 import time
 from typing import BinaryIO, Callable, List, Optional
 
-# Додаємо корінь репозиторію в sys.path для прямого запуску `python3 core/crypto_vault.py`
+# Add repository root to sys.path when running `python3 core/crypto_vault.py` directly
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
@@ -76,25 +75,32 @@ from tools.disc_packer import (
     verify_origin_sig,
 )
 
-DEFAULT_RAMDISK_MB = 1024  # 1 ГБ для 3 LoRA (~420 МБ) + FAISS/промпти/портрети; база 14B іде через --mmap
+DEFAULT_RAMDISK_MB = 1024  # 1 GB for 3 LoRAs (~420 MB) + FAISS/prompts/portraits; 14B base uses --mmap
 DEFAULT_BASE_MODEL_FILENAME = "Qwen2.5-14B-Instruct-Q4_K_M.gguf"
 KILL_SWITCH_INTERVAL_SEC = 3.0
 
 
 # =====================================================================
-# 1. ПОШУК ОПТИЧНОГО ДИСКА GVK_VAULT ТА ЗДОБУТТЯ MASTER.KEY
+# 1. GVK_VAULT MEDIA DISCOVERY & MASTER KEY ACQUISITION
 # =====================================================================
 def find_base_model_path(
     custom_path: Optional[str] = None,
     gvk_home: Optional[str] = None,
 ) -> Optional[str]:
-    """
-    Шукає публічну базову GGUF-модель для підключення у llama-server через `--mmap`.
-    Порядок пріоритету:
-      1. Явно переданий `custom_path`
-      2. Змінна середовища `GVK_BASE_MODEL`
-      3. `~/.gvk_ai/base/Qwen2.5-14B-Instruct-Q4_K_M.gguf` (або будь-який `.gguf` у `~/.gvk_ai/base/`)
-      4. Локальні шляхи в репозиторії (`base/Qwen2.5-14B-Instruct-Q4_K_M.gguf`, `base/*.gguf`, `base_model.gguf`)
+    """Locate the public base GGUF model for `llama-server --mmap`.
+
+    Search priority:
+      1. Explicitly provided `custom_path`.
+      2. `GVK_BASE_MODEL` environment variable.
+      3. `~/.gvk_ai/base/Qwen2.5-14B-Instruct-Q4_K_M.gguf` (or any `.gguf` in `~/.gvk_ai/base/`).
+      4. Local repository paths (`base/Qwen2.5-14B-Instruct-Q4_K_M.gguf`, `base/*.gguf`, `base_model.gguf`).
+
+    Args:
+        custom_path: Optional explicit path to a GGUF model file.
+        gvk_home: Optional override for the `~/.gvk_ai` home directory.
+
+    Returns:
+        Absolute path to the first non-empty GGUF model file found, or `None`.
     """
     home_dir = os.path.abspath(gvk_home or os.environ.get("GVK_HOME") or os.path.expanduser("~/.gvk_ai"))
     home_base_dir = os.path.join(home_dir, "base")
@@ -132,7 +138,7 @@ def find_base_model_path(
 
 
 def _normalize_disc_path(raw_path: str) -> str:
-    """Нормалізує шлях до диска (зокрема Windows 'D:' -> 'D:\\' перед abspath)."""
+    """Normalize a disc mount path (e.g., Windows `'D:'` -> `'D:\\'` before `abspath`)."""
     p = os.path.expanduser(raw_path.strip())
     if len(p) == 2 and p[1] == ":" and p[0].isalpha():
         p = p + "\\"
@@ -140,9 +146,13 @@ def _normalize_disc_path(raw_path: str) -> str:
 
 
 def find_gvk_disc_path(explicit_path: Optional[str] = None) -> Optional[str]:
-    """
-    Шукає змонтований оптичний DVD-носій `GVK_VAULT` (або перевіряє переданий шлях).
-    Повертає шлях до кореня диска, де лежить `vault/master.key`, або None.
+    """Locate a mounted `GVK_VAULT` optical disc or USB drive containing `vault/master.key`.
+
+    Args:
+        explicit_path: Optional explicit mount path to check first.
+
+    Returns:
+        Path to the detected media root directory, or `None` if not found.
     """
     candidates: List[str] = []
     if explicit_path:
@@ -154,7 +164,7 @@ def find_gvk_disc_path(explicit_path: Optional[str] = None) -> Optional[str]:
 
     sys_name = platform.system().lower()
     if sys_name == "darwin":
-        # macOS монтує оптичні диски у /Volumes/<VolumeName>
+        # macOS mounts optical and removable volumes under /Volumes/<VolumeName>
         candidates.extend(sorted(glob.glob("/Volumes/GVK_VAULT*")))
         candidates.extend(sorted(glob.glob("/Volumes/*")))
     elif sys_name == "linux":
@@ -187,11 +197,24 @@ def acquire_master_key(
     passphrase: Optional[str] = None,
     allow_short: bool = False,
 ) -> tuple[bytearray, Optional[str]]:
-    """
-    Здобуває 32-байтний master.key:
-      1. Якщо знайдено фізичний диск `GVK_VAULT` з `vault/master.key` — зчитує за 0.01 с.
-      2. Якщо диска немає — переходить у режим ручної деривації ключа Argon2id із фрази.
-    Повертає кортеж: (mutable bytearray ключа для безпечного затирання, шлях_до_master_key_на_диску або None).
+    """Acquire the 32-byte master encryption key from hardware media or passphrase.
+
+    Reads `vault/master.key` directly (~0.01 s) when `GVK_VAULT` media is
+    mounted; otherwise prompts for (or uses) a secret master passphrase and
+    derives the key via Argon2id.
+
+    Args:
+        disc_path: Optional explicit path to mounted `GVK_VAULT` media.
+        passphrase: Optional secret passphrase for headless fallback derivation.
+        allow_short: Allow short passphrases during automated tests.
+
+    Returns:
+        A 2-tuple `(key_buf, key_file_path)` where `key_buf` is a mutable
+        `bytearray` suitable for in-place zero-wiping, and `key_file_path` is
+        the monitored `vault/master.key` path on media (or `None` in passphrase mode).
+
+    Raises:
+        ValueError: If `vault/master.key` on media has an invalid byte length.
     """
     detected_disc = find_gvk_disc_path(disc_path)
     if detected_disc:
@@ -199,40 +222,43 @@ def acquire_master_key(
         with open(key_file, "rb") as f:
             raw_key = f.read()
         if len(raw_key) != KEY_SIZE:
-            raise ValueError(f"Пошкоджений master.key на диску ({len(raw_key)} байтів замість {KEY_SIZE}).")
+            raise ValueError(f"Corrupted master.key on media ({len(raw_key)} bytes instead of {KEY_SIZE}).")
         is_usb = (
             os.path.isdir(os.path.join(detected_disc, "base"))
             or os.path.isdir(os.path.join(detected_disc, "bin"))
             or os.path.isfile(os.path.join(detected_disc, "vault", "media_mode.json"))
         )
         mode_tag = "USB" if is_usb else "DVD"
-        print(f" [✓] Апаратний ключ доступу GVK_VAULT [{mode_tag}] зчитано з носія: {detected_disc}")
+        print(f" [OK] Hardware access key GVK_VAULT [{mode_tag}] read from media: {detected_disc}")
         return bytearray(raw_key), key_file
 
-    # Fallback: Крипто-челендж / Ручне введення секретної майстер-фрази
+    # Fallback: interactive crypto challenge / manual master passphrase entry
     if passphrase is None:
         print("====================================================================")
-        print(" [!] Фізичний носій GVK_VAULT з ключем доступу не знайдено.")
-        print(" [*] Перехід у режим ручної деривації ключа (Argon2id -> AES-256-GCM).")
+        print(" [!] Physical GVK_VAULT media with access key not found.")
+        print(" [*] Falling back to manual key derivation (Argon2id -> AES-256-GCM).")
         print("====================================================================")
-        passphrase = getpass.getpass(" [?] Введіть секретну майстер-фразу для розблокування особистостей -> ")
+        passphrase = getpass.getpass(" [?] Enter secret master passphrase to unlock personas -> ")
 
-    print(" [*] Обчислення 256-бітного ключа через Argon2id (256 МБ ОЗП)...")
+    print(" [*] Deriving 256-bit key via Argon2id (256 MB RAM)...")
     derived = derive_master_key(passphrase, allow_short=allow_short)
     return bytearray(derived), None
 
 
 # =====================================================================
-# 2. КРОСПЛАТФОРМНИЙ МЕНЕДЖЕР RAM-ДИСКА ТА CRYPTO VAULT
+# 2. CROSS-PLATFORM RAM DISK & CRYPTO VAULT MANAGER
 # =====================================================================
 class CryptoVault:
-    """
-    Керує життєвим циклом зашифрованої сесії:
-      - Монтування ізольованого RAM-диска (512–1024 МБ, macOS / Linux / Windows)
-      - Пошук публічної базової моделі на SSD (`~/.gvk_ai/base/`) для підключення через `--mmap`
-      - Потокове дешифрування секретів (LoRA-адаптерів та `payload.tar.enc`) у RAM
-      - Фоновий моніторинг оптичного приводу (Hardware Kill-Switch)
-      - Гарантоване затирання ключів і демонтування RAM-диска при виході
+    """Manage the encrypted runtime session, volatile RAM disk, and Kill-Switch.
+
+    Handles mounting an isolated RAM disk (512-1024 MB across macOS, Linux, and
+    Windows), resolving the public base model on SSD for `--mmap`, streaming
+    AES-256-GCM decryption of persona secrets into RAM, background hardware
+    media monitoring (Kill-Switch), and guaranteed zero-wipe cleanup on exit.
+
+    Example:
+        >>> with CryptoVault(disc_path="/Volumes/GVK_VAULT") as vault:
+        ...     paths = vault.unpack_persona_to_ram("friend_1", adapter_enc, payload_enc)
     """
 
     def __init__(
@@ -270,13 +296,17 @@ class CryptoVault:
         self.cleanup()
 
     def initialize(self) -> str:
-        """Здобуває ключ, монтує RAM-диск і запускає Kill-Switch (якщо сесія з диска)."""
+        """Acquire the master key, mount the RAM disk, and start Kill-Switch if disc-backed.
+
+        Returns:
+            Absolute path to the mounted RAM disk (or isolated session directory).
+        """
         self._master_key, self._monitored_key_path = acquire_master_key(
             disc_path=self.disc_path,
             passphrase=self._initial_passphrase,
             allow_short=self._allow_short,
         )
-        # Одразу видаляємо текстову фразу з пам'яті
+        # Immediately discard the plaintext passphrase reference from memory
         self._initial_passphrase = None
 
         self.mount_point = self.mount_ramdisk(self.ramdisk_mb)
@@ -288,12 +318,19 @@ class CryptoVault:
         return self.mount_point
 
     # -----------------------------------------------------------------
-    # МОНТУВАННЯ RAM-ДИСКА (Linux / macOS / Windows)
+    # RAM DISK MOUNTING (Linux / macOS / Windows)
     # -----------------------------------------------------------------
     def mount_ramdisk(self, size_mb: int) -> str:
-        """
-        Створює ізольований простір в оперативній пам'яті.
-        Жоден файл усередині цього розділу ніколи не записується на фізичний SSD.
+        """Create and mount an isolated volatile storage area in RAM.
+
+        No decrypted file inside this partition is written to persistent SSD
+        storage when native RAM disk support is available.
+
+        Args:
+            size_mb: Requested RAM disk capacity in megabytes.
+
+        Returns:
+            Absolute path to the mounted RAM disk directory (or isolated fallback).
         """
         sys_name = platform.system().lower()
         pid = os.getpid()
@@ -304,12 +341,12 @@ class CryptoVault:
                 mount_dir = os.path.join(shm_base, f"gvk_runtime_{pid}")
                 os.makedirs(mount_dir, mode=0o700, exist_ok=True)
                 os.chmod(mount_dir, 0o700)
-                print(f" [✓] RAM-диск (Linux tmpfs) змонтовано у: {mount_dir}")
+                print(f" [OK] RAM disk (Linux tmpfs) mounted at: {mount_dir}")
                 return mount_dir
 
         elif sys_name == "darwin":
-            # macOS: створюємо блоковий RAM-пристрій через `hdiutil attach -nomount ram://<sectors>`
-            # 1 сектор = 512 байтів -> size_mb * 2048 секторів
+            # macOS: allocate an in-memory block device via `hdiutil attach -nomount ram://<sectors>`
+            # 1 sector = 512 bytes -> size_mb * 2048 sectors
             sectors = max(32768, int(size_mb * 2048))
             vol_name = f"GVK_RAM_{pid}"
             try:
@@ -325,7 +362,7 @@ class CryptoVault:
                     mount_dir = os.path.join(tempfile.gettempdir(), f"gvk_ram_{pid}")
                     os.makedirs(mount_dir, mode=0o700, exist_ok=True)
 
-                    # Форматуємо блоковий пристрій у швидку файлову систему HFS+ і монтуємо в приватну папку
+                    # Format block device as HFS+ and mount into a private 0700 directory
                     subprocess.run(
                         ["newfs_hfs", "-v", vol_name, device],
                         check=True,
@@ -339,17 +376,17 @@ class CryptoVault:
                         stderr=subprocess.DEVNULL,
                     )
 
-                    # Забороняємо індексацію Spotlight
+                    # Disable macOS Spotlight indexing on the RAM volume
                     open(os.path.join(mount_dir, ".metadata_never_index"), "wb").close()
                     subprocess.run(
                         ["mdutil", "-i", "off", mount_dir],
                         stdout=subprocess.DEVNULL,
                         stderr=subprocess.DEVNULL,
                     )
-                    print(f" [✓] RAM-диск (macOS {size_mb} МБ, пристрій {device}) змонтовано у: {mount_dir}")
+                    print(f" [OK] RAM disk (macOS {size_mb} MB, device {device}) mounted at: {mount_dir}")
                     return mount_dir
             except Exception as exc:
-                # Якщо процес запущено у пісочниці без доступу до hdiutil, використовуємо захищений буфер у пам'яті
+                # Fall back to an isolated session directory if sandboxed without hdiutil access
                 if self._macos_device:
                     subprocess.run(
                         ["hdiutil", "detach", self._macos_device, "-force"],
@@ -357,10 +394,10 @@ class CryptoVault:
                         stderr=subprocess.DEVNULL,
                     )
                     self._macos_device = None
-                print(f" [!] Примітка: апаратний hdiutil недоступний ({exc}); активовано ізольований сесійний буфер.")
+                print(f" [!] Note: hardware hdiutil unavailable ({exc}); activated isolated session buffer.")
 
         elif sys_name == "windows":
-            # Спроба створити віртуальний RAM-диск через ImDisk (якщо встановлений у системі)
+            # Attempt to create a virtual RAM drive via ImDisk when installed
             if shutil.which("imdisk"):
                 for letter in "ZYXWVUTSRQ":
                     drive = f"{letter}:"
@@ -375,39 +412,47 @@ class CryptoVault:
                             self._windows_imdisk_drive = drive
                             mount_dir = f"{drive}\\gvk_runtime_{pid}"
                             os.makedirs(mount_dir, exist_ok=True)
-                            print(f" [✓] RAM-диск (Windows ImDisk {size_mb} МБ) змонтовано у: {mount_dir}")
+                            print(f" [OK] RAM disk (Windows ImDisk {size_mb} MB) mounted at: {mount_dir}")
                             return mount_dir
                         except Exception:
                             break
 
-        # Універсальний ізольований фолбек (з правами 0700 та примусовим криптографічним затиранням 0x00)
+        # Universal isolated fallback (mode 0700 with forced 0x00 zero-wipe on cleanup)
         fallback_dir = tempfile.mkdtemp(prefix=f"gvk_ram_session_{pid}_")
         os.chmod(fallback_dir, 0o700)
         try:
             open(os.path.join(fallback_dir, ".metadata_never_index"), "wb").close()
         except OSError:
             pass
-        print(f" [✓] Ізольований сесійний простір створено у: {fallback_dir}")
+        print(f" [OK] Isolated session directory created at: {fallback_dir}")
         return fallback_dir
 
     # -----------------------------------------------------------------
-    # ДЕШИФРУВАННЯ КОНТЕЙНЕРІВ У RAM-ДИСК
+    # STREAMING CONTAINER DECRYPTION TO RAM DISK
     # -----------------------------------------------------------------
     def _require_key(self) -> bytes:
         if not self._master_key or len(self._master_key) != KEY_SIZE:
-            raise RuntimeError("CryptoVault не ініціалізовано або ключ вже затерто!")
+            raise RuntimeError("CryptoVault is not initialized or master key has already been wiped!")
         return bytes(self._master_key)
 
     def decrypt_container_to_ram(self, enc_file_path: str, relative_ram_path: str) -> str:
-        """
-        Потоково розшифровує `.enc` контейнер (наприклад, `base_model.gguf.enc` або `adapter.gguf.enc`)
-        чанками по 64 МБ прямо у змонтований RAM-диск.
-        Повертає абсолютний шлях до розшифрованого файлу в RAM.
+        """Stream-decrypt an `.enc` container in 64 MB chunks directly into the RAM disk.
+
+        Args:
+            enc_file_path: Path to the encrypted `.enc` container (e.g., `adapter.gguf.enc`).
+            relative_ram_path: Relative destination path inside `self.mount_point`.
+
+        Returns:
+            Absolute path to the decrypted file inside the RAM disk.
+
+        Raises:
+            RuntimeError: If the RAM disk is not mounted or the vault is uninitialized.
+            FileNotFoundError: If `enc_file_path` does not exist.
         """
         if not self.mount_point:
-            raise RuntimeError("RAM-диск не змонтовано!")
+            raise RuntimeError("RAM disk is not mounted!")
         if not os.path.isfile(enc_file_path):
-            raise FileNotFoundError(f"Зашифрований контейнер не знайдено: {enc_file_path}")
+            raise FileNotFoundError(f"Encrypted container not found: {enc_file_path}")
 
         key = self._require_key()
         dst_path = os.path.join(self.mount_point, relative_ram_path.lstrip("/\\"))
@@ -415,20 +460,29 @@ class CryptoVault:
 
         with open(enc_file_path, "rb") as f_in, open(dst_path, "wb") as f_out:
             os.chmod(dst_path, 0o600)
-            decrypt_stream(f_in, f_out, master_key=key, label=f"Дешифрування {os.path.basename(enc_file_path)}")
+            decrypt_stream(f_in, f_out, master_key=key, label=f"Decrypting {os.path.basename(enc_file_path)}")
 
         return dst_path
 
     def unpack_persona_to_ram(self, persona_id: str, adapter_enc_path: str, payload_enc_path: str) -> dict:
-        """
-        Розшифровує LoRA-адаптер (`adapter.gguf.enc`) та архів особистості (`payload.tar.enc`)
-        конкретного учасника прямо у RAM-диск.
-        Повертає словник зі шляхами в RAM:
-          - adapter_path: <ram>/adapters/<persona_id>.gguf
-          - persona_dir:  <ram>/personas/<persona_id>/
+        """Decrypt a persona's LoRA adapter and payload archive directly into the RAM disk.
+
+        Args:
+            persona_id: Target persona identifier (e.g., `"friend_1"`).
+            adapter_enc_path: Path to encrypted `adapter.gguf.enc`.
+            payload_enc_path: Path to encrypted `payload.tar.enc`.
+
+        Returns:
+            Dictionary containing RAM paths:
+            - `persona_id`: Persona identifier.
+            - `adapter_path`: `<ram>/adapters/<persona_id>.gguf`.
+            - `persona_dir`: `<ram>/personas/<persona_id>/`.
+
+        Raises:
+            RuntimeError: If the RAM disk is not mounted.
         """
         if not self.mount_point:
-            raise RuntimeError("RAM-диск не змонтовано!")
+            raise RuntimeError("RAM disk is not mounted!")
 
         key = self._require_key()
         adapter_ram_path = self.decrypt_container_to_ram(
@@ -446,7 +500,15 @@ class CryptoVault:
         }
 
     def verify_persona_signature(self, persona_id: str, sig_file_path: str) -> bool:
-        """Перевіряє оригінальність файлу підпису `origin.sig` для вказаного `persona_id`."""
+        """Verify the HMAC `origin.sig` signature for `persona_id`.
+
+        Args:
+            persona_id: Persona identifier bound to the signature.
+            sig_file_path: Path to the 32-byte `.sig` file.
+
+        Returns:
+            `True` if the signature exists, has valid length, and matches the master key.
+        """
         if not os.path.isfile(sig_file_path):
             return False
         with open(sig_file_path, "rb") as f:
@@ -456,14 +518,14 @@ class CryptoVault:
         return verify_origin_sig(persona_id, self._require_key(), sig_bytes)
 
     def resolve_base_model_path(self, custom_path: Optional[str] = None) -> Optional[str]:
-        """Повертає шлях до публічної базової 14B GGUF моделі для запуску llama-server з `--mmap`."""
+        """Resolve the path to the public 14B base GGUF model for `llama-server --mmap`."""
         return find_base_model_path(custom_path=custom_path)
 
     # -----------------------------------------------------------------
-    # HARDWARE KILL-SWITCH (ФОНОВИЙ ДЕМОН МОНІТОРИНГУ НОСІЯ)
+    # HARDWARE KILL-SWITCH (BACKGROUND MEDIA MONITOR DAEMON)
     # -----------------------------------------------------------------
     def register_process_for_kill_switch(self, pid: int) -> None:
-        """Реєструє PID процесу (наприклад, `llama-server`) для миттєвого знищення при вийманні диска."""
+        """Register a child process PID (e.g., `llama-server`) for immediate termination on media removal."""
         if pid and pid not in self._protected_pids:
             self._protected_pids.append(pid)
 
@@ -472,9 +534,12 @@ class CryptoVault:
         interval_sec: float = KILL_SWITCH_INTERVAL_SEC,
         on_trigger_callback: Optional[Callable[[], None]] = None,
     ) -> None:
-        """
-        Запускає фоновий потік-охоронець, який кожні `interval_sec` секунд
-        перевіряє фізичну наявність `vault/master.key` на оптичному приводі.
+        """Start the background watchdog thread polling `vault/master.key` on media.
+
+        Args:
+            interval_sec: Polling interval in seconds (default 3.0 s).
+            on_trigger_callback: Optional callback invoked instead of `os._exit(137)`
+                when the Kill-Switch triggers (primarily for automated tests).
         """
         if not self._monitored_key_path or self._kill_switch_thread is not None:
             return
@@ -505,19 +570,20 @@ class CryptoVault:
             return False
 
     def _trigger_emergency_purge(self, callback: Optional[Callable[[], None]] = None) -> None:
-        """
-        АВАРІЙНЕ СКИДАННЯ (Kill-Switch):
-        Викликається миттєво при вийманні DVD-диска або клацанні тумблера GVK-DOCK.
+        """Execute an emergency Kill-Switch purge when GVK_VAULT media is disconnected.
+
+        Terminates registered subprocesses (`SIGKILL`), zero-wipes the master key
+        and RAM disk, and exits with status 137 unless `callback` is provided.
         """
         sys.stderr.write(
             "\n\n====================================================================\n"
-            " [!!!] EMERGENCY RAM PURGE: ВТРАЧЕНО ЗВ'ЯЗОК ІЗ НОСІЄМ GVK_VAULT!\n"
-            " [!!!] Зупинка llama-server та екстрене знищення даних у RAM...\n"
+            " [!] EMERGENCY RAM PURGE: LOST CONNECTION TO GVK_VAULT MEDIA!\n"
+            " [!] Stopping llama-server and urgently wiping RAM data...\n"
             "====================================================================\n"
         )
         sys.stderr.flush()
 
-        # 1. Миттєвий SIGKILL для всіх зареєстрованих підпроцесів (llama-server)
+        # 1. Immediate SIGKILL for all registered child processes (e.g., llama-server)
         had_pids = bool(self._protected_pids)
         for pid in list(self._protected_pids):
             try:
@@ -527,25 +593,25 @@ class CryptoVault:
         if had_pids:
             time.sleep(0.25)
 
-        # 2. Занулення ключа та демонтування RAM-диска
+        # 2. Zero-wipe master key and unmount the RAM disk
         self.cleanup()
 
         if callback:
             callback()
             return
 
-        # Примусовий негайний вихід із кодом 137 (SIGKILL)
+        # Force immediate process exit with code 137 (SIGKILL)
         os._exit(137)
 
     # -----------------------------------------------------------------
-    # БЕЗПЕЧНЕ ЗАТИРАННЯ ПАМ'ЯТІ ТА ДЕМОНТУВАННЯ RAM-ДИСКА
+    # SECURE MEMORY ZERO-WIPE & RAM DISK UNMOUNTING
     # -----------------------------------------------------------------
     @staticmethod
     def _zero_wipe_directory(directory: str) -> None:
-        """Перезаписує всі файли в директорії нульовими байтами (0x00) перед видаленням."""
+        """Overwrite all files inside `directory` with zero bytes (`0x00`) before deletion."""
         if not directory or not os.path.isdir(directory):
             return
-        zero_buf = b"\x00" * (1024 * 1024)  # 1 МБ блок нулів
+        zero_buf = b"\x00" * (1024 * 1024)  # 1 MB zero buffer
         for root, dirs, files in os.walk(directory, topdown=False):
             for fname in files:
                 fpath = os.path.join(root, fname)
@@ -575,11 +641,11 @@ class CryptoVault:
                     pass
 
     def cleanup(self) -> None:
-        """
-        Безпечно завершує сесію:
-          1. Зупиняє потік Kill-Switch.
-          2. По-байтово затирає `master_key` у пам'яті Python нулями (`0x00`).
-          3. Затирає всі розшифровані файли в RAM-диску і демонтує пристрій.
+        """Safely tear down the vault session.
+
+        Stops the Kill-Switch thread, overwrites `master_key` in memory with
+        zero bytes (`0x00`), zero-wipes all decrypted files on the RAM disk,
+        and detaches/removes the RAM disk mount point.
         """
         with self._cleanup_lock:
             if self._is_cleaned_up:
@@ -588,13 +654,13 @@ class CryptoVault:
 
             self._kill_switch_stop.set()
 
-            # 1. Занулення master_key в ОЗП
+            # 1. Zero-wipe master_key in RAM
             if self._master_key is not None:
                 for i in range(len(self._master_key)):
                     self._master_key[i] = 0
                 self._master_key = None
 
-            # 2. Очищення та демонтування RAM-диска
+            # 2. Zero-wipe and unmount the RAM disk
             if self.mount_point and os.path.exists(self.mount_point):
                 self._zero_wipe_directory(self.mount_point)
 
@@ -624,34 +690,40 @@ class CryptoVault:
                 except OSError:
                     pass
 
-                print(f" [✓] RAM-диск очищено нулями та демонтовано: {self.mount_point}")
+                print(f" [OK] RAM disk zero-wiped and unmounted: {self.mount_point}")
                 self.mount_point = None
 
 
 # =====================================================================
-# 3. АВТОМАТИЧНИЙ ТЕСТ MILESTONE 1 (ШИФРУВАННЯ -> RAM-ДИСК -> KILL-SWITCH)
+# 3. AUTOMATED MILESTONE 1 SELF-TEST (ENCRYPT -> RAM DISK -> KILL-SWITCH)
 # =====================================================================
 def run_milestone1_self_test() -> None:
+    """Run the Milestone 1 end-to-end security self-test.
+
+    Simulates an inserted `GVK_VAULT` disc, encrypts a test LoRA adapter and
+    persona payload, mounts a RAM disk, verifies signature and streaming
+    decryption, and confirms that removing `master.key` triggers the Kill-Switch.
+    """
     print("====================================================================")
-    print(" [*] GVK Private AI — Тест Milestone 1 (core/crypto_vault.py)")
+    print(" [*] GVK Private AI - Milestone 1 Self-Test (core/crypto_vault.py)")
     print("====================================================================")
 
     with tempfile.TemporaryDirectory(prefix="gvk_sim_disc_") as sim_disc_dir:
-        # 1. Імітуємо вставлений DVD-диск GVK_VAULT у дисководі
+        # 1. Simulate an inserted GVK_VAULT DVD disc
         vault_dir = os.path.join(sim_disc_dir, "vault")
         persona_src = os.path.join(sim_disc_dir, "src_friend_1")
         os.makedirs(vault_dir, exist_ok=True)
         os.makedirs(os.path.join(persona_src, "portraits"), exist_ok=True)
 
-        print(" [1/5] Деривація ключа Argon2id та імітація DVD-диска GVK_VAULT...")
+        print(" [1/5] Deriving Argon2id key and simulating GVK_VAULT DVD media...")
         key = derive_master_key("GVK_Milestone_1_Verification_Phrase_2026!")
         key_file_path = os.path.join(vault_dir, "master.key")
         with open(key_file_path, "wb") as f:
             f.write(key)
 
-        # Створюємо тестовий LoRA-адаптер та приватний архів особистості з емоціями
+        # Create a synthetic LoRA adapter and private persona archive with emotion sprites
         raw_adapter = os.path.join(sim_disc_dir, "raw_adapter.gguf")
-        fake_gguf_bytes = b"GGUF" + os.urandom(512 * 1024)  # 512 КБ тестових ваг
+        fake_gguf_bytes = b"GGUF" + os.urandom(512 * 1024)  # 512 KB synthetic weights
         with open(raw_adapter, "wb") as f:
             f.write(fake_gguf_bytes)
 
@@ -663,8 +735,8 @@ def run_milestone1_self_test() -> None:
             with open(os.path.join(persona_src, "portraits", f"{mood}.txt"), "w", encoding="utf-8") as f:
                 f.write(f"[ASCII SPRITE: {mood.upper()}]\n")
 
-        # 2. Шифруємо контейнери
-        print(" [2/5] Шифрування тестових контейнерів adapter.gguf.enc та payload.tar.enc...")
+        # 2. Encrypt containers
+        print(" [2/5] Encrypting test containers adapter.gguf.enc and payload.tar.enc...")
         adapter_enc = os.path.join(sim_disc_dir, "adapter.gguf.enc")
         payload_enc = os.path.join(sim_disc_dir, "payload.tar.enc")
         sig_path = os.path.join(sim_disc_dir, "origin.sig")
@@ -675,50 +747,51 @@ def run_milestone1_self_test() -> None:
         with open(sig_path, "wb") as f:
             f.write(generate_origin_sig("friend_1", key))
 
-        # 3. Монтуємо RAM-диск (64 МБ для швидкого тесту) і розпаковуємо напряму в RAM
-        print(" [3/5] Ініціалізація CryptoVault та монтування RAM-диска...")
+        # 3. Mount RAM disk (64 MB for fast test) and unpack directly into RAM
+        print(" [3/5] Initializing CryptoVault and mounting RAM disk...")
         vault = CryptoVault(disc_path=sim_disc_dir, ramdisk_mb=64)
         ram_root = vault.initialize()
 
         assert vault.verify_persona_signature("friend_1", sig_path) is True
-        print(" [4/5] Розшифрування контейнерів напряму в RAM-диск...")
+        print(" [4/5] Decrypting containers directly into RAM disk...")
         unpacked = vault.unpack_persona_to_ram("friend_1", adapter_enc, payload_enc)
 
         with open(unpacked["adapter_path"], "rb") as f:
             assert f.read() == fake_gguf_bytes
         for mood in ("мовчить", "говорить_спокійно", "подив", "сміх"):
             sprite_file = os.path.join(unpacked["persona_dir"], "portraits", f"{mood}.txt")
-            assert os.path.isfile(sprite_file), f"Не знайдено спрайт у RAM: {sprite_file}"
+            assert os.path.isfile(sprite_file), f"Sprite file not found in RAM: {sprite_file}"
 
-        print(f"       [OK] Адаптер та 4 ASCII-спрайти емоцій успішно розпаковано в ОЗП: {unpacked['persona_dir']}")
+        print(f"       [OK] Adapter and 4 ASCII emotion sprites unpacked into RAM: {unpacked['persona_dir']}")
 
-        # 4. Тестуємо спрацювання Kill-Switch при вийманні диска (або клацанні тумблера)
-        print(" [5/5] Тестування демона Kill-Switch (імітація виймання DVD-диска)...")
+        # 4. Verify Kill-Switch activation when media is removed (or toggle switch tripped)
+        print(" [5/5] Testing Kill-Switch daemon (simulating DVD removal)...")
         triggered_event = threading.Event()
-        vault._kill_switch_stop.set()  # Зупиняємо стандартний 3-секундний потік, щоб запустити швидкий 0.2с тест
+        vault._kill_switch_stop.set()  # Stop default 3 s loop to run a fast 0.2 s test
         vault._kill_switch_thread = None
         vault.start_kill_switch(interval_sec=0.2, on_trigger_callback=lambda: triggered_event.set())
 
-        # Видаляємо master.key з імітованого диска (ніби користувач висмикнув диск або клацнув тумблер)
+        # Remove master.key from simulated disc to simulate media ejection
         os.remove(key_file_path)
-        assert triggered_event.wait(timeout=2.0), "Kill-Switch не спрацював після видалення ключа!"
+        assert triggered_event.wait(timeout=2.0), "Kill-Switch did not trigger after key removal!"
         assert vault.mount_point is None or not os.path.exists(ram_root)
         assert vault._master_key is None
-        print("       [OK] Kill-Switch миттєво виявив відсутність носія та знищив RAM-диск!")
+        print("       [OK] Kill-Switch detected missing media and purged the RAM disk!")
 
     print("====================================================================")
-    print(" [✓] MILESTONE 1 ПРОЙДЕНО УСПІШНО!")
+    print(" [OK] MILESTONE 1 PASSED SUCCESSFULLY!")
     print("====================================================================")
 
 
 def main() -> None:
+    """Parse CLI arguments and run CryptoVault commands."""
     parser = argparse.ArgumentParser(
-        description="GVK Private AI — Крипто-сховище, RAM-диск та Kill-Switch (core/crypto_vault.py)"
+        description="GVK Private AI - Crypto Vault, RAM Disk & Kill-Switch (core/crypto_vault.py)"
     )
     sub = parser.add_subparsers(dest="cmd", required=True)
     sub.add_parser(
         "self-test",
-        help="Виконати перевірку Milestone 1 (шифрування -> монтування RAM-диска -> дешифрування -> Kill-Switch)",
+        help="Run Milestone 1 verification (encrypt -> mount RAM disk -> decrypt -> Kill-Switch)",
     )
     args = parser.parse_args()
 

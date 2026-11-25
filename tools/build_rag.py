@@ -1,22 +1,21 @@
 #!/usr/bin/env python3
 """
-GVK Private AI — Генератор векторної бази пам'яті (tools/build_rag.py)
+GVK Private AI - RAG Memory Index Builder (tools/build_rag.py)
 
-Компілює текстовий файл спогадів (`memories.txt`, `.md`, `.json`, `.jsonl`)
-у векторний індекс `memory.faiss` (і супровідний `memories.json`) для
-подальшого пакування в `payload.tar.enc` через `tools/disc_packer.py`.
+Compiles a structured memory source file (`.txt`, `.md`, `.json`, or `.jsonl`) into
+a FAISS vector index (`memory.faiss`) and accompanying `memories.json` metadata for
+packaging into `payload.tar.enc` via `tools/disc_packer.py`.
 
-Приклади запуску:
-  # Пряма збірка (найзручніше):
+Key Responsibilities:
+  - Resolve target output paths whether given a directory or an explicit `.faiss` file.
+  - Delegate embedding and index generation to `core.memory_rag.build_rag_index`.
+  - Optionally run a post-build smoke query against the freshly compiled index.
+  - Expose an offline `self-test` subcommand for verifying the RAG pipeline.
+
+Usage:
   python3 tools/build_rag.py --input memories.txt --output raw/friend_1_data/memory.faiss
-
-  # Збірка у папку + миттєва перевірка пошуком:
-  python3 tools/build_rag.py -i memories.txt -o raw/friend_1_data/ --test-query "тестовий запит до пам'яті"
-
-  # Через підкоманду build:
+  python3 tools/build_rag.py -i memories.txt -o raw/friend_1_data/ --test-query "test memory query"
   python3 tools/build_rag.py build -i memories.txt -o raw/friend_1_data/memory.faiss
-
-  # Автономна перевірка:
   python3 tools/build_rag.py self-test
 """
 
@@ -37,8 +36,21 @@ from core.memory_rag import (
 )
 
 
+# =====================================================================
+# PATH & FORMATTING HELPERS
+# =====================================================================
 def _resolve_output_faiss_path(output_arg: str) -> str:
-    """Якщо передано папку (існуючу або зі слешем у кінці), додає `memory.faiss`."""
+    """Resolve the destination `memory.faiss` path from a file or directory argument.
+
+    If `output_arg` points to an existing directory, ends with a path separator, or has
+    no file extension, `memory.faiss` is appended automatically.
+
+    Args:
+        output_arg: CLI `--output` path value.
+
+    Returns:
+        Resolved path ending in a target `.faiss` filename.
+    """
     if output_arg.endswith(("/", "\\")) or os.path.isdir(output_arg):
         return os.path.join(output_arg, "memory.faiss")
     if not os.path.splitext(output_arg)[1]:
@@ -47,6 +59,14 @@ def _resolve_output_faiss_path(output_arg: str) -> str:
 
 
 def _format_size(num_bytes: int) -> str:
+    """Format a byte count as a human-readable string (B, KB, or MB).
+
+    Args:
+        num_bytes: Size in bytes.
+
+    Returns:
+        Formatted size string.
+    """
     if num_bytes < 1024:
         return f"{num_bytes} B"
     if num_bytes < 1024 * 1024:
@@ -54,14 +74,22 @@ def _format_size(num_bytes: int) -> str:
     return f"{num_bytes / (1024 * 1024):.2f} MB"
 
 
+# =====================================================================
+# BUILD EXECUTION & CLI
+# =====================================================================
 def _run_build(args: argparse.Namespace) -> None:
+    """Compile the RAG index from parsed CLI arguments and optionally run a test query.
+
+    Args:
+        args: Parsed namespace from `_build_args_parser`.
+    """
     output_faiss = _resolve_output_faiss_path(args.output)
-    print("====================================================================")
-    print(" [*] GVK Private AI — RAG Builder (tools/build_rag.py)")
-    print("====================================================================")
-    print(f" Вхідний файл : {os.path.abspath(args.input)}")
-    print(f" Вихідний індекс: {os.path.abspath(output_faiss)}")
-    print(f" Модель       : {args.model} (backend={args.backend})")
+    print("=====================================================================")
+    print(" [*] GVK Private AI - RAG Builder (tools/build_rag.py)")
+    print("=====================================================================")
+    print(f" Input file    : {os.path.abspath(args.input)}")
+    print(f" Output index  : {os.path.abspath(output_faiss)}")
+    print(f" Embedding     : {args.model} (backend={args.backend})")
 
     stats = build_rag_index(
         input_path=args.input,
@@ -70,79 +98,98 @@ def _run_build(args: argparse.Namespace) -> None:
         backend=args.backend,
     )
 
-    print("--------------------------------------------------------------------")
-    print(f" [✓] Спогадів оброблено : {stats['count']}")
-    print(f" [✓] Активний бекенд    : {stats['backend']}")
-    print(f" [✓] Формат індексу     : {stats['index_format']} (dim={stats['dimension']})")
-    print(f" [✓] memory.faiss       : {stats['faiss_path']} ({_format_size(stats['faiss_bytes'])})")
-    print(f" [✓] memories.json      : {stats['memories_json_path']} ({_format_size(stats['json_bytes'])})")
+    print("---------------------------------------------------------------------")
+    print(f" [OK] Memories indexed : {stats['count']}")
+    print(f" [OK] Active backend   : {stats['backend']}")
+    print(f" [OK] Index format     : {stats['index_format']} (dim={stats['dimension']})")
+    print(f" [OK] memory.faiss     : {stats['faiss_path']} ({_format_size(stats['faiss_bytes'])})")
+    print(f" [OK] memories.json    : {stats['memories_json_path']} ({_format_size(stats['json_bytes'])})")
 
     if stats["backend"] == "ngram" and args.backend == "auto":
         print(
-            "\n [i] Примітка: використано легкий офлайн-енкодер `ngram`, бо пакет "
-            "`sentence-transformers` недоступний або модель не завантажена."
+            "\n [*] Note: Fell back to the lightweight offline `ngram` encoder because "
+            "`sentence-transformers` is unavailable or the model is not cached locally."
         )
 
     if args.test_query:
-        print("\n--------------------------------------------------------------------")
-        print(f" [?] Тестовий запит: {args.test_query!r}")
+        print("\n---------------------------------------------------------------------")
+        print(f" [*] Test query: {args.test_query!r}")
         rag = MemoryRAG(stats["faiss_path"])
         hits = rag.search(args.test_query, top_k=3)
         if not hits:
-            print(" [!] Збігів вище порогу релевантності не знайдено.")
+            print(" [!] No matches found above the relevance threshold.")
         else:
             for i, hit in enumerate(hits, 1):
                 print(f"   #{i} (score={hit['score']:.4f} | {hit['category']}): {hit['text']}")
 
-    print("====================================================================")
+    print("=====================================================================")
 
 
 def _build_args_parser(prog: str) -> argparse.ArgumentParser:
+    """Create the argument parser for building a RAG memory index.
+
+    Args:
+        prog: Program name displayed in CLI usage output.
+
+    Returns:
+        Configured `argparse.ArgumentParser` instance.
+    """
     parser = argparse.ArgumentParser(
         prog=prog,
-        description="GVK Private AI — Збірка векторного індексу memory.faiss зі спогадів",
+        description="GVK Private AI - Build a memory.faiss vector index from persona memories",
     )
     parser.add_argument(
         "-i",
         "--input",
         required=True,
-        help="Шлях до вхідного файлу зі спогадами (.txt, .md, .json, .jsonl)",
+        help="Path to the source memories file (.txt, .md, .json, .jsonl)",
     )
     parser.add_argument(
         "-o",
         "--output",
         required=True,
-        help="Шлях до вихідного файлу memory.faiss або папки персонажа",
+        help="Destination path for memory.faiss or a persona data directory",
     )
     parser.add_argument(
         "--model",
         default=DEFAULT_EMBEDDING_MODEL,
-        help=f"Назва моделі ембедінгів (за замовчуванням: {DEFAULT_EMBEDDING_MODEL})",
+        help=f"Embedding model name (default: {DEFAULT_EMBEDDING_MODEL})",
     )
     parser.add_argument(
         "--backend",
         choices=("auto", "sentence-transformers", "ngram"),
         default="auto",
-        help="Бекенд векторизації (auto — спроба sentence-transformers із фолбеком на ngram)",
+        help="Vectorization backend ('auto' tries sentence-transformers with an ngram fallback)",
     )
     parser.add_argument(
         "--test-query",
         default=None,
-        help="Опціональний тестовий запит для перевірки пошуку одразу після збірки",
+        help="Optional query to run against the built index for immediate verification",
     )
     return parser
 
 
 def main(argv: Optional[List[str]] = None) -> None:
+    """Entry point for the RAG index builder CLI.
+
+    Supports direct invocation (`build_rag.py -i ... -o ...`), the explicit `build`
+    subcommand, and the offline `self-test` subcommand.
+
+    Args:
+        argv: Optional list of CLI arguments (defaults to `sys.argv[1:]`).
+    """
     raw_argv = list(sys.argv[1:] if argv is None else argv)
 
     if raw_argv and raw_argv[0] == "self-test":
-        p_test = argparse.ArgumentParser(prog="build_rag.py self-test")
+        p_test = argparse.ArgumentParser(
+            prog="build_rag.py self-test",
+            description="GVK Private AI - Offline self-test for RAG index building",
+        )
         p_test.add_argument(
             "--backend",
             choices=("auto", "sentence-transformers", "ngram"),
             default="ngram",
-            help="Бекенд ембедінгів для self-test",
+            help="Embedding backend to use for self-test (default: ngram)",
         )
         test_args = p_test.parse_args(raw_argv[1:])
         run_self_test(backend=test_args.backend)

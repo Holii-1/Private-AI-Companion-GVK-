@@ -1,7 +1,15 @@
 @echo off
 REM =====================================================================
-REM GVK Private AI — Універсальний Zero-Install лаунчер (Windows)
-REM Працює з локального репо або з DVD GVK_VAULT (навіть без Git та Python).
+REM GVK Private AI - Universal Zero-Install Launcher (run.bat)
+REM
+REM Runs from a local repository clone or a GVK_VAULT DVD/USB media
+REM on Windows (no pre-installed Git or Python required).
+REM
+REM Usage:
+REM   run.bat
+REM   run.bat --fast
+REM   run.bat status
+REM   run.bat self-test
 REM =====================================================================
 chcp 65001 >nul 2>&1
 setlocal EnableExtensions
@@ -26,7 +34,7 @@ if not exist "%SCRIPT_DIR%\updater.py" goto :dvd_mode
 
 set "REPO_DIR=%SCRIPT_DIR%"
 echo ====================================================================
-echo  [*] GVK Private AI — Local Launch: %REPO_DIR%
+echo  [*] GVK Private AI - Local Launch: %REPO_DIR%
 echo ====================================================================
 if exist "%SCRIPT_DIR%\persona\manifest.json" set "DISC_PATH=%SCRIPT_DIR%"
 if /I "%CMD_NAME%"=="self-test" goto :resolve_py
@@ -115,19 +123,19 @@ goto :resolve_py
 if exist "%REPO_TMP%" rmdir /S /Q "%REPO_TMP%" >nul 2>&1
 if exist "%REPO_ARCHIVE%" del /F /Q "%REPO_ARCHIVE%" >nul 2>&1
 if exist "%REPO_DIR%\core\main.py" (
-    echo  [!] Offline — using cached GVK core: %REPO_DIR%
+    echo  [!] Offline - using cached GVK core: %REPO_DIR%
     goto :resolve_py
 )
-echo  [X] Error: failed to download GVK core from GitHub. Internet is required on first launch.
+echo  [!] Error: failed to download GVK core from GitHub. Internet is required on first launch.
 call :fail 1
 exit /b 1
 
 :repo_no_tools
 if exist "%REPO_DIR%\core\main.py" (
-    echo  [!] Offline / no git or curl — using cached GVK core.
+    echo  [!] Offline / no git or curl - using cached GVK core.
     goto :resolve_py
 )
-echo  [X] Error: neither git nor curl.exe/tar.exe found. Install Git for Windows and retry.
+echo  [!] Error: neither git nor curl.exe/tar.exe found. Install Git for Windows and retry.
 call :fail 1
 exit /b 1
 
@@ -192,7 +200,7 @@ if defined USB_PY_ARCHIVE (
 where curl.exe >nul 2>&1
 if errorlevel 1 goto :py_missing
 
-echo  [*] Python 3.10+ ^(with Tkinter^) not found — downloading portable Python 3.12 ^(~35 MB^)...
+echo  [*] Python 3.10+ ^(with Tkinter^) not found - downloading portable Python 3.12 ^(~35 MB^)...
 curl.exe -fSL --retry 2 --connect-timeout 15 -o "%PY_ARCHIVE%" "%PORTABLE_PY_URL%"
 if errorlevel 1 goto :py_dl_failed
 
@@ -221,7 +229,7 @@ if exist "%PY_TMP%" rmdir /S /Q "%PY_TMP%" >nul 2>&1
 if exist "%PY_ARCHIVE%" del /F /Q "%PY_ARCHIVE%" >nul 2>&1
 
 :py_missing
-echo  [X] Error: Python 3.10+ not found and portable download failed. Check internet or install Python 3.12 from python.org.
+echo  [!] Error: Python 3.10+ not found and portable download failed. Check internet or install Python 3.12 from python.org.
 call :fail 1
 exit /b 1
 

@@ -1,7 +1,15 @@
 #!/usr/bin/env bash
 # =====================================================================
-# GVK Private AI — Універсальний Zero-Install лаунчер (macOS / Linux)
-# Працює з локального репо або з DVD GVK_VAULT (навіть без Git та Python).
+# GVK Private AI - Universal Zero-Install Launcher (run.sh)
+#
+# Runs from a local repository clone or a GVK_VAULT DVD/USB media
+# on macOS and Linux (no pre-installed Git or Python required).
+#
+# Usage:
+#   ./run.sh
+#   ./run.sh --fast
+#   ./run.sh status
+#   ./run.sh self-test
 # =====================================================================
 set -e
 
@@ -22,7 +30,7 @@ DISC_ARGS=()
 
 has_real_git() {
     if [ "$(uname -s)" = "Darwin" ]; then
-        # На чистій macOS /usr/bin/git — заглушка, що відкриває вікно Xcode CLT
+        # On a fresh macOS install, /usr/bin/git is a stub that triggers the Xcode CLT dialog
         xcode-select -p >/dev/null 2>&1 || return 1
     fi
     command -v git >/dev/null 2>&1
@@ -44,7 +52,7 @@ seed_repo_from_disc_bundle() {
         mkdir -p "${target_dir}"
         cp -R "${SCRIPT_DIR}/core_bundle/." "${target_dir}/"
         chmod -R u+w "${target_dir}" 2>/dev/null || true
-        echo " [OK] Локальне ядро з DVD (core_bundle) розгорнуто у: ${target_dir}"
+        echo " [OK] Seeded local GVK core from media (core_bundle) to: ${target_dir}"
         return 0
     fi
     return 1
@@ -55,43 +63,43 @@ sync_repo_via_tarball() {
     local tmp_dir archive extracted
     if ! command -v curl >/dev/null 2>&1 || ! command -v tar >/dev/null 2>&1; then
         if [ -f "${target_dir}/core/main.py" ]; then
-            echo " [!] curl/tar недоступні — використовуємо локальну копію ядра."
+            echo " [!] curl/tar unavailable - using cached local GVK core."
             return 0
         fi
-        echo " [X] Помилка: не знайдено git або curl+tar для завантаження ядра." >&2
+        echo " [!] Error: neither git nor curl+tar found to download GVK core." >&2
         return 1
     fi
 
     tmp_dir="$(mktemp -d "${GVK_HOME}/repo_dl_XXXXXX")"
     archive="${tmp_dir}/repo.tar.gz"
-    echo " [*] Завантаження ядра GVK Private AI (без git)..."
+    echo " [*] Downloading GVK Private AI core archive (no Git required)..."
     if ! curl -fSL --retry 2 --connect-timeout 15 -o "${archive}" "${REPO_TARBALL_URL}"; then
         rm -rf "${tmp_dir}"
         if [ -f "${target_dir}/core/main.py" ]; then
-            echo " [!] Немає мережі — використовуємо кешовану копію ядра."
+            echo " [!] Offline - using cached local GVK core."
             return 0
         fi
-        echo " [X] Не вдалося завантажити ядро з GitHub. Перевірте інтернет на 1-й запуск." >&2
+        echo " [!] Error: failed to download GVK core from GitHub. Internet is required on first launch." >&2
         return 1
     fi
 
     if ! tar -xzf "${archive}" -C "${tmp_dir}"; then
         rm -rf "${tmp_dir}"
-        echo " [X] Помилка розпакування архіву репозиторію." >&2
+        echo " [!] Error: failed to extract repository archive." >&2
         return 1
     fi
 
     extracted="$(find "${tmp_dir}" -mindepth 1 -maxdepth 1 -type d | head -n 1)"
     if [ -z "${extracted}" ] || [ ! -f "${extracted}/updater.py" ]; then
         rm -rf "${tmp_dir}"
-        echo " [X] Некоректний архів репозиторію (відсутній updater.py)." >&2
+        echo " [!] Error: invalid repository archive (missing updater.py)." >&2
         return 1
     fi
 
     mkdir -p "${target_dir}"
     cp -R "${extracted}/." "${target_dir}/"
     rm -rf "${tmp_dir}"
-    echo " [✓] Ядро GVK Private AI оновлено у: ${target_dir}"
+    echo " [OK] GVK Private AI core synced to: ${target_dir}"
     return 0
 }
 
@@ -123,11 +131,11 @@ bootstrap_portable_python() {
     fi
 
     if [ -z "${triple}" ]; then
-        echo " [X] Непідтримувана архітектура (${os_name}/${arch_name}) для автозавантаження Python. Встановіть Python 3.12 вручну." >&2
+        echo " [!] Error: unsupported architecture (${os_name}/${arch_name}) for portable Python auto-download. Install Python 3.12 manually." >&2
         return 1
     fi
     if ! command -v curl >/dev/null 2>&1 || ! command -v tar >/dev/null 2>&1; then
-        echo " [X] Потрібен curl + tar для автозавантаження портативного Python 3.12." >&2
+        echo " [!] Error: curl and tar are required to download portable Python 3.12." >&2
         return 1
     fi
 
@@ -145,20 +153,20 @@ bootstrap_portable_python() {
     done
 
     if [ -n "${usb_py_cand}" ]; then
-        echo " [*] [USB-РЕЖИМ] Встановлення портативного Python ${PORTABLE_PY_VER} із носія: $(basename "${usb_py_cand}")..." >&2
+        echo " [*] [USB-MODE] Installing portable Python ${PORTABLE_PY_VER} from media: $(basename "${usb_py_cand}")..." >&2
         cp "${usb_py_cand}" "${archive}"
     else
-        echo " [*] Python 3.10+ (з Tk >= 8.6) не знайдено — завантажуємо портативний Python ${PORTABLE_PY_VER} (~35 МБ)..." >&2
+        echo " [*] Python 3.10+ (with Tk >= 8.6) not found - downloading portable Python ${PORTABLE_PY_VER} (~35 MB)..." >&2
         if ! curl -fSL --retry 2 --connect-timeout 15 -o "${archive}" "${py_url}"; then
             rm -rf "${tmp_dir}"
-            echo " [X] Не вдалося завантажити портативний Python. Перевірте інтернет або встановіть Python 3.12 вручну." >&2
+            echo " [!] Error: failed to download portable Python. Check internet or install Python 3.12 manually." >&2
             return 1
         fi
     fi
 
     if ! tar -xzf "${archive}" -C "${tmp_dir}" || [ ! -x "${tmp_dir}/python/bin/python3" ]; then
         rm -rf "${tmp_dir}"
-        echo " [X] Помилка розпакування портативного Python." >&2
+        echo " [!] Error: failed to extract portable Python archive." >&2
         return 1
     fi
 
@@ -166,7 +174,7 @@ bootstrap_portable_python() {
     mv "${tmp_dir}/python" "${GVK_HOME}/python"
     rm -rf "${tmp_dir}"
     export_portable_tk_env
-    echo " [✓] Портативний Python ${PORTABLE_PY_VER} встановлено у: ${GVK_HOME}/python" >&2
+    echo " [OK] Portable Python ${PORTABLE_PY_VER} installed to: ${GVK_HOME}/python" >&2
     printf '%s\n' "${GVK_HOME}/python/bin/python3"
     return 0
 }
@@ -234,7 +242,7 @@ resolve_venv_python() {
 if [ -f "${SCRIPT_DIR}/core/main.py" ] && [ -f "${SCRIPT_DIR}/updater.py" ]; then
     REPO_DIR="${SCRIPT_DIR}"
     echo "===================================================================="
-    echo " [*] GVK Private AI — Локальний запуск: ${REPO_DIR}"
+    echo " [*] GVK Private AI - Local Launch: ${REPO_DIR}"
     echo "===================================================================="
     if [ -f "${SCRIPT_DIR}/persona/manifest.json" ]; then
         DISC_ARGS=(--disc-path "${SCRIPT_DIR}")
@@ -242,8 +250,8 @@ if [ -f "${SCRIPT_DIR}/core/main.py" ] && [ -f "${SCRIPT_DIR}/updater.py" ]; the
     if [ "${CMD_NAME}" != "self-test" ] && [ "${CMD_NAME}" != "--self-test" ] && [ "${CMD_NAME}" != "status" ]; then
         if [ -d "${REPO_DIR}/.git" ] && has_real_git; then
             if [ -z "$(git -C "${REPO_DIR}" status --porcelain 2>/dev/null || true)" ]; then
-                echo " [*] Перевірка оновлень коду..."
-                git -C "${REPO_DIR}" pull --ff-only || echo " [!] Не вдалося виконати git pull (офлайн), продовжуємо..."
+                echo " [*] Checking repository updates via git pull..."
+                git -C "${REPO_DIR}" pull --ff-only || echo " [!] git pull skipped (offline), continuing..."
             fi
         fi
     fi
@@ -255,7 +263,7 @@ else
         MEDIA_MODE="USB"
     fi
     echo "===================================================================="
-    echo " [*] GVK_VAULT Виявлено: ${SCRIPT_DIR} [Режим: ${MEDIA_MODE}]"
+    echo " [*] GVK_VAULT Media Detected: ${SCRIPT_DIR} [Mode: ${MEDIA_MODE}]"
     echo "===================================================================="
     mkdir -p "${GVK_HOME}"
     if [ ! -f "${REPO_DIR}/core/main.py" ]; then
@@ -265,16 +273,16 @@ else
         seed_repo_from_disc_bundle "${REPO_DIR}" || true
     elif has_real_git && { [ -d "${REPO_DIR}/.git" ] || [ ! -f "${REPO_DIR}/core/main.py" ]; }; then
         if [ ! -d "${REPO_DIR}/.git" ]; then
-            echo " [*] Перший запуск: клонування ядра GVK Private AI..."
+            echo " [*] First launch: cloning GVK Private AI core..."
             git clone "${REPO_URL}" "${REPO_DIR}" || sync_repo_via_tarball "${REPO_DIR}"
         else
-            echo " [*] Перевірка оновлень ядра та personas_encrypted/..."
-            git -C "${REPO_DIR}" pull --ff-only || echo " [!] Не вдалося виконати git pull (офлайн або локальні зміни), продовжуємо..."
+            echo " [*] Checking repository updates (core and personas_encrypted/)..."
+            git -C "${REPO_DIR}" pull --ff-only || echo " [!] git pull skipped (offline or local changes), continuing..."
         fi
     else
         sync_repo_via_tarball "${REPO_DIR}"
     fi
-    # Якщо на носії core_bundle свіжіший за завантажене з GitHub репо — поверх накладаємо файли з носія
+    # Overlay core_bundle from media if it is newer than the GitHub copy
     if [ -f "${SCRIPT_DIR}/core_bundle/core/main.py" ] && { [ ! -f "${REPO_DIR}/core/main.py" ] || [ "${SCRIPT_DIR}/core_bundle/core/main.py" -nt "${REPO_DIR}/core/main.py" ]; }; then
         seed_repo_from_disc_bundle "${REPO_DIR}" || true
     fi
@@ -283,14 +291,14 @@ fi
 if [ "${CMD_NAME}" = "status" ]; then
     shift
     STAT_PY="$(resolve_any_python)" || {
-        echo " [!] Python ще не встановлено (буде завантажено автоматично при першому запуску ./run.sh)." >&2
+        echo " [!] Python is not installed yet (it will be downloaded automatically on first ./run.sh launch)." >&2
         exit 1
     }
     exec "${STAT_PY}" "${REPO_DIR}/updater.py" status --repo-root "${REPO_DIR}" "$@"
 fi
 
 SYS_PY="$(resolve_system_python)" || {
-    echo " [X] Помилка: не вдалося знайти або завантажити Python 3.10+ (Tk >= 8.6)." >&2
+    echo " [!] Error: failed to locate or download Python 3.10+ (Tk >= 8.6)." >&2
     exit 1
 }
 export_portable_tk_env
@@ -316,6 +324,6 @@ if [ -f "${REPO_DIR}/core/main.py" ]; then
         exec "${VENV_PY}" "${REPO_DIR}/core/main.py" "$@"
     fi
 else
-    echo " [!] Модуль core/main.py ще не створено. Статус кешу:"
+    echo " [!] core/main.py not found yet. Cache status:"
     exec "${SYS_PY}" "${REPO_DIR}/updater.py" status --repo-root "${REPO_DIR}"
 fi

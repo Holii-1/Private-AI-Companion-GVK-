@@ -1,26 +1,29 @@
 #!/usr/bin/env python3
 """
-GVK Private AI — Пісочниця індивідуальних скілів учасників (core/skill_runner.py)
+GVK Private AI - Persona Skill Execution Sandbox (core/skill_runner.py)
 
-Забезпечує безпечне виявлення, перевірку та виконання персональних Python-функцій
-(`tools.py`) усередині ізольованого runtime (зазвичай із RAM-диска).
+Provides safe discovery, static AST validation, trigger/slash matching, and
+isolated subprocess execution of per-persona Python skill functions (`tools.py`),
+typically unpacked into the runtime RAM disk.
 
-Основні властивості:
-  1. Опціональність (Graceful Fallback): якщо `tools.py` ще не створено або він порожній,
-     модуль працює штатно без помилок (`available=False`, статус `IDLE` для TUI).
-  2. Статичний AST-фільтр (`validate_tools_ast`): до виконання коду перевіряє синтаксичне
-     дерево, дозволяючи лише безпечні стандартні модулі та блокуючи файловий/мережевий/OS-доступ
-     і небезпечні конструкції (`eval`, `exec`, `open`, `__globals__`, `__subclasses__`).
-  3. Ізольоване виконання з тайм-аутом та лімітом токенів: кожен виклик скіла виконується
-     в окремому обмеженому процесі з жорстким тайм-аутом (за замовч. 3.0 с) та обрізанням
-     виводу до 2000 символів, щоб не зависнути й не переповнити контекст LLM.
-  4. Безпечний парсер викликів LLM: розбирає теги `[SKILL: func(a=1, b="ok")]` через
-     `ast.parse` + `ast.literal_eval` без використання `eval()`.
+Key Responsibilities:
+  - Graceful Fallback: operate cleanly when `tools.py` is missing or empty
+    (`available=False`, TUI dossier status `IDLE`).
+  - Static AST Validator (`validate_tools_ast`): inspect the syntax tree prior
+    to execution, whitelisting safe standard-library modules and blocking
+    filesystem, network, OS, and unsafe constructs (`eval`, `exec`, `open`,
+    `__globals__`, `__subclasses__`).
+  - Isolated Subprocess Execution: run every skill call in a separate worker
+    process with a hard timeout (default 3.0 s) and output truncation (default
+    2000 chars) to prevent hangs and LLM context overflow.
+  - Safe LLM Tag Parsing: parse `[SKILL: func(a=1, b="ok")]` tags via
+    `ast.parse` and `ast.literal_eval` without invoking `eval()`.
 
-Приклади запуску:
+Usage:
   python3 core/skill_runner.py self-test
   python3 core/skill_runner.py inspect -d path/to/persona_dir
   python3 core/skill_runner.py run -d path/to/persona_dir -f calc_split --args '{"total": 1200, "people": 3}'
+  python3 core/skill_runner.py --help
 """
 
 import argparse
@@ -42,7 +45,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 
 # =====================================================================
-# КОНСТАНТИ ПІСОЧНИЦІ ТА ОБМЕЖЕННЯ
+# SANDBOX CONSTANTS & LIMITS
 # =====================================================================
 DEFAULT_TIMEOUT_SEC = 3.0
 MAX_OUTPUT_CHARS = 2000
@@ -147,14 +150,16 @@ _SLASH_HELP_COMMANDS = frozenset({"skills", "скили", "скилы", "help", 
 
 
 class SkillSecurityError(ValueError):
-    """Помилка безпекової перевірки коду `tools.py` (AST або sandbox)."""
+    """Raised when `tools.py` fails static AST or sandbox security validation."""
 
 
 # =====================================================================
-# СТРУКТУРИ ДАНИХ
+# DATA STRUCTURES
 # =====================================================================
 @dataclass
 class SkillSpec:
+    """Metadata and invocation schema for a registered persona skill."""
+
     name: str
     description: str
     triggers: List[str] = field(default_factory=list)
@@ -168,6 +173,8 @@ class SkillSpec:
 
 @dataclass
 class SkillMatch:
+    """Result of matching a user query against a persona's available skills."""
+
     skill_name: str
     persona_id: str
     score: float
@@ -176,6 +183,8 @@ class SkillMatch:
 
 @dataclass
 class SkillCall:
+    """Parsed `[SKILL: ...]` or `[TOOL: ...]` invocation extracted from LLM output."""
+
     name: str
     args: List[Any]
     kwargs: Dict[str, Any]
@@ -184,6 +193,8 @@ class SkillCall:
 
 @dataclass
 class SkillResult:
+    """Outcome of executing a skill inside the isolated worker subprocess."""
+
     ok: bool
     skill_name: str
     output: str
@@ -193,7 +204,7 @@ class SkillResult:
 
 
 # =====================================================================
-# ДЕКОРАТОР @skill ДЛЯ ФАЙЛІВ tools.py
+# @skill DECORATOR FOR tools.py FILES
 # =====================================================================
 def skill(
     triggers: Optional[Sequence[str]] = None,
@@ -204,9 +215,22 @@ def skill(
     slash_aliases: Optional[Sequence[str]] = None,
     usage: Optional[str] = None,
 ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
-    """
-    Декоратор для явної реєстрації скіла у `tools.py`.
-    Усередині пісочниці доступний автоматично без потреби робити import.
+    """Register a Python function in `tools.py` as an invocable persona skill.
+
+    Injected automatically into the sandbox globals so `tools.py` can use
+    `@skill(...)` without importing anything.
+
+    Args:
+        triggers: Optional natural-language trigger phrases for auto-matching.
+        description: Full skill description shown to the LLM and `/skills` help.
+        name: Optional override for the registered skill function name.
+        short_desc: Compact one-line summary for the TUI dossier panel.
+        slash: Primary slash command (e.g., `"/split"`).
+        slash_aliases: Additional slash aliases.
+        usage: Formatted usage hint (e.g., `"/split <total> [people]"`).
+
+    Returns:
+        Decorator attaching `_gvk_skill_meta` to the target function.
     """
 
     def _decorator(func: Callable[..., Any]) -> Callable[..., Any]:
@@ -226,7 +250,7 @@ def skill(
 
 
 # =====================================================================
-# РІВЕНЬ 1-2: СТАТИЧНИЙ AST-ВАЛІДАТОР ТА ПІСОЧНИЦЯ ІМПОРТУ
+# LAYER 1-2: STATIC AST VALIDATOR & IMPORT SANDBOX
 # =====================================================================
 def _normalize_for_match(text: str) -> str:
     s = text.lower().strip()
@@ -235,14 +259,25 @@ def _normalize_for_match(text: str) -> str:
 
 
 def validate_tools_ast(source_code: str, filename: str = "tools.py") -> ast.Module:
-    """
-    Перевіряє синтаксичне дерево `tools.py` до виконання.
-    Дозволяє лише модулі з `ALLOWED_MODULES` та блокує небезпечні виклики / dunder-атрибути.
+    """Validate the AST of `tools.py` before compilation and execution.
+
+    Allows only modules in `ALLOWED_MODULES` and blocks relative imports,
+    dunder attribute access, and dangerous built-in identifiers/calls.
+
+    Args:
+        source_code: Python source code of `tools.py`.
+        filename: Filename label used in syntax and security error messages.
+
+    Returns:
+        Validated `ast.Module` node ready for `compile()`.
+
+    Raises:
+        SkillSecurityError: If parsing fails or any disallowed construct is detected.
     """
     try:
         tree = ast.parse(source_code, filename=filename, mode="exec")
     except SyntaxError as exc:
-        raise SkillSecurityError(f"Синтаксична помилка у {filename} (рядок {exc.lineno}): {exc.msg}") from exc
+        raise SkillSecurityError(f"Syntax error in {filename} (line {exc.lineno}): {exc.msg}") from exc
 
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
@@ -250,35 +285,35 @@ def validate_tools_ast(source_code: str, filename: str = "tools.py") -> ast.Modu
                 root_mod = alias.name.split(".")[0]
                 if root_mod not in ALLOWED_MODULES:
                     raise SkillSecurityError(
-                        f"Заборонений імпорт '{alias.name}' (рядок {node.lineno}). "
-                        f"Дозволені модулі: {', '.join(sorted(ALLOWED_MODULES))}."
+                        f"Disallowed import '{alias.name}' (line {node.lineno}). "
+                        f"Allowed modules: {', '.join(sorted(ALLOWED_MODULES))}."
                     )
 
         elif isinstance(node, ast.ImportFrom):
             if node.level and node.level > 0:
-                raise SkillSecurityError(f"Заборонений відносний імпорт у {filename} (рядок {node.lineno}).")
+                raise SkillSecurityError(f"Relative imports are disallowed in {filename} (line {node.lineno}).")
             mod_name = (node.module or "").split(".")[0]
             if mod_name not in ALLOWED_MODULES:
                 raise SkillSecurityError(
-                    f"Заборонений імпорт із '{node.module}' (рядок {node.lineno})."
+                    f"Disallowed import from '{node.module}' (line {node.lineno})."
                 )
 
         elif isinstance(node, ast.Attribute):
             if node.attr.startswith("__"):
                 raise SkillSecurityError(
-                    f"Заборонений доступ до службового dunder-атрибута '{node.attr}' (рядок {node.lineno})."
+                    f"Disallowed access to dunder attribute '{node.attr}' (line {node.lineno})."
                 )
 
         elif isinstance(node, ast.Name):
             if node.id in BLOCKED_CALL_NAMES:
                 raise SkillSecurityError(
-                    f"Заборонене використання небезпечного ідентифікатора '{node.id}' (рядок {node.lineno})."
+                    f"Disallowed use of restricted identifier '{node.id}' (line {node.lineno})."
                 )
 
         elif isinstance(node, ast.Call):
             if isinstance(node.func, ast.Name) and node.func.id in BLOCKED_CALL_NAMES:
                 raise SkillSecurityError(
-                    f"Заборонений виклик '{node.func.id}()' у пісочниці (рядок {node.lineno})."
+                    f"Disallowed call '{node.func.id}()' in sandbox (line {node.lineno})."
                 )
 
     return tree
@@ -292,15 +327,15 @@ def _sandbox_import(
     level: int = 0,
 ) -> Any:
     if level != 0:
-        raise ImportError("Відносні імпорти заборонені у пісочниці.")
+        raise ImportError("Relative imports are disallowed in the sandbox.")
     root_mod = name.split(".")[0]
     if root_mod not in ALLOWED_MODULES:
-        raise ImportError(f"Модуль '{name}' заборонений у пісочниці GVK.")
+        raise ImportError(f"Module '{name}' is disallowed in the GVK sandbox.")
     return importlib.__import__(name, globals_dict, locals_dict, fromlist, 0)
 
 
 def build_sandbox_globals() -> Dict[str, Any]:
-    """Формує ізольований простір імен `__builtins__` для виконання `tools.py`."""
+    """Build a restricted `__builtins__` globals dictionary for executing `tools.py`."""
     safe_builtins: Dict[str, Any] = {"__import__": _sandbox_import}
     for name in SAFE_BUILTIN_NAMES:
         safe_builtins[name] = getattr(_py_builtins, name)
@@ -313,7 +348,14 @@ def build_sandbox_globals() -> Dict[str, Any]:
 
 
 def load_sandbox_namespace(tools_path: str) -> Dict[str, Any]:
-    """Валідує AST та виконує `tools.py` у чистому sandbox-просторі імен."""
+    """Validate AST and execute `tools.py` inside a clean sandbox namespace.
+
+    Args:
+        tools_path: Path to the persona's `tools.py` file.
+
+    Returns:
+        Executed module namespace dictionary, or `{}` if the file is empty.
+    """
     with open(tools_path, "r", encoding="utf-8") as f:
         source_code = f.read()
 
@@ -323,17 +365,24 @@ def load_sandbox_namespace(tools_path: str) -> Dict[str, Any]:
     tree = validate_tools_ast(source_code, filename=os.path.basename(tools_path))
     code_obj = compile(tree, filename=os.path.basename(tools_path), mode="exec")
     namespace = build_sandbox_globals()
-    exec(code_obj, namespace, namespace)  # noqa: S102 — код щойно перевірено AST-фільтром та ізольовано
+    exec(code_obj, namespace, namespace)  # noqa: S102 - source validated by AST filter and sandboxed
     return namespace
 
 
 # =====================================================================
-# ПАРСЕР ТЕГІВ ВИКЛИКУ ВІДПОВІДІ LLM ([SKILL: func(a=1, b="x")])
+# LLM SKILL-CALL TAG PARSER ([SKILL: func(a=1, b="x")])
 # =====================================================================
 def parse_skill_call(text: str) -> Optional[SkillCall]:
-    """
-    Безпечно парсить перший тег виклику `[SKILL: func_name(...)]` або `[TOOL: ...]`
-    у згенерованому тексті моделі через `ast.parse` та `ast.literal_eval`.
+    """Safely parse the first `[SKILL: func(...)]` or `[TOOL: ...]` tag in LLM text.
+
+    Uses `ast.parse` and `ast.literal_eval` to extract literal arguments without
+    evaluating arbitrary Python expressions.
+
+    Args:
+        text: Raw assistant response text.
+
+    Returns:
+        Parsed `SkillCall` instance, or `None` if no valid tag is present.
     """
     if not text:
         return None
@@ -360,7 +409,7 @@ def parse_skill_call(text: str) -> Optional[SkillCall]:
             args.append(ast.literal_eval(arg_node))
         for kw_node in parsed.body.keywords:
             if kw_node.arg is None:
-                return None  # Блокуємо **unpacking у виклику LLM
+                return None  # Block **kwargs unpacking in LLM-emitted calls
             kwargs[kw_node.arg] = ast.literal_eval(kw_node.value)
     except (ValueError, SyntaxError, TypeError):
         return None
@@ -369,7 +418,7 @@ def parse_skill_call(text: str) -> Optional[SkillCall]:
 
 
 def strip_skill_tags(text: str) -> str:
-    """Видаляє службові теги `[SKILL: ...]` / `[TOOL: ...]` з репліки перед показом у TUI."""
+    """Remove `[SKILL: ...]` and `[TOOL: ...]` service tags before rendering in the TUI."""
     if not text:
         return ""
     cleaned = _SKILL_TAG_RE.sub("", text)
@@ -379,7 +428,7 @@ def strip_skill_tags(text: str) -> str:
 
 
 # =====================================================================
-# РІВЕНЬ 3: ОСНОВНИЙ КЛАС SKILL RUNNER
+# LAYER 3: SKILL RUNNER MANAGER
 # =====================================================================
 def _extract_param_schema(func: Callable[..., Any]) -> Tuple[Dict[str, Dict[str, Any]], str]:
     sig = inspect.signature(func)
@@ -406,10 +455,15 @@ def _extract_param_schema(func: Callable[..., Any]) -> Tuple[Dict[str, Dict[str,
 
 
 class SkillRunner:
-    """
-    Менеджер скілів персонажа.
-    Приймає шлях до папки персонажа (в RAM) або безпосередньо до `tools.py`.
-    Якщо `tools.py` відсутній або порожній, безпечно працює в режимі без скілів.
+    """Manage discovery, matching, and sandboxed execution of a persona's skills.
+
+    Accepts either a persona directory (typically on the RAM disk) or a direct
+    path to `tools.py`. If `tools.py` is missing or empty, operates safely with
+    `available=False`.
+
+    Example:
+        >>> runner = SkillRunner("personas/friend_1", persona_id="friend_1")
+        >>> res = runner.execute("calc_split", kwargs={"total": 1200, "people": 3})
     """
 
     def __init__(
@@ -469,7 +523,7 @@ class SkillRunner:
                 continue
             if not inspect.isfunction(obj):
                 continue
-            # Реєструємо тільки функції, визначені у самому `tools.py`
+            # Only register functions defined directly inside `tools.py`
             if getattr(obj, "__module__", None) != "gvk_persona_tools":
                 continue
 
@@ -529,10 +583,11 @@ class SkillRunner:
         self.available = bool(loaded)
 
     def list_skills(self) -> List[SkillSpec]:
+        """Return all registered `SkillSpec` definitions for this persona."""
         return list(self.skills.values())
 
     def get_dossier_status(self) -> str:
-        """Повертає компактний рядок статусу скілів для панелі досьє TUI."""
+        """Return a compact localized skills status string for the TUI dossier panel."""
         if not self.available or not self.skills:
             return "немає активних скілів [IDLE]"
         names = list(self.skills.keys())
@@ -541,7 +596,7 @@ class SkillRunner:
         return f"активних: {len(names)} [OK]"
 
     def get_dossier_skills_lines(self) -> List[str]:
-        """Повертає список однорядкових описів скілів у форматі `як викликати - що робить`."""
+        """Return single-line skill summaries formatted as `<command> - <description>`."""
         if not self.available or not self.skills:
             return []
         lines: List[str] = []
@@ -555,7 +610,7 @@ class SkillRunner:
         return lines
 
     def is_slash_help_command(self, user_text: str) -> bool:
-        """Перевіряє, чи ввів користувач команду перегляду списку скілів (`/skills`, `/скіли`, `/help`)."""
+        """Return True if `user_text` is a bare skills help command (`/skills`, `/скіли`, `/help`)."""
         if not user_text:
             return False
         m = _SLASH_CMD_RE.match(user_text.strip())
@@ -566,7 +621,7 @@ class SkillRunner:
         return cmd_norm in _SLASH_HELP_COMMANDS and not rest
 
     def format_slash_help(self) -> str:
-        """Форматує список доступних slash-команд та підказку по ключових словах."""
+        """Format the localized list of available slash commands for the chat UI."""
         if not self.available or not self.skills:
             return "Для цього персонажа активні скіли відсутні."
         lines = ["Доступні скіли (через /команду або ключові слова в тексті):"]
@@ -578,7 +633,7 @@ class SkillRunner:
 
     @staticmethod
     def _build_kwargs_from_text(spec: SkillSpec, raw_arg_text: str) -> Dict[str, Any]:
-        """Витягує аргументи функції скіла з тексту після `/команди` або з природної фрази."""
+        """Extract typed skill keyword arguments from trailing slash-command or natural-language text."""
         kwargs: Dict[str, Any] = {}
         param_items = list(spec.parameters.items())
         if not param_items:
@@ -618,9 +673,13 @@ class SkillRunner:
         return kwargs
 
     def match_slash_command(self, user_text: str) -> Optional[Tuple[SkillSpec, str]]:
-        """
-        Перевіряє, чи починається повідомлення зі slash-команди зареєстрованого скіла
-        (наприклад `/split 900 3` або `/ping`).
+        """Check whether `user_text` starts with a registered skill slash command.
+
+        Args:
+            user_text: Raw user chat message (e.g., `"/split 900 3"` or `"/ping"`).
+
+        Returns:
+            Tuple `(spec, arg_text)` on match, or `None`.
         """
         if not self.available or not self.skills or not user_text:
             return None
@@ -639,7 +698,7 @@ class SkillRunner:
         return None
 
     def execute_slash_command(self, user_text: str) -> Optional[SkillResult]:
-        """Виконує скіл за явною slash-командою користувача (`/команда [аргументи]`)."""
+        """Execute a skill matched via an explicit user slash command (`/cmd [args]`)."""
         matched = self.match_slash_command(user_text)
         if matched is None:
             return None
@@ -652,9 +711,14 @@ class SkillRunner:
         user_text: str,
         threshold: float = 0.75,
     ) -> Optional[SkillResult]:
-        """
-        Якщо репліка користувача є slash-командою або явно збігається з тригером скіла
-        (`score >= threshold`), автоматично витягує аргумент і виконує скіл у пісочниці.
+        """Auto-execute a skill when `user_text` is a slash command or strongly matches a trigger.
+
+        Args:
+            user_text: Incoming user chat utterance.
+            threshold: Minimum trigger-match score required for automatic execution.
+
+        Returns:
+            `SkillResult` if a skill was invoked, or `None`.
         """
         if not self.available or not self.skills or not user_text or not user_text.strip():
             return None
@@ -685,9 +749,16 @@ class SkillRunner:
         query: str,
         threshold: float = SKILL_MATCH_THRESHOLD,
     ) -> Optional[SkillMatch]:
-        """
-        Оцінює, чи відповідає репліка користувача slash-команді, тригерам або опису скіла.
-        Використовується арбітром `core/orchestrator.py` на етапі Skill Match.
+        """Score whether a user query matches a skill's slash command, triggers, or description.
+
+        Used by the arbiter in `core/orchestrator.py` during the Skill Match stage.
+
+        Args:
+            query: Incoming user message.
+            threshold: Minimum score required to report a match.
+
+        Returns:
+            Highest-scoring `SkillMatch` above `threshold`, or `None`.
         """
         if not self.available or not self.skills or not query or not query.strip():
             return None
@@ -758,9 +829,15 @@ class SkillRunner:
         args: Optional[Sequence[Any]] = None,
         kwargs: Optional[Dict[str, Any]] = None,
     ) -> SkillResult:
-        """
-        Виконує скіл в окремому ізольованому процесі з тайм-аутом `timeout_sec`
-        та обмеженням довжини тексту `max_output_chars`.
+        """Execute a skill in an isolated worker subprocess with timeout and output limits.
+
+        Args:
+            skill_name: Registered skill name to invoke.
+            args: Optional positional arguments passed to the skill function.
+            kwargs: Optional keyword arguments passed to the skill function.
+
+        Returns:
+            `SkillResult` with status, truncated output, error message, and latency in ms.
         """
         t0 = time.time()
         if not self.available or not self.tools_path:
@@ -849,14 +926,14 @@ class SkillRunner:
         )
 
     def execute_tag(self, llm_text: str) -> Optional[SkillResult]:
-        """Якщо у тексті LLM є тег `[SKILL: ...]`, виконує його та повертає `SkillResult`."""
+        """Parse and execute a `[SKILL: ...]` tag from `llm_text`, returning `SkillResult` or `None`."""
         call = parse_skill_call(llm_text)
         if call is None:
             return None
         return self.execute(call.name, args=call.args, kwargs=call.kwargs)
 
     def format_skills_for_prompt(self) -> str:
-        """Формує інструкцію доступних скілів для системного промпта моделі."""
+        """Format available skills as a localized prompt instruction block for the LLM."""
         if not self.available or not self.skills:
             return ""
         lines = [
@@ -871,14 +948,14 @@ class SkillRunner:
 
     @staticmethod
     def format_result_for_prompt(result: SkillResult) -> str:
-        """Формує блок із результатом роботи скіла для повторного ходу оркестратора."""
+        """Format a skill execution result block for the orchestrator's follow-up LLM turn."""
         if result.ok:
             return f"[РЕЗУЛЬТАТ СКІЛА {result.skill_name}]:\n{result.output}"
         return f"[ПОМИЛКА СКІЛА {result.skill_name}]: {result.error or 'невідома помилка'}"
 
 
 # =====================================================================
-# ВНУТРІШНІЙ ВОРКЕР ПІСОЧНИЦІ (ІЗОЛЬОВАНИЙ ПРОЦЕС)
+# INTERNAL SANDBOX WORKER (ISOLATED SUBPROCESS)
 # =====================================================================
 def _format_return_value(ret_val: Any, printed: str) -> str:
     parts: List[str] = []
@@ -933,16 +1010,17 @@ def _run_worker_from_stdin() -> int:
 
 
 # =====================================================================
-# АВТОНОМНИЙ SELF-TEST (ПЕРЕВІРКА ПІСОЧНИЦІ, ТАЙМ-АУТУ ТА FALLBACK)
+# STANDALONE SELF-TEST (SANDBOX, TIMEOUT & FALLBACK)
 # =====================================================================
 def run_self_test() -> None:
+    """Run the standalone self-test suite for `SkillRunner` and the AST sandbox."""
     print("====================================================================")
-    print(" [*] GVK Private AI — Self-Test пісочниці скілів (skill_runner.py)")
+    print(" [*] GVK Private AI - Skill Sandbox Self-Test (core/skill_runner.py)")
     print("====================================================================")
 
     with tempfile.TemporaryDirectory(prefix="gvk_skill_test_") as tmpdir:
-        # 1. Режим без tools.py
-        print(" [1/6] Перевірка режиму без tools.py (Graceful Fallback)...")
+        # 1. Missing tools.py mode (graceful fallback)
+        print(" [1/6] Checking missing tools.py mode (Graceful Fallback)...")
         empty_dir = os.path.join(tmpdir, "empty_persona")
         os.makedirs(empty_dir, exist_ok=True)
         idle_runner = SkillRunner(empty_dir, persona_id="friend_1")
@@ -951,10 +1029,10 @@ def run_self_test() -> None:
         assert idle_runner.match_query("порахуй чек на трьох") is None
         assert idle_runner.format_skills_for_prompt() == ""
         assert "IDLE" in idle_runner.get_dossier_status()
-        print(f"       [OK] Без tools.py працює стабільно: {idle_runner.get_dossier_status()}")
+        print(f"       [OK] Graceful fallback works without tools.py: {idle_runner.get_dossier_status()}")
 
-        # 2. Безпечні тестові скіли
-        print(" [2/6] Перевірка завантаження та виконання безпечних скілів...")
+        # 2. Safe test skills
+        print(" [2/6] Checking loading and execution of safe skills...")
         persona_dir = os.path.join(tmpdir, "persona_ok")
         os.makedirs(persona_dir, exist_ok=True)
         tools_file = os.path.join(persona_dir, "tools.py")
@@ -1000,13 +1078,13 @@ def verbose_spam() -> str:
         assert "[OK]" in runner.get_dossier_status()
 
         res_calc = runner.execute("calc_split", kwargs={"total": 1200, "people": 3})
-        assert res_calc.ok and "400.0" in res_calc.output, f"Невірний результат calc_split: {res_calc}"
+        assert res_calc.ok and "400.0" in res_calc.output, f"Unexpected calc_split result: {res_calc}"
         res_code = runner.execute("analyze_code", args=["a = 1\nb = 2\nc = 3\nd = 4"])
         assert res_code.ok and '"non_empty_lines": 4' in res_code.output
         print(f"       [OK] calc_split -> {res_calc.output}")
 
-        # 3. Skill Match, slash-команди та парсер тегів [SKILL: ...]
-        print(" [3/6] Перевірка Skill Match, slash-команд та парсера тегів LLM...")
+        # 3. Skill Match, slash commands, and [SKILL: ...] tag parser
+        print(" [3/6] Checking Skill Match, slash commands, and LLM tag parser...")
         matched = runner.match_query("пацани, по скільки скинутись за піцу?")
         assert matched is not None and matched.skill_name == "calc_split"
         slash_res = runner.execute_slash_command("/чек 900 3")
@@ -1021,10 +1099,10 @@ def verbose_spam() -> str:
         assert tag_res is not None and tag_res.ok and "300.0" in tag_res.output
         assert "[ДОСТУПНІ ІНСТРУМЕНТИ" in runner.format_skills_for_prompt()
         assert "[РЕЗУЛЬТАТ СКІЛА calc_split]" in runner.format_result_for_prompt(tag_res)
-        print(f"       [OK] Skill Match (score={matched.score}), /чек, /split і теги працюють.")
+        print(f"       [OK] Skill Match (score={matched.score}), /чек, /split, and tags work.")
 
-        # 4. Блокування небезпечного коду AST-валідатором
-        print(" [4/6] Перевірка блокування небезпечного коду AST-фільтром...")
+        # 4. Blocking unsafe code via the AST validator
+        print(" [4/6] Checking AST validator blocks unsafe code...")
         malicious_samples = [
             "import subprocess\ndef pwn(): return subprocess.check_output(['id'])",
             "from os import system\ndef pwn(): return system('ls')",
@@ -1039,51 +1117,52 @@ def verbose_spam() -> str:
                 validate_tools_ast(sample, filename=f"bad_{idx}.py")
             except SkillSecurityError:
                 blocked = True
-            assert blocked, f"Небезпечний зразок #{idx} не був заблокований!"
-        print(f"       [OK] Усі {len(malicious_samples)} небезпечних конструкцій заблоковано до виконання.")
+            assert blocked, f"Malicious sample #{idx} was not blocked!"
+        print(f"       [OK] All {len(malicious_samples)} unsafe constructs were blocked before execution.")
 
-        # 5. Захист від нескінченного циклу (Timeout)
-        print(" [5/6] Перевірка тайм-ауту на нескінченному циклі while True...")
+        # 5. Protection against infinite loops (timeout)
+        print(" [5/6] Checking timeout enforcement on an infinite while True loop...")
         res_timeout = runner.execute("infinite_loop")
         assert res_timeout.ok is False and res_timeout.error and "ліміт часу" in res_timeout.error
-        print(f"       [OK] Завислий процес примусово зупинено ({res_timeout.elapsed_ms:.0f} мс).")
+        print(f"       [OK] Hung worker process terminated ({res_timeout.elapsed_ms:.0f} ms).")
 
-        # 6. Перехоплення винятків та обрізання надмірного виводу
-        print(" [6/6] Перевірка перехоплення помилок та обрізання довгого виводу...")
+        # 6. Exception isolation and long-output truncation
+        print(" [6/6] Checking exception isolation and output truncation...")
         res_crash = runner.execute("crash_div")
         assert res_crash.ok is False and res_crash.error and "ZeroDivisionError" in res_crash.error
         res_spam = runner.execute("verbose_spam")
         assert res_spam.ok and res_spam.truncated is True and len(res_spam.output) <= 300
-        print("       [OK] ZeroDivisionError ізольовано; довгий вивід обрізано до 300 симв.")
+        print("       [OK] ZeroDivisionError isolated; verbose output truncated to 300 chars.")
 
     print("====================================================================")
-    print(" [✓] УСІ ТЕСТИ SKILL_RUNNER ПРОЙДЕНО УСПІШНО!")
+    print(" [OK] ALL SKILL_RUNNER SELF-TESTS PASSED SUCCESSFULLY!")
     print("====================================================================")
 
 
 # =====================================================================
-# CLI ІНТЕРФЕЙС
+# CLI INTERFACE
 # =====================================================================
 def main(argv: Optional[List[str]] = None) -> None:
+    """Parse CLI arguments and run skill inspection, execution, or self-test."""
     raw_argv = list(sys.argv[1:] if argv is None else argv)
     if raw_argv and raw_argv[0] == "_worker":
         raise SystemExit(_run_worker_from_stdin())
 
     parser = argparse.ArgumentParser(
-        description="GVK Private AI — Пісочниця скілів учасників (core/skill_runner.py)"
+        description="GVK Private AI - Persona Skill Execution Sandbox (core/skill_runner.py)"
     )
     sub = parser.add_subparsers(dest="cmd", required=True)
 
-    sub.add_parser("self-test", help="Запустити повну самоперевірку пісочниці, AST-фільтра і тайм-аутів")
+    sub.add_parser("self-test", help="Run full sandbox, AST filter, and timeout self-tests")
 
-    p_insp = sub.add_parser("inspect", help="Показати список доступних скілів у папці персонажа або tools.py")
-    p_insp.add_argument("-d", "--source", required=True, help="Шлях до папки персонажа або tools.py")
+    p_insp = sub.add_parser("inspect", help="List available skills in a persona directory or tools.py")
+    p_insp.add_argument("-d", "--source", required=True, help="Path to a persona directory or tools.py")
 
-    p_run = sub.add_parser("run", help="Безпечно виконати скіл у пісочниці")
-    p_run.add_argument("-d", "--source", required=True, help="Шлях до папки персонажа або tools.py")
-    p_run.add_argument("-f", "--func", required=True, help="Назва функції скіла")
-    p_run.add_argument("--args", default="{}", help="JSON-словник іменованих аргументів")
-    p_run.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT_SEC, help="Ліміт часу в секундах")
+    p_run = sub.add_parser("run", help="Safely execute a skill inside the sandbox")
+    p_run.add_argument("-d", "--source", required=True, help="Path to a persona directory or tools.py")
+    p_run.add_argument("-f", "--func", required=True, help="Skill function name to invoke")
+    p_run.add_argument("--args", default="{}", help="JSON object of keyword arguments")
+    p_run.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT_SEC, help="Execution timeout in seconds")
 
     args = parser.parse_args(raw_argv)
 
@@ -1091,10 +1170,10 @@ def main(argv: Optional[List[str]] = None) -> None:
         run_self_test()
     elif args.cmd == "inspect":
         runner = SkillRunner(args.source)
-        print(f"Статус: {runner.get_dossier_status()}")
+        print(f"Status: {runner.get_dossier_status()}")
         for spec in runner.list_skills():
             tr = ", ".join(spec.triggers) if spec.triggers else "-"
-            print(f" - {spec.name}{spec.signature_str}: {spec.description} [тригери: {tr}]")
+            print(f" - {spec.name}{spec.signature_str}: {spec.description} [triggers: {tr}]")
     elif args.cmd == "run":
         runner = SkillRunner(args.source, timeout_sec=args.timeout)
         kwargs = json.loads(args.args) if args.args else {}
@@ -1102,7 +1181,7 @@ def main(argv: Optional[List[str]] = None) -> None:
         if res.ok:
             print(res.output)
         else:
-            print(f"[!] Помилка ({res.elapsed_ms:.1f} мс): {res.error}", file=sys.stderr)
+            print(f"[!] Error ({res.elapsed_ms:.1f} ms): {res.error}", file=sys.stderr)
             raise SystemExit(1)
 
 
