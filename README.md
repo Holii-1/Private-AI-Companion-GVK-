@@ -32,7 +32,7 @@ Instead of relying on cloud chatbots, everything runs locally on your machine us
 
 No prior setup is needed—no Git, Python, Homebrew, or admin rights required.
 
-* **Requirements:** Windows 10/11, macOS, or Linux; **16+ GB RAM** recommended; **~12 GB free SSD space**.
+* **Requirements:** Windows 10/11, macOS (ARM only), or Linux; **16+ GB RAM** recommended; **~12 GB free SSD space**.
 * **Launch:**
   * **Windows:** double-click `run.bat` (on the `GVK_VAULT` DVD/USB or in a local clone).
   * **macOS:** double-click `run.command` in Finder, or run `./run.sh` in Terminal.
@@ -42,7 +42,7 @@ No prior setup is needed—no Git, Python, Homebrew, or admin rights required.
   * **From a `GVK_VAULT` DVD or Git clone:** downloads the base model, runtime, and Python packages once (~9.5 GB into `~/.gvk_ai`), then runs **100% offline** on every launch after that (3–5 s warm start).
 
 > [!NOTE]
-> **About cloning this repository:** This public GitHub repository contains the **engine and persona-building tools**, not unlocked access to anyone's private personas. Even though encrypted containers live in `personas_encrypted/`, they cannot be activated or decrypted without a shared `GVK_VAULT` cartridge (`origin.sig`) and its master key from the persona's creator. To use GVK Private AI, you either need someone to share a persona with you, or you can create your own by following the [Persona Creation Pipeline](docs/persona-pipeline.md).
+> **About cloning this repository:** This public GitHub repository contains the **engine and persona-building tools**, not access to anyone's private personas. The encrypted containers live in `personas_encrypted/` and cannot be activated or decrypted without a shared `GVK_VAULT` cartridge (`origin.sig`) and its master key from the persona's creator. To use GVK Private AI, you either need someone to share a persona with you, or you can create your own by following the [Persona Creation Pipeline](docs/persona-pipeline.md).
 
 ### Useful Launcher Commands
 ```bash
