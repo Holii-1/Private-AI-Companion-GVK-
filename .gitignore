@@ -1,10 +1,10 @@
 # =====================================================================
-# GVK Private AI — Безпековий .gitignore
-# Гарантує принцип Zero-Plaintext-At-Rest та запобігає витоку лору й ключів
+# GVK Private AI — Security .gitignore
+# Enforces the Zero-Plaintext-At-Rest principle and prevents lore and key leaks
 # =====================================================================
 
 # ---------------------------------------------------------------------
-# 1. КРИПТОГРАФІЧНІ КЛЮЧІ ТА ПІДПИСИ (СУВОРО ЗАБОРОНЕНО В РЕПОЗИТОРІЇ!)
+# 1. CRYPTOGRAPHIC KEYS AND SIGNATURES (STRICTLY FORBIDDEN IN REPOSITORY!)
 # ---------------------------------------------------------------------
 *.key
 *.pem
@@ -24,9 +24,9 @@ vault/
 .env.*
 
 # ---------------------------------------------------------------------
-# 2. СИРІ ДАНІ ЧАТІВ, АРХІВИ, МЕДІА ТА ПРИВАТНІ ЛОГИ (Zero-Leak)
+# 2. RAW CHAT DATA, ARCHIVES, MEDIA, AND PRIVATE LOGS (Zero-Leak)
 # ---------------------------------------------------------------------
-# Експорти Telegram, бази даних та датасети для тренування
+# Telegram exports, databases, and training datasets
 result.json
 raw_chats_and_prompts/
 data/
@@ -39,7 +39,7 @@ datasets/
 *.sqlite
 *.sqlite3
 *.dump
-# Метадані та приватні промпти у відкритому вигляді
+# Plaintext metadata and private prompts
 prompt.txt
 memory.txt
 memories.txt
@@ -52,7 +52,7 @@ tools.py
 !tools/
 portraits/
 personas/
-# Логи та дебаг-вивід
+# Logs and debug output
 logs/
 *.log
 *.log.*
@@ -61,7 +61,7 @@ logs/
 nohup.out
 crash*.txt
 debug*.txt
-# Бекапи та тимчасові файли
+# Backups and temporary files
 backup/
 backups/
 *.bak
@@ -69,7 +69,7 @@ backups/
 *.temp
 *.orig
 *.rej
-# Приватні фото, скріни, відео, аудіо, документи
+# Private photos, screenshots, video, audio, and documents
 *.png
 *.jpg
 *.jpeg
@@ -90,7 +90,25 @@ backups/
 *.ogg
 *.m4a
 *.pdf
-# Будь-які архіви та образи дисків (ризик витоку + ліміт GitHub 100 MB)
+# Allowed media files (pictures, video, audio) for documentation in docs/
+!docs/**/*.png
+!docs/**/*.jpg
+!docs/**/*.jpeg
+!docs/**/*.webp
+!docs/**/*.gif
+!docs/**/*.bmp
+!docs/**/*.tiff
+!docs/**/*.heic
+!docs/**/*.heif
+!docs/**/*.mp4
+!docs/**/*.mov
+!docs/**/*.avi
+!docs/**/*.mkv
+!docs/**/*.mp3
+!docs/**/*.wav
+!docs/**/*.ogg
+!docs/**/*.m4a
+# Any archives and disk images (leak risk + GitHub 100 MB limit)
 *.zip
 *.7z
 *.rar
@@ -110,7 +128,7 @@ backups/
 *.cdr
 
 # ---------------------------------------------------------------------
-# 3. НЕЗАШИФРОВАНІ ВАГИ ШІ ТА ВЕКТОРНІ БАЗИ
+# 3. UNENCRYPTED AI WEIGHTS AND VECTOR DATABASES
 # ---------------------------------------------------------------------
 adapters/
 lora_final/
@@ -127,15 +145,15 @@ checkpoints/
 *.part
 
 # ---------------------------------------------------------------------
-# 4. ВАЖКІ БАЗОВІ МОДЕЛІ (Навіть зашифровані > 100 МБ блокуються GitHub)
+# 4. LARGE BASE MODELS (Even encrypted, files > 100 MB are blocked by GitHub)
 # ---------------------------------------------------------------------
-# Базова модель (5 ГБ) живе тільки на Blu-ray та в локальному кеші SSD
+# The base model (5 GB) lives only on Blu-ray and in the local SSD cache
 base_model.gguf.enc
 base/
 *.iso
 
 # ---------------------------------------------------------------------
-# 5. СКОМПІЛЬОВАНІ БІНАРНИКИ RUNTIME
+# 5. COMPILED RUNTIME BINARIES
 # ---------------------------------------------------------------------
 llama-server
 llama-server.exe
@@ -148,7 +166,7 @@ llama-cli.exe
 *.metallib
 
 # ---------------------------------------------------------------------
-# 6. КЕШІ ТА СЕРЕДОВИЩЕ PYTHON
+# 6. PYTHON CACHES AND ENVIRONMENT
 # ---------------------------------------------------------------------
 __pycache__/
 *.py[cod]
@@ -179,14 +197,14 @@ wheels/
 htmlcov/
 graphify-out/
 
-# Віртуальні оточення
+# Virtual environments
 venv/
 .venv/
 env/
 ENV/
 
 # ---------------------------------------------------------------------
-# 7. СИСТЕМНІ ФАЙЛИ ТА IDE
+# 7. SYSTEM AND IDE FILES
 # ---------------------------------------------------------------------
 .DS_Store
 .DS_Store?
